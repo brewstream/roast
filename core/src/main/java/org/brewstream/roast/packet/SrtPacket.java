@@ -12,6 +12,12 @@ public sealed interface SrtPacket permits DataPacket, ControlPacket {
 
     int HEADER_LENGTH = 16;
 
+    /** Packet sequence numbers wrap at 31 bits — see {@link org.brewstream.roast.util.CircularNumber}. */
+    long MAX_SEQUENCE_NUMBER = 0x7FFF_FFFFL;
+
+    /** Timestamps (and ACK numbers, which share the same wire width) wrap at 32 bits. */
+    long MAX_TIMESTAMP = 0xFFFF_FFFFL;
+
     SrtSocketId destination();
 
     int timestamp();

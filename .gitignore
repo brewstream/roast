@@ -4,3 +4,7 @@ out/
 .idea/
 *.iml
 .DS_Store
+
+# Reference implementations cloned locally for porting/comparison (DESIGN.md §3).
+# Not ours to push upstream - keep out of this repo's history.
+/references/
