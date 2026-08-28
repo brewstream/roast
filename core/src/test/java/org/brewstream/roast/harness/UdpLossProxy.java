@@ -1,4 +1,4 @@
-package io.github.brewstream.roast.harness;
+package org.brewstream.roast.harness;
 
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;

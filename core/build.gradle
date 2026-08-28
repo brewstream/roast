@@ -1,1 +1,9 @@
 description = 'Pure-Java SRT (Secure Reliable Transport) protocol implementation'
+
+dependencies {
+    implementation platform('io.netty:netty-bom:4.2.17.Final')
+    implementation 'io.netty:netty-common'
+    implementation 'io.netty:netty-buffer'
+    implementation 'io.netty:netty-transport'
+    implementation 'io.netty:netty-codec'
+}
