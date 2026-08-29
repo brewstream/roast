@@ -40,16 +40,26 @@ handled as well, unlocking real RTT/RTTVar tracking and an RTT-adaptive periodic
 NAK interval (previously a fixed floor) — see "What's built" and "Testing
 methodology" below. `ReceiveBuffer` now also does TSBPD clock-drift correction
 and 32-bit wire-timestamp wraparound handling, both fed by/tied into the same
-ACKACK/delivery-time machinery. **Phase 3 (receiver path) is now feature-complete
-per DESIGN.md's phased plan** — the only thing left is the entire sender-side
-path (Phase 4); see "Known gaps."
+ACKACK/delivery-time machinery. **Phase 3 (receiver path) is feature-complete
+per DESIGN.md's phased plan.**
 
-141 tests passing (128 default + 1 gated interop + 2 ACKACK/RTT + 5
-`DriftTracerTest` + 2 `ReceiveBufferTest` drift cases + 4 `ReceiveBufferTest`
-wraparound cases), all committed to `main` (no branches). Every commit so far
-has been asked-for explicitly by the user, one narrowly-scoped piece at a
-time — see git log for the exact sequence and rationale (commit messages are
-detailed).
+**Phase 4 (sender path) is now underway**: `SendBuffer` (new `send` package)
+is built, tested against gosrt's own `send_test.go`, and wired into
+`SrtConnection` — a connection can now `write(ByteBuf)` data out, get it
+retransmitted on an inbound NAK, have it acknowledged/pruned on an inbound
+ACK, and reply with ACKACK on a Full ACK (feeding the *same* shared RTT
+estimate the receive side already tracks). See "What's built" and "Known
+gaps" for what's still missing (real bandwidth pacing beyond gosrt's own
+informational model, message chunking/MSS, live stats, caller-side
+handshake). Wiring this in surfaced and fixed a real bug in `SendBuffer`
+itself — see "Testing methodology."
+
+155 tests passing (128 default + 1 gated interop + 2 ACKACK/RTT + 5
+`DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
+wraparound + 10 `SendBufferTest` + 5 new `SrtConnectionTest` send-side
+cases), all committed to `main` (no branches). Every commit so far has been
+asked-for explicitly by the user, one narrowly-scoped piece at a time — see
+git log for the exact sequence and rationale (commit messages are detailed).
 
 ## What's built
 
@@ -118,8 +128,20 @@ dropped, never thrown.
   replacing the old fixed floor. Unknown/stale ACKACKs are logged and ignored,
   matching gosrt's tolerant behavior. Buffer/rate figures fed to `AckSender.tick`
   are still hardcoded to 0 — that needs receive-side stats this codebase doesn't
-  track yet. Exposes `onData`/`onLoss`/`onTlpktDrop`/`onClose` — see below — and
-  `.metadata()` returning its `AcceptedConnection`.
+  track yet. Now also owns a `SendBuffer` (see `send` below) and exposes
+  `write(ByteBuf)` — the actual data-send API, marshaled onto the connection's
+  own event loop since it's the one method meant to be called from an arbitrary
+  application thread (every other method here assumes the single event-loop
+  thread). Inbound ACK prunes `SendBuffer`'s retransmit state for every ACK
+  variant; a Full ACK additionally feeds its own reported RTT into the *same
+  shared* RTT/RTTVar estimate ACKACK round trips update, and triggers an ACKACK
+  reply — both gated to Full only, matching gosrt's `handleACK` exactly. Inbound
+  NAK triggers retransmission via `SendBuffer.nak`. Both directions share the
+  same initial sequence number (HSv5's handshake carries one such field,
+  mirrored by both peers — confirmed in gosrt and in `ListenerHandshake`, which
+  echoes the peer's own value back rather than generating a fresh one).
+  Exposes `onData`/`onLoss`/`onTlpktDrop`/`onRetransmit`/`onClose` — see
+  below — and `.metadata()` returning its `AcceptedConnection`.
 - `ConnectionRequest` / `AcceptDecision` / `AcceptHandler` / `AcceptedConnection`
   — the extensibility surface added per DESIGN.md's "Extensibility &
   observability" section: rich accept/reject (peer address, StreamID, SRT
@@ -179,6 +201,22 @@ numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
   only valid if read immediately after `update()` returns true) is collapsed
   into a single `OptionalLong` return from `update()` — same information, a
   deliberate documented API simplification, not a behavior change.
+
+**`send`** — Phase 4's sender path, now wired to a live connection via
+`SrtConnection` above:
+- `SendBuffer` — the sending side's counterpart to `LossList`/`ReceiveBuffer`
+  combined, ported directly from gosrt's `congestion/live.sender` (`send.go`).
+  `push`/`tick`/`ack`/`nak`/`flush`: queues outgoing DATA packets, delivers
+  whatever's due (gosrt's own "pacing" is informational only — nothing spaces
+  packets out beyond each one's own scheduled send time, traced directly from
+  gosrt's source rather than assumed), prunes retransmit state on ACK,
+  retransmits on NAK, and implements sender-side TLPKTDROP (the other half of
+  the mechanism — `ReceiveBuffer` implements the receiver's). Every delivery —
+  first send or retransmit alike — hands out a `retainedDuplicate()`, never
+  the entry actually held in its internal queues, so the original stays valid
+  for a possible later retransmit (see "Testing methodology" for the bug this
+  fixes). The 16th/17th-packet bandwidth-probe trick and full bandwidth-rate
+  statistics (gosrt's `Stats()`) are deliberately not ported — see known gaps.
 
 **`handshake`** — `SynCookie`: MD5-based SYN cookie so a listener can verify an
 INDUCTION cookie was echoed back correctly in CONCLUSION without keeping
@@ -291,6 +329,24 @@ falls back to `references/srt/build/srt-live-transmit`.
   double-checking directly — a packet buffered while the wrap was only
   suspected lands on the exact same deadline once a later packet confirms it,
   with no discontinuity across that transition.
+- **`SendBuffer`** is grounded at the strongest tier this codebase uses: gosrt
+  has real dedicated tests (`congestion/live/send_test.go`) and all five are
+  ported directly (`SendBufferTest`), unlike RTT/drift/wraparound above, where
+  neither reference had any coverage to port from.
+- **Wiring `SendBuffer` into `SrtConnection` surfaced a real bug**, not just a
+  wiring detail: `tick()`'s first delivery used to hand the `deliver` callback
+  the same `DataPacket`/`ByteBuf` object retained internally for
+  retransmission — harmless in `SendBufferTest`'s no-op callbacks (nothing
+  ever actually encoded/released anything), but once wired to a real Netty
+  encoder, that buffer gets consumed/released the moment it's actually sent —
+  so a later NAK-triggered retransmit calling `retainedDuplicate()` on that
+  already-released buffer would throw `IllegalReferenceCountException`. Fixed
+  by having every delivery, first send included, hand out a fresh duplicate
+  (symmetric with how retransmits already worked) — see `SendBuffer`'s
+  javadoc. `SendBufferTest.retransmitAfterARealSendDoesNotReuseAnAlreadyReleasedBuffer`
+  is a regression test that fails without the fix; `SrtConnectionTest`'s
+  `nakOnUnacknowledgedPacketTriggersRetransmit` exercises the real path (an
+  actual Netty encoder in the loop) end-to-end.
 
 ## Known gaps / deliberately deferred
 
@@ -330,17 +386,35 @@ falls back to `references/srt/build/srt-live-transmit`.
   gosrt nor the RFC's own KEEPALIVE section impose a limit). Verified safe
   against libsrt (doesn't echo on receipt) — reconsider a rate limit before this
   codebase gets its own keepalive-originating caller/sender side.
-- **The entire sender-side path (Phase 4)** — untouched. `SrtConnection`
-  now handles DATA/KEEPALIVE/SHUTDOWN/ACKACK; anything else is logged and
-  dropped. This is why a connection can currently receive but not send.
+- ~~The entire sender-side path (Phase 4)~~ **Underway** — `SrtConnection` now
+  handles DATA/KEEPALIVE/SHUTDOWN/ACK/NAK/ACKACK and can `write(...)` data
+  out; see "What's built". Remaining pieces of Phase 4, still deferred:
+  - **Real bandwidth pacing** — `SendBuffer` matches gosrt's own model, which
+    is informational only (nothing spaces packets out beyond each one's own
+    scheduled send time); actual rate-limited output, if ever needed, isn't
+    implemented by gosrt's "live" congestion control either.
+  - **Message chunking/MSS** — `write(ByteBuf)` sends exactly one DATA packet
+    per call, no splitting; matches the existing "no MSS negotiation" gap.
+  - **Full send-side stats** (gosrt's `Stats()`: `estimatedInputBW`/
+    `estimatedSentBW`/`pktLossRate`) and the 16th/17th-packet bandwidth-probe
+    trick — both deliberately not ported, see `SendBuffer`'s javadoc.
+  - **ACK-sent/received hooks and live pollable stats** generally — still
+    just `onRetransmit` added this pass, matching how `onData`/`onLoss`/
+    `onTlpktDrop` were rolled out incrementally too.
+- **Caller-side handshake** (dial/connect flow) is unaffected by the above —
+  still only the listener side exists (see earlier gap). Real interop for the
+  send path (a real peer receiving data *from* Roast) needs either that, or
+  testing the send path against a real peer that connects *to* our listener
+  and then reads — not yet exercised either way.
 
 ## Next steps, in order
 
-1. The sender-side path (Phase 4) — send buffer, live-mode pacing, NAK-driven
-   retransmission, ACK handling. Everything so far is receive-only; a connection
-   can't send anything back yet. This is now the only remaining major gap —
-   Phase 3 (the receiver path) is feature-complete.
-2. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
+1. Real interop for the send path — a real peer (libsrt/gosrt) receiving data
+   Roast sends, over the connections `SrtListener` already accepts (doesn't
+   need caller-side handshake first).
+2. Caller-side handshake (dial/connect flow) — unlocks Roast connecting out to
+   a peer's listener, not just accepting inbound connections.
+3. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
    against `SrtListener`, for full belt-and-suspenders confidence beyond
    `srt-live-transmit` — not expected to surface anything new, since ffmpeg
    wraps the same libsrt handshake code already exercised.
