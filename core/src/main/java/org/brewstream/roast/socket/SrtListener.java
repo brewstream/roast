@@ -1,0 +1,188 @@
+package org.brewstream.roast.socket;
+
+import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.AddressedEnvelope;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.DefaultAddressedEnvelope;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
+import io.netty.channel.socket.DatagramChannel;
+import io.netty.channel.socket.nio.NioDatagramChannel;
+import org.brewstream.roast.codec.SrtFrameDecoder;
+import org.brewstream.roast.codec.SrtFrameEncoder;
+import org.brewstream.roast.handshake.ConclusionOutcome;
+import org.brewstream.roast.handshake.ListenerHandshake;
+import org.brewstream.roast.handshake.SynCookie;
+import org.brewstream.roast.packet.ControlPacket;
+import org.brewstream.roast.packet.ControlType;
+import org.brewstream.roast.packet.SrtPacket;
+import org.brewstream.roast.packet.SrtSocketId;
+import org.brewstream.roast.packet.cif.HandshakeCif;
+import org.brewstream.roast.packet.cif.HandshakeExtension;
+import org.brewstream.roast.packet.cif.HandshakeType;
+import org.brewstream.roast.packet.cif.RejectionReason;
+
+import java.net.InetSocketAddress;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Binds a real Netty {@code NioDatagramChannel} and drives the HSv5 induction→
+ * conclusion exchange ({@link ListenerHandshake}) through it. This is Phase 2's
+ * "reaches connected" milestone — there is no data-transfer path yet (Phase 3),
+ * so a DATA packet for an accepted connection is logged and dropped by
+ * {@link SrtSocketIdDemultiplexer}'s existing unknown-socket-id path; that's
+ * expected, not a bug here.
+ */
+public final class SrtListener {
+
+    private static final Logger LOG = Logger.getLogger(SrtListener.class.getName());
+    private static final int DEFAULT_LATENCY_MILLIS = 120;
+    private static final int DEFAULT_SRT_VERSION = 0x010401;
+
+    private final Channel channel;
+    private final EventLoopGroup eventLoopGroup;
+    private final ListenerHandshake listenerHandshake;
+    private final SrtSocketIdGenerator socketIdGenerator;
+    private final ConcurrentHashMap<SrtSocketId, HandshakeCif> acceptedByPeerSocketId = new ConcurrentHashMap<>();
+    private final long startNanos = System.nanoTime();
+
+    private volatile AcceptHandler acceptHandler = request -> AcceptDecision.reject(RejectionReason.PEER);
+    private volatile Consumer<AcceptedConnection> connectionHandler = connection -> {
+    };
+
+    private SrtListener(Channel channel, EventLoopGroup eventLoopGroup, ListenerHandshake listenerHandshake,
+            SrtSocketIdGenerator socketIdGenerator) {
+        this.channel = channel;
+        this.eventLoopGroup = eventLoopGroup;
+        this.listenerHandshake = listenerHandshake;
+        this.socketIdGenerator = socketIdGenerator;
+    }
+
+    public static SrtListener bind(InetSocketAddress localAddress) throws InterruptedException {
+        SrtSocketIdDemultiplexer demultiplexer = new SrtSocketIdDemultiplexer();
+        EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+        Bootstrap bootstrap = new Bootstrap()
+                .group(group)
+                .channel(NioDatagramChannel.class)
+                .handler(new ChannelInitializer<DatagramChannel>() {
+                    @Override
+                    protected void initChannel(DatagramChannel ch) {
+                        ch.pipeline().addLast(new SrtFrameDecoder(), new SrtFrameEncoder(), demultiplexer);
+                    }
+                });
+
+        Channel channel = bootstrap.bind(localAddress).sync().channel();
+        InetSocketAddress boundAddress = (InetSocketAddress) channel.localAddress();
+
+        SynCookie cookie = SynCookie.forListener(boundAddress.toString());
+        ListenerHandshake listenerHandshake =
+                new ListenerHandshake(cookie, boundAddress.getAddress(), DEFAULT_SRT_VERSION);
+
+        SrtListener listener = new SrtListener(channel, group, listenerHandshake, new SrtSocketIdGenerator());
+        demultiplexer.setAcceptor(listener::onHandshakePacket);
+        return listener;
+    }
+
+    /** Decides whether to accept an incoming connection once it's passed protocol-level validation. */
+    public void setAcceptHandler(AcceptHandler handler) {
+        this.acceptHandler = handler;
+    }
+
+    /** Fired once a connection's handshake completes and its accept response has been sent. */
+    public void onConnection(Consumer<AcceptedConnection> handler) {
+        this.connectionHandler = handler;
+    }
+
+    public InetSocketAddress localAddress() {
+        return (InetSocketAddress) channel.localAddress();
+    }
+
+    public void close() throws InterruptedException {
+        channel.close().sync();
+        eventLoopGroup.shutdownGracefully().sync();
+    }
+
+    private void onHandshakePacket(AddressedEnvelope<SrtPacket, InetSocketAddress> msg) {
+        SrtPacket packet = msg.content();
+        if (!(packet instanceof ControlPacket control) || control.type() != ControlType.HANDSHAKE) {
+            packet.body().release();
+            return;
+        }
+
+        HandshakeCif request = HandshakeCif.decode(control.body(), true);
+        control.body().release();
+        if (request == null) {
+            LOG.log(Level.FINE, "Dropping malformed handshake CIF from {0}", msg.sender());
+            return;
+        }
+
+        String senderAddress = msg.sender().toString();
+        HandshakeType type = request.handshakeType();
+
+        if (type == HandshakeType.INDUCTION) {
+            send(listenerHandshake.onInduction(request, senderAddress), request.srtSocketId(), msg.sender());
+            return;
+        }
+        if (type != HandshakeType.CONCLUSION) {
+            LOG.log(Level.FINE, "Dropping non-progression handshake type from {0}", msg.sender());
+            return;
+        }
+
+        HandshakeCif cachedResponse = acceptedByPeerSocketId.get(request.srtSocketId());
+        if (cachedResponse != null) {
+            // A retried CONCLUSION for an already-accepted connection - resend, don't re-run accept logic.
+            send(cachedResponse, request.srtSocketId(), msg.sender());
+            return;
+        }
+
+        ConclusionOutcome outcome = listenerHandshake.validateConclusion(request, senderAddress);
+        if (outcome instanceof ConclusionOutcome.Rejected rejected) {
+            send(rejected.response(), request.srtSocketId(), msg.sender());
+            return;
+        }
+
+        AcceptDecision decision = acceptHandler.handle(toConnectionRequest(request, msg.sender()));
+        if (decision instanceof AcceptDecision.Reject reject) {
+            send(listenerHandshake.buildRejectResponse(request, reject.reason()), request.srtSocketId(), msg.sender());
+            return;
+        }
+
+        SrtSocketId assignedSocketId = socketIdGenerator.generate();
+        HandshakeCif response = listenerHandshake.buildAcceptResponse(
+                request, assignedSocketId, DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS);
+        acceptedByPeerSocketId.put(request.srtSocketId(), response);
+        send(response, request.srtSocketId(), msg.sender());
+
+        HandshakeExtension negotiated = response.handshakeExtension();
+        connectionHandler.accept(new AcceptedConnection(
+                assignedSocketId, request.srtSocketId(), msg.sender(), request.streamId(),
+                negotiated.receiveTsbpdDelayMillis(), negotiated.sendTsbpdDelayMillis(), negotiated.srtVersion()));
+    }
+
+    private static ConnectionRequest toConnectionRequest(HandshakeCif request, InetSocketAddress peerAddress) {
+        HandshakeExtension extension = request.handshakeExtension();
+        String streamId = request.streamId() == null ? "" : request.streamId();
+        return new ConnectionRequest(
+                peerAddress, request.srtSocketId(), streamId, extension.srtVersion(),
+                request.encryptionField() != 0,
+                extension.receiveTsbpdDelayMillis(), extension.sendTsbpdDelayMillis());
+    }
+
+    private void send(HandshakeCif responseCif, SrtSocketId packetDestination, InetSocketAddress recipient) {
+        ByteBuf cifBuf = channel.alloc().buffer();
+        responseCif.encodeTo(cifBuf);
+        ControlPacket controlPacket =
+                new ControlPacket(ControlType.HANDSHAKE, 0, elapsedMicros(), packetDestination, cifBuf);
+        channel.writeAndFlush(new DefaultAddressedEnvelope<>(controlPacket, recipient));
+    }
+
+    private int elapsedMicros() {
+        return (int) ((System.nanoTime() - startNanos) / 1000);
+    }
+}
