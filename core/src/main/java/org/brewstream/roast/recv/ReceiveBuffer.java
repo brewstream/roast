@@ -7,6 +7,7 @@ import org.brewstream.roast.util.CircularNumber;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.OptionalLong;
 
 /**
  * Holds accepted DATA packets until their TSBPD delivery deadline arrives (per
@@ -30,11 +31,22 @@ import java.util.List;
  * {@link DeliveryResult#abandoned()} so a caller can clear it from a paired
  * {@link LossList} (stop NAKing it).
  *
- * <p>Deliberately simplified for this pass, both documented as known gaps (see
+ * <p><b>Drift correction</b>: every delivery deadline is computed live (at
+ * {@link #deliver}-check time), not frozen when a packet is buffered — {@code
+ * timeBaseMicros + packet timestamp + latency + driftTracer.drift()} —
+ * matching libsrt's live-query {@code getPktTime()} model
+ * ({@code srtcore/tsbpd_time.cpp}) rather than gosrt's, which has no working
+ * drift implementation at all (a dead field never assigned). This means an
+ * already-buffered-but-undelivered packet's deadline re-evaluates if drift
+ * shifts while it's waiting, not just newly-arriving packets'. Samples come
+ * from {@link #addDriftSample}, fed by the connection on every ACKACK — see
+ * that method's javadoc for the exact formula, ported from libsrt's {@code
+ * CTsbpdTime::addDriftSample}. No dedicated test exists in either reference
+ * for this piece (STATUS.md's testing methodology section has the detail).
+ *
+ * <p>Deliberately simplified for this pass, documented as a known gap (see
  * STATUS.md):
  * <ul>
- *   <li>No drift correction — clock skew between sender and receiver isn't
- *       compensated for (DESIGN.md's separate {@code DriftCorrector}).</li>
  *   <li>No 32-bit wire-timestamp wraparound handling (draft-sharabayko-srt.md
  *       §4.5.1.1's "TSBPD Time Base Calculation") — correct for connections
  *       under ~71 minutes (2^32 microseconds), the common case for now.</li>
@@ -52,14 +64,16 @@ import java.util.List;
  */
 public final class ReceiveBuffer {
 
-    private record Entry(CircularNumber seq, long tsbpdTimeMicros, DataPacket packet) {
+    private record Entry(CircularNumber seq, int timestamp, DataPacket packet) {
     }
 
     private final long latencyMicros;
     private final List<Entry> buffered = new ArrayList<>();
+    private final DriftTracer driftTracer = new DriftTracer();
 
     private Long timeBaseMicros;
     private CircularNumber lastDelivered;
+    private long firstRttSampleMicros = -1;
 
     public ReceiveBuffer(CircularNumber initialSequenceNumber, long latencyMicros) {
         this.latencyMicros = latencyMicros;
@@ -83,8 +97,41 @@ public final class ReceiveBuffer {
             return;
         }
 
-        long tsbpdTime = timeBaseMicros + Integer.toUnsignedLong(packet.timestamp()) + latencyMicros;
-        insertSorted(seq, tsbpdTime, packet);
+        insertSorted(seq, packet.timestamp(), packet);
+    }
+
+    /**
+     * Records a clock-drift sample from an ACK/ACKACK round trip — ported from
+     * libsrt's {@code CTsbpdTime::addDriftSample} ({@code srtcore/tsbpd_time.cpp}).
+     * {@code packetTimestamp} is the ACKACK packet's own header timestamp field
+     * (the peer's connection-relative clock at the moment it sent the ACKACK);
+     * {@code arrivalMicros} is when it arrived locally; {@code rttSampleMicros}
+     * is the raw (unsmoothed) RTT sample for that same exchange.
+     *
+     * <p>The ACKACK's timestamp is run through the same "packet timestamp -&gt;
+     * base time" formula data packets use, then compared against when it
+     * actually arrived — the difference, minus half the change in RTT since the
+     * first-ever RTT sample (compensating for one-way-delay changes), is the
+     * drift sample fed to {@link #driftTracer}. A no-op before {@link #add} has
+     * established {@link #timeBaseMicros} (mirrors libsrt's own {@code if
+     * (!m_bTsbPdMode) return}).
+     */
+    public void addDriftSample(int packetTimestamp, long arrivalMicros, long rttSampleMicros) {
+        if (timeBaseMicros == null) {
+            return;
+        }
+        if (firstRttSampleMicros == -1) {
+            firstRttSampleMicros = rttSampleMicros;
+        }
+
+        long rttDeltaMicros = (rttSampleMicros - firstRttSampleMicros) / 2;
+        long packetBaseTimeMicros = timeBaseMicros + Integer.toUnsignedLong(packetTimestamp);
+        long sampleMicros = arrivalMicros - packetBaseTimeMicros - rttDeltaMicros;
+
+        OptionalLong overdriftMicros = driftTracer.update(sampleMicros);
+        if (overdriftMicros.isPresent()) {
+            timeBaseMicros += overdriftMicros.getAsLong();
+        }
     }
 
     /**
@@ -99,7 +146,7 @@ public final class ReceiveBuffer {
 
         while (!buffered.isEmpty()) {
             Entry next = buffered.get(0);
-            if (next.tsbpdTimeMicros() > nowMicros) {
+            if (tsbpdTimeMicros(next) > nowMicros) {
                 break;
             }
 
@@ -122,7 +169,11 @@ public final class ReceiveBuffer {
         buffered.clear();
     }
 
-    private void insertSorted(CircularNumber seq, long tsbpdTime, DataPacket packet) {
+    private long tsbpdTimeMicros(Entry entry) {
+        return timeBaseMicros + Integer.toUnsignedLong(entry.timestamp()) + latencyMicros + driftTracer.drift();
+    }
+
+    private void insertSorted(CircularNumber seq, int timestamp, DataPacket packet) {
         int i = 0;
         while (i < buffered.size() && buffered.get(i).seq().lessThan(seq)) {
             i++;
@@ -131,6 +182,6 @@ public final class ReceiveBuffer {
             packet.payload().release(); // already buffered
             return;
         }
-        buffered.add(i, new Entry(seq, tsbpdTime, packet));
+        buffered.add(i, new Entry(seq, timestamp, packet));
     }
 }

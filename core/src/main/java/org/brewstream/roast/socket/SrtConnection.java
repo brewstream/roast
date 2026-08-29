@@ -180,7 +180,7 @@ public final class SrtConnection {
             }
             if (control.type() == ControlType.ACKACK) {
                 control.body().release();
-                handleAckAck(control.typeSpecificInfo());
+                handleAckAck(control);
                 return;
             }
         }
@@ -190,19 +190,25 @@ public final class SrtConnection {
     }
 
     /**
-     * {@code ackNumber} is the ACKACK's echoed Type-specific Information field.
+     * The ACKACK's echoed Type-specific Information field is the ack number.
      * Cleans up any older still-pending ack numbers too — once a later one is
      * confirmed, earlier ones are presumed stale (matches gosrt's
      * {@code handleACKACK}), so this map can't grow forever against a
-     * compliant peer.
+     * compliant peer. Also feeds the raw (unsmoothed) RTT sample and the
+     * ACKACK's own header timestamp into {@link ReceiveBuffer#addDriftSample}
+     * for clock-drift correction — see that method's javadoc.
      */
-    private void handleAckAck(int ackNumber) {
+    private void handleAckAck(ControlPacket control) {
+        int ackNumber = control.typeSpecificInfo();
         Long sentAtMicros = pendingAcks.remove(ackNumber);
         if (sentAtMicros == null) {
             LOG.log(Level.FINE, "Got ACKACK for unknown ack number {0} on socket {1}", new Object[]{ackNumber, metadata.socketId()});
             return;
         }
-        recalculateRtt(elapsedMicros() - sentAtMicros);
+        long nowMicros = elapsedMicros();
+        long sampleMicros = nowMicros - sentAtMicros;
+        recalculateRtt(sampleMicros);
+        receiveBuffer.addDriftSample(control.timestamp(), nowMicros, sampleMicros);
         pendingAcks.keySet().removeIf(pending -> pending < ackNumber);
     }
 

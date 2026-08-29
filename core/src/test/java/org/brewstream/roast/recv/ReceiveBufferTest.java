@@ -120,4 +120,45 @@ class ReceiveBufferTest {
         assertThat(second.abandoned()).containsExactly(new LossRange(seq(5), seq(7)));
         release(second.delivered());
     }
+
+    @Test
+    void driftSamplesBeforeTimeBaseEstablishedAreNoOps() {
+        ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 10_000);
+
+        for (int i = 0; i < DriftTracer.MAX_SAMPLES; i++) {
+            buffer.addDriftSample(0, 8_000, 100_000);
+        }
+
+        buffer.add(dataPacket(0, 0), 0); // establishes timeBase = 0 - 0 = 0
+
+        // If the pre-timeBase samples above had silently accumulated, the
+        // completed span would already have banked an overdrift and shifted
+        // this deadline past 10_000 (latency alone).
+        assertThat(buffer.deliver(9_999).delivered()).isEmpty();
+        DeliveryResult result = buffer.deliver(10_000);
+        assertThat(seqNumbersOf(result.delivered())).containsExactly(0);
+        release(result.delivered());
+    }
+
+    @Test
+    void overdriftShiftsAlreadyBufferedPacketsEffectiveDeadline() {
+        ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 10_000);
+        buffer.add(dataPacket(0, 0), 0); // establishes timeBase = 0 - 0 = 0; deadline = 10_000 pre-drift
+
+        assertThat(buffer.deliver(9_999).delivered()).isEmpty();
+
+        // A consistent 8_000us drift sample (same RTT every time, so the
+        // RTT-delta term stays 0) exceeds the 5_000us clamp once the span
+        // completes, banking a 5_000us overdrift into the time base and
+        // leaving a running drift() of 3_000us - shifting this already-
+        // buffered packet's deadline from 10_000 to 18_000.
+        for (int i = 0; i < DriftTracer.MAX_SAMPLES; i++) {
+            buffer.addDriftSample(0, 8_000, 100_000);
+        }
+
+        assertThat(buffer.deliver(17_999).delivered()).isEmpty();
+        DeliveryResult result = buffer.deliver(18_000);
+        assertThat(seqNumbersOf(result.delivered())).containsExactly(0);
+        release(result.delivered());
+    }
 }
