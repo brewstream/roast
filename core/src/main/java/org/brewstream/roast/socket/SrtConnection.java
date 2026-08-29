@@ -21,8 +21,8 @@ import org.brewstream.roast.util.CircularNumber;
 
 import java.net.InetSocketAddress;
 import java.util.List;
-import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -35,10 +35,20 @@ import java.util.logging.Logger;
  * on that one thread, so (like its three collaborators individually) this class
  * needs no internal synchronization.
  *
- * <p>Only DATA packets are handled. KEEPALIVE, SHUTDOWN, and ACKACK aren't
- * implemented yet — anything else arriving for this socket ID is logged and
- * dropped, matching this codebase's established "drop what you don't handle
- * yet" pattern rather than crashing the connection.
+ * <p>DATA, KEEPALIVE, and SHUTDOWN are handled. ACKACK isn't yet (needs RTT
+ * measurement machinery this pass doesn't add) — anything else arriving for this
+ * socket ID is logged and dropped, matching this codebase's established "drop
+ * what you don't handle yet" pattern rather than crashing the connection.
+ *
+ * <p>KEEPALIVE is echoed back immediately on receipt, matching gosrt's
+ * {@code handleKeepAlive} (connection.go) exactly — worth flagging: if a peer
+ * mirrors this same "echo on receipt" behavior (this codebase's own future
+ * caller/sender side might), two such peers talking to each other could in
+ * theory tight-loop echoing each other's keepalives forever, since neither
+ * gosrt nor the RFC's own KEEPALIVE description gates this with a rate limit.
+ * Verified safe against libsrt specifically (it doesn't echo on receipt), which
+ * is this codebase's actual interop target so far — reconsider a rate limit
+ * before this codebase gets its own keepalive-originating side.
  *
  * <p>RTT/RTTVar/buffer/rate figures fed to {@link AckSender#tick} are hardcoded
  * to 0 — not measured yet, same gap {@code AckSender} already documents. The
@@ -59,6 +69,7 @@ public final class SrtConnection {
     private final ReceiveBuffer receiveBuffer;
     private final ScheduledFuture<?> scheduledTick;
     private final long startNanos = System.nanoTime();
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
     private long lastPeriodicNakMicros;
     private int fullAckCounter;
@@ -68,6 +79,8 @@ public final class SrtConnection {
     private volatile Consumer<LossRange> onLoss = range -> {
     };
     private volatile Consumer<LossRange> onTlpktDrop = range -> {
+    };
+    private volatile Runnable onClose = () -> {
     };
 
     public SrtConnection(Channel channel, SrtSocketIdDemultiplexer demultiplexer, AcceptedConnection metadata,
@@ -103,21 +116,59 @@ public final class SrtConnection {
         this.onTlpktDrop = handler;
     }
 
-    /** Unregisters from the demultiplexer, cancels the tick, and releases any buffered-but-undelivered payloads. */
+    /** Fires once this connection has fully torn down — from either side closing it. */
+    public void onClose(Runnable handler) {
+        this.onClose = handler;
+    }
+
+    /**
+     * Tears the connection down: sends our own SHUTDOWN to the peer (mirroring
+     * gosrt's {@code close()}, which does this unconditionally regardless of
+     * whether the peer's SHUTDOWN is what triggered this call — a symmetric
+     * teardown handshake, not just a one-sided notification), unregisters from
+     * the demultiplexer, cancels the tick, releases any buffered-but-undelivered
+     * payloads, and fires {@link #onClose}. Safe to call more than once, from any
+     * thread — only the first call does anything, matching gosrt's
+     * {@code sync.Once}-guarded {@code close()} for the same reason (this can be
+     * reached both from a peer's SHUTDOWN arriving on the event loop thread, and
+     * from {@link SrtListener#close()} on whatever thread the app called that on).
+     */
     public void close() {
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
+        sendShutdown();
         scheduledTick.cancel(false);
         demultiplexer.unregister(metadata.socketId());
         receiveBuffer.dispose();
+        onClose.run();
     }
 
     private void onPacket(AddressedEnvelope<SrtPacket, InetSocketAddress> msg) {
         SrtPacket packet = msg.content();
-        if (!(packet instanceof DataPacket data)) {
-            LOG.log(Level.FINE, "Dropping non-DATA packet for socket {0} (not yet handled)", metadata.socketId());
-            packet.body().release();
+        if (packet instanceof DataPacket data) {
+            handleData(data);
             return;
         }
 
+        if (packet instanceof ControlPacket control) {
+            if (control.type() == ControlType.KEEPALIVE) {
+                control.body().release();
+                sendKeepAlive();
+                return;
+            }
+            if (control.type() == ControlType.SHUTDOWN) {
+                control.body().release();
+                close();
+                return;
+            }
+        }
+
+        LOG.log(Level.FINE, "Dropping unhandled packet type for socket {0}", metadata.socketId());
+        packet.body().release();
+    }
+
+    private void handleData(DataPacket data) {
         CircularNumber seq = CircularNumber.of(data.sequenceNumber() & 0x7FFF_FFFF, SrtPacket.MAX_SEQUENCE_NUMBER);
         List<LossRange> immediateLoss = lossList.onPacketReceived(seq);
         ackSender.onPacketReceived();
@@ -150,6 +201,16 @@ public final class SrtConnection {
         for (DataPacket delivered : result.delivered()) {
             onData.accept(delivered.body());
         }
+    }
+
+    private void sendKeepAlive() {
+        send(new ControlPacket(ControlType.KEEPALIVE, 0, (int) elapsedMicros(), metadata.peerSocketId(),
+                channel.alloc().buffer(0)));
+    }
+
+    private void sendShutdown() {
+        send(new ControlPacket(ControlType.SHUTDOWN, 0, (int) elapsedMicros(), metadata.peerSocketId(),
+                channel.alloc().buffer(0)));
     }
 
     private void sendNak(List<LossRange> ranges) {

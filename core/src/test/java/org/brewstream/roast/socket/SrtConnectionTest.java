@@ -147,6 +147,27 @@ class SrtConnectionTest {
         connection.close();
     }
 
+    @Test
+    void keepAliveIsEchoedBack() throws Exception {
+        SrtConnection connection = connectAndAccept();
+
+        sendControl(connection.metadata().socketId(), ControlType.KEEPALIVE);
+
+        receiveControl(ControlType.KEEPALIVE).body().release();
+    }
+
+    @Test
+    void shutdownClosesTheConnectionAndRepliesWithOurOwnShutdown() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        CompletableFuture<Void> closed = new CompletableFuture<>();
+        connection.onClose(() -> closed.complete(null));
+
+        sendControl(connection.metadata().socketId(), ControlType.SHUTDOWN);
+
+        receiveControl(ControlType.SHUTDOWN).body().release();
+        closed.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    }
+
     private SrtConnection connectAndAccept() throws Exception {
         listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0));
         listener.setAcceptHandler(request -> AcceptDecision.accept());
@@ -172,8 +193,26 @@ class SrtConnectionTest {
         caller.send(new DatagramPacket(bytes, bytes.length, listener.localAddress()));
     }
 
-    /** Reads incoming packets until a NAK is found (skipping periodic ACKs), decoded into loss ranges. */
+    private void sendControl(SrtSocketId destination, ControlType type) throws IOException {
+        ControlPacket packet = new ControlPacket(type, 0, 0, destination, Unpooled.buffer(0));
+        var out = Unpooled.buffer();
+        packet.encodeTo(out);
+        byte[] bytes = new byte[out.readableBytes()];
+        out.readBytes(bytes);
+        out.release();
+
+        caller.send(new DatagramPacket(bytes, bytes.length, listener.localAddress()));
+    }
+
     private List<LossRange> receiveNak() throws IOException {
+        ControlPacket control = receiveControl(ControlType.NAK);
+        List<LossRange> ranges = LossListCodec.decode(control.body());
+        control.body().release();
+        return ranges;
+    }
+
+    /** Reads incoming packets until one of the given type is found (skipping others, e.g. periodic ACKs). */
+    private ControlPacket receiveControl(ControlType type) throws IOException {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
         while (System.nanoTime() < deadline) {
             byte[] buffer = new byte[2048];
@@ -182,16 +221,14 @@ class SrtConnectionTest {
 
             ByteBuf buf = Unpooled.wrappedBuffer(incoming.getData(), 0, incoming.getLength());
             SrtPacket packet = SrtPacket.decode(buf);
-            if (packet instanceof ControlPacket control && control.type() == ControlType.NAK) {
-                List<LossRange> ranges = LossListCodec.decode(control.body());
-                control.body().release();
-                return ranges;
+            if (packet instanceof ControlPacket control && control.type() == type) {
+                return control;
             }
             if (packet != null) {
                 packet.body().release();
             }
         }
-        throw new AssertionError("No NAK received within " + TIMEOUT_SECONDS + "s");
+        throw new AssertionError("No " + type + " received within " + TIMEOUT_SECONDS + "s");
     }
 
     private HandshakeCif sendAndReceiveHandshake(HandshakeCif request) throws IOException {
