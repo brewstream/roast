@@ -1,0 +1,183 @@
+package org.brewstream.roast.send;
+
+import io.netty.buffer.ByteBuf;
+import org.brewstream.roast.packet.DataPacket;
+import org.brewstream.roast.packet.SrtPacket;
+import org.brewstream.roast.packet.SrtSocketId;
+import org.brewstream.roast.packet.cif.LossRange;
+import org.brewstream.roast.util.CircularNumber;
+
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.Iterator;
+import java.util.List;
+import java.util.function.Consumer;
+
+/**
+ * Queues outgoing DATA packets and hands them to a {@code deliver} callback
+ * once due, keeping delivered-but-unacknowledged ones around for possible
+ * retransmission — the sending side's counterpart to {@link
+ * org.brewstream.roast.recv.LossList}/{@link org.brewstream.roast.recv.ReceiveBuffer}
+ * combined. Ported directly from gosrt's {@code congestion/live.sender}
+ * ({@code send.go}), which keeps both roles in one struct too; no need to
+ * split it further here.
+ *
+ * <p>Two FIFO queues, unlike {@code ReceiveBuffer}'s sequence-sorted list:
+ * packets here only ever arrive in strictly increasing sequence order (this
+ * class assigns the sequence number itself in {@link #push}), so no
+ * out-of-order insertion is possible and a plain queue suffices.
+ * <ul>
+ *   <li>{@code packetList} — pushed, not yet due to be handed to {@code deliver}.</li>
+ *   <li>{@code lossList} — delivered at least once, kept for possible
+ *       retransmission until {@link #ack} confirms it or {@link #tick}'s
+ *       TLPKTDROP gives up on it.</li>
+ * </ul>
+ *
+ * <p><b>Pacing</b>: traced directly from gosrt's source, not assumed —
+ * {@link #tick} gates delivery purely on each packet's own {@code
+ * scheduledSendMicros}; the {@link #avgPayloadSize} EWMA this class also
+ * tracks (draft-sharabayko-srt.md §5.1.2, "SRT's Default LiveCC Algorithm")
+ * is carried forward the same way gosrt does — computed, not enforced.
+ * Nothing here delays or spaces out delivery beyond what the caller already
+ * scheduled. Real output-rate shaping, if ever needed, isn't implemented by
+ * gosrt's own "live" congestion control either.
+ *
+ * <p><b>Sender-side TLPKTDROP</b>: {@link #tick}'s second pass drops
+ * {@code lossList} entries whose scheduled time plus the configured drop
+ * threshold has passed — the other half of TLPKTDROP; {@code ReceiveBuffer}
+ * already implements the receiver's half.
+ *
+ * <p>Grounded against gosrt's own {@code congestion/live/send_test.go} — real
+ * reference tests exist for this piece, unlike several other pieces of this
+ * codebase (RTT/drift/wraparound) where none did.
+ *
+ * <p>Deliberately deferred, not part of this class: full bandwidth-rate-window
+ * statistics ({@code estimatedInputBW}/{@code estimatedSentBW}/{@code
+ * pktLossRate} — gosrt's {@code Stats()}) and the 16th/17th-packet
+ * same-timestamp bandwidth-probe trick gosrt's {@code Push} does. See
+ * STATUS.md's known gaps.
+ *
+ * <p>Not thread-safe, same as this codebase's other buffer/list state.
+ */
+public final class SendBuffer {
+
+    private record Entry(CircularNumber seq, long scheduledSendMicros, DataPacket packet) {
+    }
+
+    private final SrtSocketId destination;
+    private final long dropThresholdMicros;
+    private final Deque<Entry> packetList = new ArrayDeque<>();
+    private final Deque<Entry> lossList = new ArrayDeque<>();
+    private final Consumer<DataPacket> deliver;
+
+    private CircularNumber nextSequenceNumber;
+    private double avgPayloadSize = 1_456; // gosrt's packet.MAX_PAYLOAD_SIZE, its own seed value
+
+    public SendBuffer(CircularNumber initialSequenceNumber, SrtSocketId destination,
+            long dropThresholdMicros, Consumer<DataPacket> deliver) {
+        this.nextSequenceNumber = initialSequenceNumber;
+        this.destination = destination;
+        this.dropThresholdMicros = dropThresholdMicros;
+        this.deliver = deliver;
+    }
+
+    /** Current EWMA average payload size in bytes (draft-sharabayko-srt.md §5.1.2). */
+    public double avgPayloadSize() {
+        return avgPayloadSize;
+    }
+
+    /**
+     * Queues a payload for delivery once {@code scheduledSendMicros} is due,
+     * assigning it the next sequence number. Ownership of {@code payload}
+     * transfers to this buffer.
+     */
+    public void push(ByteBuf payload, long scheduledSendMicros) {
+        CircularNumber seq = nextSequenceNumber;
+        nextSequenceNumber = nextSequenceNumber.inc();
+
+        DataPacket packet = new DataPacket(
+                (int) seq.value(), 3, false, 0, false, 1,
+                (int) (scheduledSendMicros & SrtPacket.MAX_TIMESTAMP), destination, payload);
+        packetList.addLast(new Entry(seq, scheduledSendMicros, packet));
+    }
+
+    /**
+     * Delivers whatever's due as of {@code nowMicros}, then drops whatever in
+     * {@link #lossList} has aged past the drop threshold (sender-side
+     * TLPKTDROP). Ported from gosrt's {@code Tick}.
+     */
+    public void tick(long nowMicros) {
+        while (!packetList.isEmpty() && packetList.peekFirst().scheduledSendMicros() <= nowMicros) {
+            Entry entry = packetList.pollFirst();
+            avgPayloadSize = avgPayloadSize * 0.875 + entry.packet().payload().readableBytes() * 0.125;
+            deliver.accept(entry.packet());
+            lossList.addLast(entry);
+        }
+
+        while (!lossList.isEmpty() && lossList.peekFirst().scheduledSendMicros() + dropThresholdMicros <= nowMicros) {
+            lossList.pollFirst().packet().payload().release();
+        }
+    }
+
+    /**
+     * Prunes every {@link #lossList} entry older than {@code
+     * lastAckPacketSequenceNumber} — confirmed delivered, no longer needed
+     * for retransmission. Ported from gosrt's {@code ACK}.
+     */
+    public void ack(CircularNumber lastAckPacketSequenceNumber) {
+        while (!lossList.isEmpty() && lossList.peekFirst().seq().lessThan(lastAckPacketSequenceNumber)) {
+            lossList.pollFirst().packet().payload().release();
+        }
+    }
+
+    /**
+     * Retransmits every {@link #lossList} entry whose sequence number falls
+     * within any of the given ranges — a fresh {@link DataPacket} with {@code
+     * retransmitted=true} and a {@code retainedDuplicate()} of the payload
+     * (the original stays in {@code lossList}, per this codebase's ByteBuf
+     * ownership convention: {@code encodeTo} consumes/releases a packet's
+     * body, so a packet that might be resent again can't reuse the same
+     * buffer instance). Ported from gosrt's {@code NAK}, including its
+     * back-to-front scan direction (no test observes the order, only the
+     * count, but faithfulness is cheap).
+     */
+    public void nak(List<LossRange> ranges) {
+        if (ranges.isEmpty()) {
+            return;
+        }
+
+        Iterator<Entry> it = lossList.descendingIterator();
+        while (it.hasNext()) {
+            Entry entry = it.next();
+            for (LossRange range : ranges) {
+                if (entry.seq().greaterThanOrEqual(range.start()) && entry.seq().lessThanOrEqual(range.end())) {
+                    DataPacket original = entry.packet();
+                    DataPacket retransmit = new DataPacket(
+                            original.sequenceNumber(), original.pp(), original.inOrder(), original.kk(), true,
+                            original.messageNumber(), original.timestamp(), original.destination(),
+                            original.payload().retainedDuplicate());
+                    deliver.accept(retransmit);
+                    break;
+                }
+            }
+        }
+    }
+
+    /** Test-support only, mirrors gosrt's own same-package whitebox test access to its lists' lengths. */
+    int packetListSize() {
+        return packetList.size();
+    }
+
+    /** Test-support only, mirrors gosrt's own same-package whitebox test access to its lists' lengths. */
+    int lossListSize() {
+        return lossList.size();
+    }
+
+    /** Releases every queued/unacknowledged payload. */
+    public void flush() {
+        packetList.forEach(entry -> entry.packet().payload().release());
+        packetList.clear();
+        lossList.forEach(entry -> entry.packet().payload().release());
+        lossList.clear();
+    }
+}
