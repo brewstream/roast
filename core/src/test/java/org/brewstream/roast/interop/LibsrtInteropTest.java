@@ -3,6 +3,7 @@ package org.brewstream.roast.interop;
 import org.brewstream.roast.socket.AcceptDecision;
 import org.brewstream.roast.socket.AcceptedConnection;
 import org.brewstream.roast.socket.ConnectionRequest;
+import org.brewstream.roast.socket.SrtConnection;
 import org.brewstream.roast.socket.SrtListener;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
@@ -65,7 +66,7 @@ class LibsrtInteropTest {
     void realLibsrtCallerReachesConnected() throws Exception {
         listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
         CompletableFuture<ConnectionRequest> seenRequest = new CompletableFuture<>();
-        CompletableFuture<AcceptedConnection> connected = new CompletableFuture<>();
+        CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
         listener.setAcceptHandler(request -> {
             seenRequest.complete(request);
             return AcceptDecision.accept();
@@ -76,7 +77,7 @@ class LibsrtInteropTest {
         srtLiveTransmit = launchSrtLiveTransmit(listener.localAddress().getPort(), peerOutput);
 
         ConnectionRequest request = seenRequest.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        AcceptedConnection connection = connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        AcceptedConnection connection = connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).metadata();
 
         assertThat(request.streamId()).isEqualTo(STREAM_ID);
         assertThat(request.srtVersion()).isPositive(); // a real version was reported, not asserting which

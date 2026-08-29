@@ -71,7 +71,7 @@ class SrtListenerTest {
     @Test
     void conclusionHappyPathAcceptsAndFiresOnConnection() throws Exception {
         listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0));
-        CompletableFuture<AcceptedConnection> connected = new CompletableFuture<>();
+        CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
         CompletableFuture<ConnectionRequest> seenRequest = new CompletableFuture<>();
         listener.setAcceptHandler(request -> {
             seenRequest.complete(request);
@@ -91,7 +91,7 @@ class SrtListenerTest {
         assertThat(conclusionReply.srtSocketId().isZero()).isFalse();
         assertThat(conclusionReply.streamId()).isEqualTo("live/test");
 
-        AcceptedConnection connection = connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        AcceptedConnection connection = connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).metadata();
         assertThat(connection.socketId()).isEqualTo(conclusionReply.srtSocketId());
         assertThat(connection.peerSocketId()).isEqualTo(callerSocketId);
         assertThat(connection.streamId()).isEqualTo("live/test");
@@ -104,7 +104,7 @@ class SrtListenerTest {
     @Test
     void conclusionWithBadCookieIsRejectedProtocolLevel() throws Exception {
         listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0));
-        CompletableFuture<AcceptedConnection> connected = new CompletableFuture<>();
+        CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
         listener.onConnection(connected::complete);
         caller = newCaller();
         SrtSocketId callerSocketId = SrtSocketId.of(0x3000);

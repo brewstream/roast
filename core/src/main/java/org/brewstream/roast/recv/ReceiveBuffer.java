@@ -116,6 +116,12 @@ public final class ReceiveBuffer {
         return new DeliveryResult(delivered, abandoned);
     }
 
+    /** Releases every currently-buffered, undelivered packet's payload — call on connection teardown. */
+    public void dispose() {
+        buffered.forEach(entry -> entry.packet().body().release());
+        buffered.clear();
+    }
+
     private void insertSorted(CircularNumber seq, long tsbpdTime, DataPacket packet) {
         int i = 0;
         while (i < buffered.size() && buffered.get(i).seq().lessThan(seq)) {

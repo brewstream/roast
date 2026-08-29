@@ -47,19 +47,22 @@ public final class SrtListener {
 
     private final Channel channel;
     private final EventLoopGroup eventLoopGroup;
+    private final SrtSocketIdDemultiplexer demultiplexer;
     private final ListenerHandshake listenerHandshake;
     private final SrtSocketIdGenerator socketIdGenerator;
     private final ConcurrentHashMap<SrtSocketId, HandshakeCif> acceptedByPeerSocketId = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<SrtSocketId, SrtConnection> connections = new ConcurrentHashMap<>();
     private final long startNanos = System.nanoTime();
 
     private volatile AcceptHandler acceptHandler = request -> AcceptDecision.reject(RejectionReason.PEER);
-    private volatile Consumer<AcceptedConnection> connectionHandler = connection -> {
+    private volatile Consumer<SrtConnection> connectionHandler = connection -> {
     };
 
-    private SrtListener(Channel channel, EventLoopGroup eventLoopGroup, ListenerHandshake listenerHandshake,
-            SrtSocketIdGenerator socketIdGenerator) {
+    private SrtListener(Channel channel, EventLoopGroup eventLoopGroup, SrtSocketIdDemultiplexer demultiplexer,
+            ListenerHandshake listenerHandshake, SrtSocketIdGenerator socketIdGenerator) {
         this.channel = channel;
         this.eventLoopGroup = eventLoopGroup;
+        this.demultiplexer = demultiplexer;
         this.listenerHandshake = listenerHandshake;
         this.socketIdGenerator = socketIdGenerator;
     }
@@ -84,7 +87,8 @@ public final class SrtListener {
         ListenerHandshake listenerHandshake =
                 new ListenerHandshake(cookie, boundAddress.getAddress(), DEFAULT_SRT_VERSION);
 
-        SrtListener listener = new SrtListener(channel, group, listenerHandshake, new SrtSocketIdGenerator());
+        SrtListener listener = new SrtListener(
+                channel, group, demultiplexer, listenerHandshake, new SrtSocketIdGenerator());
         demultiplexer.setAcceptor(listener::onHandshakePacket);
         return listener;
     }
@@ -95,7 +99,7 @@ public final class SrtListener {
     }
 
     /** Fired once a connection's handshake completes and its accept response has been sent. */
-    public void onConnection(Consumer<AcceptedConnection> handler) {
+    public void onConnection(Consumer<SrtConnection> handler) {
         this.connectionHandler = handler;
     }
 
@@ -104,6 +108,7 @@ public final class SrtListener {
     }
 
     public void close() throws InterruptedException {
+        connections.values().forEach(SrtConnection::close);
         channel.close().sync();
         eventLoopGroup.shutdownGracefully().sync();
     }
@@ -160,9 +165,13 @@ public final class SrtListener {
         send(response, request.srtSocketId(), msg.sender());
 
         HandshakeExtension negotiated = response.handshakeExtension();
-        connectionHandler.accept(new AcceptedConnection(
+        AcceptedConnection metadata = new AcceptedConnection(
                 assignedSocketId, request.srtSocketId(), msg.sender(), request.streamId(),
-                negotiated.receiveTsbpdDelayMillis(), negotiated.sendTsbpdDelayMillis(), negotiated.srtVersion()));
+                negotiated.receiveTsbpdDelayMillis(), negotiated.sendTsbpdDelayMillis(), negotiated.srtVersion());
+        SrtConnection connection = new SrtConnection(
+                channel, demultiplexer, metadata, request.initialPacketSequenceNumber());
+        connections.put(assignedSocketId, connection);
+        connectionHandler.accept(connection);
     }
 
     private static ConnectionRequest toConnectionRequest(HandshakeCif request, InetSocketAddress peerAddress) {
