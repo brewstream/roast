@@ -39,7 +39,10 @@ class SendBufferTest {
     @Test
     void deliversInOrderAsScheduledTimeComesDue() {
         List<Integer> delivered = new ArrayList<>();
-        SendBuffer buffer = sendBuffer(p -> delivered.add(p.sequenceNumber()));
+        SendBuffer buffer = sendBuffer(p -> {
+            delivered.add(p.sequenceNumber());
+            p.payload().release(); // each delivery is now a duplicate the consumer owns - see SendBuffer's javadoc
+        });
 
         for (int i = 0; i < 10; i++) {
             buffer.push(Unpooled.buffer(0), i + 1);
@@ -57,7 +60,7 @@ class SendBufferTest {
     /** Ported from gosrt's TestSendLossListACK. */
     @Test
     void ackPrunesLossListInOrder() {
-        SendBuffer buffer = sendBuffer(p -> { });
+        SendBuffer buffer = sendBuffer(p -> p.payload().release());
 
         for (int i = 0; i < 10; i++) {
             buffer.push(Unpooled.buffer(0), i + 1);
@@ -89,10 +92,40 @@ class SendBufferTest {
         buffer.nak(List.of(new LossRange(seq(5), seq(7))));
         assertThat(retransmitCount(delivered)).isEqualTo(4);
 
-        // Retransmit duplicates are separate ByteBuf instances the buffer
-        // doesn't track once handed off - the test owns releasing those.
-        // Originals are still held by the buffer's lossList; flush() releases them.
-        delivered.stream().filter(DataPacket::retransmitted).forEach(p -> p.payload().release());
+        // Every delivery - first send and retransmit alike - is a duplicate
+        // the consumer owns (see SendBuffer's javadoc); the originals stay in
+        // lossList and are released separately by flush().
+        delivered.forEach(p -> p.payload().release());
+        buffer.flush();
+    }
+
+    /**
+     * Regression test for a real bug caught while wiring this into a live
+     * connection: tick()'s first delivery used to hand out the same packet
+     * object retained in lossList. Once a real consumer (an encoder, or here,
+     * a callback that releases immediately - simulating one) actually
+     * releases what it's given, a later nak() retransmit calling
+     * retainedDuplicate() on that same already-released buffer would throw
+     * IllegalReferenceCountException. Fixed by always duplicating on delivery.
+     */
+    @Test
+    void retransmitAfterARealSendDoesNotReuseAnAlreadyReleasedBuffer() {
+        List<DataPacket> delivered = new ArrayList<>();
+        SendBuffer buffer = sendBuffer(p -> {
+            delivered.add(p);
+            p.payload().release(); // simulates a real encoder consuming the buffer on send
+        });
+
+        buffer.push(Unpooled.buffer(0), 1);
+        buffer.tick(1);
+
+        buffer.nak(List.of(new LossRange(seq(0), seq(0))));
+
+        // Both deliveries were already released by the callback above (simulating
+        // a real encoder) - if nak() had reused the first delivery's already-
+        // released buffer instead of duplicating the still-valid original held
+        // in lossList, this would have thrown IllegalReferenceCountException.
+        assertThat(delivered).hasSize(2); // original send + retransmit
         buffer.flush();
     }
 
@@ -103,7 +136,7 @@ class SendBufferTest {
     /** Ported from gosrt's TestSendDrop. */
     @Test
     void tickDropsStaleUnacknowledgedPackets() {
-        SendBuffer buffer = sendBuffer(p -> { });
+        SendBuffer buffer = sendBuffer(p -> p.payload().release());
 
         for (int i = 0; i < 10; i++) {
             buffer.push(Unpooled.buffer(0), i + 1);
@@ -118,7 +151,7 @@ class SendBufferTest {
     /** Ported from gosrt's TestSendFlush. */
     @Test
     void flushClearsBothQueues() {
-        SendBuffer buffer = sendBuffer(p -> { });
+        SendBuffer buffer = sendBuffer(p -> p.payload().release());
 
         for (int i = 0; i < 10; i++) {
             buffer.push(Unpooled.buffer(0), i + 1);
@@ -141,7 +174,7 @@ class SendBufferTest {
     @Test
     void ackReleasesPrunedPayload() {
         ByteBuf payload = Unpooled.buffer(0);
-        SendBuffer buffer = sendBuffer(p -> { });
+        SendBuffer buffer = sendBuffer(p -> p.payload().release());
         buffer.push(payload, 1);
         buffer.tick(1);
 
@@ -153,7 +186,7 @@ class SendBufferTest {
     @Test
     void tickDropReleasesStalePayload() {
         ByteBuf payload = Unpooled.buffer(0);
-        SendBuffer buffer = sendBuffer(p -> { });
+        SendBuffer buffer = sendBuffer(p -> p.payload().release());
         buffer.push(payload, 1);
         buffer.tick(1);
 
@@ -166,7 +199,7 @@ class SendBufferTest {
     void flushReleasesEverythingRegardlessOfState() {
         ByteBuf delivered = Unpooled.buffer(0); // will be moved to lossList
         ByteBuf pending = Unpooled.buffer(0); // stays in packetList, not yet due
-        SendBuffer buffer = sendBuffer(p -> { });
+        SendBuffer buffer = sendBuffer(p -> p.payload().release());
         buffer.push(delivered, 1);
         buffer.tick(1);
         buffer.push(pending, 100);

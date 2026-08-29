@@ -31,6 +31,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Integration tests for {@link SrtConnection}: completes a real handshake (same
@@ -196,6 +197,90 @@ class SrtConnectionTest {
         assertThat(next.cif().rtt()).isEqualTo(100_000); // untouched - the bogus ACKACK matched nothing
     }
 
+    @Test
+    void writeSendsDataPacketToPeer() throws Exception {
+        SrtConnection connection = connectAndAccept();
+
+        connection.write(Unpooled.wrappedBuffer("hello".getBytes(StandardCharsets.US_ASCII)));
+
+        DataPacket received = receiveData();
+        assertThat(received.sequenceNumber()).isEqualTo(1); // shared initial sequence number from the handshake
+        assertThat(received.payload().toString(StandardCharsets.US_ASCII)).isEqualTo("hello");
+        received.payload().release();
+    }
+
+    @Test
+    void ackedPacketIsNotRetransmittedOnSubsequentNak() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        CompletableFuture<DataPacket> retransmitted = new CompletableFuture<>();
+        connection.onRetransmit(retransmitted::complete);
+
+        connection.write(Unpooled.wrappedBuffer("payload".getBytes(StandardCharsets.US_ASCII)));
+        DataPacket original = receiveData();
+        int sentSeq = original.sequenceNumber();
+        original.payload().release();
+
+        sendFullAck(connection.metadata().socketId(), 1, 50_000, 25_000, seq(sentSeq + 1));
+        receiveControl(ControlType.ACKACK).body().release(); // drain our reply before the negative check below
+
+        sendNak(connection.metadata().socketId(), List.of(new LossRange(seq(sentSeq), seq(sentSeq))));
+
+        assertThatThrownBy(() -> retransmitted.get(500, TimeUnit.MILLISECONDS))
+                .isInstanceOf(java.util.concurrent.TimeoutException.class);
+    }
+
+    @Test
+    void nakOnUnacknowledgedPacketTriggersRetransmit() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        CompletableFuture<DataPacket> retransmitted = new CompletableFuture<>();
+        connection.onRetransmit(retransmitted::complete);
+
+        connection.write(Unpooled.wrappedBuffer("payload".getBytes(StandardCharsets.US_ASCII)));
+        DataPacket original = receiveData();
+        int sentSeq = original.sequenceNumber();
+        original.payload().release();
+
+        sendNak(connection.metadata().socketId(), List.of(new LossRange(seq(sentSeq), seq(sentSeq))));
+
+        DataPacket hookPacket = retransmitted.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        assertThat(hookPacket.sequenceNumber()).isEqualTo(sentSeq);
+        assertThat(hookPacket.retransmitted()).isTrue();
+        // Not released here - onRetransmit doesn't own the payload (unlike onData);
+        // it's consumed by the send that immediately follows, see the hook's javadoc.
+
+        DataPacket resent = receiveData();
+        assertThat(resent.sequenceNumber()).isEqualTo(sentSeq);
+        assertThat(resent.retransmitted()).isTrue();
+        resent.payload().release();
+    }
+
+    @Test
+    void fullAckTriggersAckAckReplyAndUpdatesSharedRtt() throws Exception {
+        SrtConnection connection = connectAndAccept();
+
+        sendFullAck(connection.metadata().socketId(), 77, 40_000, 20_000, seq(1));
+
+        ControlPacket ackAck = receiveControl(ControlType.ACKACK);
+        assertThat(ackAck.typeSpecificInfo()).isEqualTo(77);
+        ackAck.body().release();
+
+        // RTT is one shared estimate (see SrtConnection's "Sending" javadoc) - a
+        // peer-reported RTT from an inbound ACK shows up in our own subsequent
+        // outgoing Full ACKs about data we've received.
+        FullAck updated = receiveFullAckWhereRttDiffersFrom(100_000);
+        assertThat(updated.cif().rtt()).isLessThan(100_000);
+    }
+
+    @Test
+    void closeReleasesUnacknowledgedWrittenPayload() throws Exception {
+        SrtConnection connection = connectAndAccept();
+
+        connection.write(Unpooled.wrappedBuffer("not-yet-acked".getBytes(StandardCharsets.US_ASCII)));
+        receiveData().payload().release(); // let it actually get sent first
+
+        connection.close();
+    }
+
     private SrtConnection connectAndAccept() throws Exception {
         listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0));
         listener.setAcceptHandler(request -> AcceptDecision.accept());
@@ -245,6 +330,54 @@ class SrtConnectionTest {
         List<LossRange> ranges = LossListCodec.decode(control.body());
         control.body().release();
         return ranges;
+    }
+
+    private void sendNak(SrtSocketId destination, List<LossRange> ranges) throws IOException {
+        ByteBuf cifBuf = Unpooled.buffer();
+        LossListCodec.encode(ranges, cifBuf);
+        ControlPacket packet = new ControlPacket(ControlType.NAK, 0, 0, destination, cifBuf);
+        var out = Unpooled.buffer();
+        packet.encodeTo(out);
+        byte[] bytes = new byte[out.readableBytes()];
+        out.readBytes(bytes);
+        out.release();
+
+        caller.send(new DatagramPacket(bytes, bytes.length, listener.localAddress()));
+    }
+
+    private void sendFullAck(SrtSocketId destination, int ackNumber, int rtt, int rttVar,
+            CircularNumber lastAckPacketSequenceNumber) throws IOException {
+        AckCif cif = new AckCif(AckVariant.FULL, lastAckPacketSequenceNumber, rtt, rttVar, 8192, 1000, 1000, 1000);
+        ByteBuf cifBuf = Unpooled.buffer();
+        cif.encodeTo(cifBuf);
+        ControlPacket packet = new ControlPacket(ControlType.ACK, ackNumber, 0, destination, cifBuf);
+        var out = Unpooled.buffer();
+        packet.encodeTo(out);
+        byte[] bytes = new byte[out.readableBytes()];
+        out.readBytes(bytes);
+        out.release();
+
+        caller.send(new DatagramPacket(bytes, bytes.length, listener.localAddress()));
+    }
+
+    /** Reads incoming packets until a DATA packet is found (skipping control traffic, e.g. periodic ACKs). */
+    private DataPacket receiveData() throws IOException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline) {
+            byte[] buffer = new byte[2048];
+            DatagramPacket incoming = new DatagramPacket(buffer, buffer.length);
+            caller.receive(incoming);
+
+            ByteBuf buf = Unpooled.wrappedBuffer(incoming.getData(), 0, incoming.getLength());
+            SrtPacket packet = SrtPacket.decode(buf);
+            if (packet instanceof DataPacket data) {
+                return data;
+            }
+            if (packet != null) {
+                packet.body().release();
+            }
+        }
+        throw new AssertionError("No DATA packet received within " + TIMEOUT_SECONDS + "s");
     }
 
     private record FullAck(int ackNumber, AckCif cif) {

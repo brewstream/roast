@@ -57,6 +57,16 @@ import java.util.function.Consumer;
  * same-timestamp bandwidth-probe trick gosrt's {@code Push} does. See
  * STATUS.md's known gaps.
  *
+ * <p><b>ByteBuf ownership</b>: {@code deliver} always receives a {@link
+ * #duplicate}, never the entry actually held in {@code packetList}/{@code
+ * lossList} — every packet this class hands out, first send or retransmit
+ * alike, is a fresh {@code retainedDuplicate()} so the original stays valid
+ * in {@code lossList} for a possible future {@link #nak}, per this
+ * codebase's ByteBuf convention ({@code encodeTo} consumes/releases a
+ * packet's body once actually sent). {@code deliver}'s implementation owns
+ * releasing what it's handed (directly, or by handing it to something that
+ * will, like {@code encodeTo}).
+ *
  * <p>Not thread-safe, same as this codebase's other buffer/list state.
  */
 public final class SendBuffer {
@@ -104,13 +114,22 @@ public final class SendBuffer {
     /**
      * Delivers whatever's due as of {@code nowMicros}, then drops whatever in
      * {@link #lossList} has aged past the drop threshold (sender-side
-     * TLPKTDROP). Ported from gosrt's {@code Tick}.
+     * TLPKTDROP). Ported from gosrt's {@code Tick} — with one necessary
+     * departure: gosrt hands {@code deliver} the same in-memory packet object
+     * that also stays in its loss list, harmless in Go since nothing there
+     * consumes/releases it. Here, the packet actually going out over the wire
+     * has its {@code ByteBuf} consumed/released by {@code encodeTo} once
+     * sent — so this hands {@code deliver} a {@link #duplicate} instead,
+     * keeping the original safely in {@link #lossList} for a possible later
+     * {@link #nak}. (An earlier version of this method delivered the
+     * original directly; a NAK-triggered retransmit after a real send would
+     * have called {@code retainedDuplicate()} on an already-released buffer.)
      */
     public void tick(long nowMicros) {
         while (!packetList.isEmpty() && packetList.peekFirst().scheduledSendMicros() <= nowMicros) {
             Entry entry = packetList.pollFirst();
             avgPayloadSize = avgPayloadSize * 0.875 + entry.packet().payload().readableBytes() * 0.125;
-            deliver.accept(entry.packet());
+            deliver.accept(duplicate(entry.packet(), false));
             lossList.addLast(entry);
         }
 
@@ -151,16 +170,18 @@ public final class SendBuffer {
             Entry entry = it.next();
             for (LossRange range : ranges) {
                 if (entry.seq().greaterThanOrEqual(range.start()) && entry.seq().lessThanOrEqual(range.end())) {
-                    DataPacket original = entry.packet();
-                    DataPacket retransmit = new DataPacket(
-                            original.sequenceNumber(), original.pp(), original.inOrder(), original.kk(), true,
-                            original.messageNumber(), original.timestamp(), original.destination(),
-                            original.payload().retainedDuplicate());
-                    deliver.accept(retransmit);
+                    deliver.accept(duplicate(entry.packet(), true));
                     break;
                 }
             }
         }
+    }
+
+    private static DataPacket duplicate(DataPacket original, boolean retransmitted) {
+        return new DataPacket(
+                original.sequenceNumber(), original.pp(), original.inOrder(), original.kk(), retransmitted,
+                original.messageNumber(), original.timestamp(), original.destination(),
+                original.payload().retainedDuplicate());
     }
 
     /** Test-support only, mirrors gosrt's own same-package whitebox test access to its lists' lengths. */
