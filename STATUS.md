@@ -69,6 +69,34 @@ Roast can now both accept and initiate connections. Real interop confirming
 our caller against libsrt/gosrt acting as *listener* hasn't been done yet —
 see "Next steps."
 
+**A real, confirmed correctness bug was found via manual interop testing**
+(ffmpeg pushing a real, continuous MPEG-TS stream through a Roast listener at
+realistic bitrate, via the new `RelayDemo` tool — the first time this
+codebase has been exercised under sustained real throughput rather than a
+handful of test packets). Root-caused via a `tcpdump` packet capture decoded
+with our own `SrtPacket.decode` (see "Testing methodology" for the exact
+method): `AckSender`'s ACK boundary stayed frozen at the start of the
+*oldest* unresolved gap in `LossList` for the entire ~120ms TLPKTDROP window,
+even while dozens of packets arrived cleanly behind it. **This specific bug
+is now fixed** — `ReceiveBuffer.computeAckBoundary` decouples the ACK
+boundary from the delivery boundary, matching gosrt's real two-boundary
+design exactly (verified against `TestIssue67`, a real historical gosrt bug
+fix for this identical failure mode — see "Testing methodology"). See "Known
+gaps" for the full before/after story.
+
+**However, re-running the `RelayDemo` + real-ffmpeg reproduction after the
+fix still shows corruption, essentially unchanged.** A follow-up diagnostic
+(decoding `DROPREQ` directly, no `tcpdump` needed) found `DROPREQ` arriving
+only ~4-10ms after our *very first* NAK for a fresh loss — too fast to be
+explained by ACK-boundary lag (we hadn't had time to send a follow-up ACK
+yet). So the ACK-boundary fix was real and correct, but **not the dominant
+cause** of the interop symptom — a second, distinct, not-yet-root-caused
+issue remains, most likely genuine frequent packet loss on loopback itself
+(JVM/event-loop scheduling jitter is the leading suspect; Netty socket-buffer
+sizing and this codebase's own blocking I/O were both checked and ruled out
+during the same investigation). **Not yet investigated further** — this is
+the actual top priority now, ahead of any Phase 5/6 work; see "Next steps."
+
 169 tests passing (128 default + 2 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 5 `SrtConnectionTest` send-side + 11
@@ -203,19 +231,27 @@ numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
   `ControlPacket` via `LossListCodec`.
 - `AckSender` — decides when to send an ACK and which variant (Full ~every 10ms,
   Light for every 64 packets in between — gosrt's own receiver never emits Small
-  despite the wire format supporting it, neither does this), built directly on
-  `LossList`'s state. RTT/RTTVar/buffer/rate figures are caller-supplied per
-  `tick` — `SrtConnection` currently hardcodes them to 0, not measured yet.
-  `nowMicros` must be elapsed time since this receiver's own start, matching
-  gosrt's `lastPeriodicACK` zero-value-start semantics exactly.
-- `ReceiveBuffer` (+ `DeliveryResult`) — holds accepted DATA packets sorted by
-  sequence number, delivers whatever's contiguous-or-abandoned and past its
-  TSBPD deadline (wire timestamp + a per-connection time base + negotiated
-  latency + clock drift). Combines what DESIGN.md separately names
-  `ReceiveBuffer` and `TsbpdDeliverer` (gosrt keeps them as one struct too).
-  Implements TLPKTDROP: gives up on a stale gap once a later packet's deadline
-  has passed rather than blocking delivery forever. Delivery deadlines are
-  computed live at `deliver()`-check time (not frozen when a packet is
+  despite the wire format supporting it, neither does this). No longer depends
+  on `LossList` at all — the "last acknowledged" sequence number is now
+  supplied by the caller on each `tick` (computed by `ReceiveBuffer.computeAckBoundary`,
+  below), so this class is purely the timing/variant decision plus CIF
+  construction. RTT/RTTVar/buffer/rate figures are also caller-supplied —
+  `SrtConnection` currently hardcodes the buffer/rate ones to 0, not measured
+  yet. `nowMicros` must be elapsed time since this receiver's own start,
+  matching gosrt's `lastPeriodicACK` zero-value-start semantics exactly.
+- `ReceiveBuffer` (+ `DeliveryResult`, `AckBoundaryResult`) — holds accepted
+  DATA packets sorted by sequence number. Tracks **two separate boundaries**,
+  matching gosrt's `lastACKSequenceNumber`/`lastDeliveredSequenceNumber` split
+  exactly (a fix landed 2026-08-29 after real interop testing found the old
+  single-boundary design starved a real peer's send buffer — see "Known gaps"
+  and "Testing methodology"): `computeAckBoundary(nowMicros)` walks the buffer
+  from the ACK boundary forward, skipping a packet whose own TSBPD deadline
+  has already passed *even across a gap* (the actual TLPKTDROP "give up"
+  decision lives here now) or advancing normally through contiguous packets —
+  call once per tick, before `deliver`. `deliver(ackBoundary, nowMicros)` is
+  now a purely mechanical hand-out, gated by both that boundary and each
+  entry's own deadline; it no longer independently discovers gaps. Delivery
+  deadlines are computed live at query time (not frozen when a packet is
   buffered) — matches libsrt's `getPktTime()` model, so an already-buffered
   packet's deadline correctly shifts if drift/time-base changes while it's
   still waiting. Also handles 32-bit wire-timestamp wraparound (`updateWrapPeriod`/
@@ -274,6 +310,19 @@ has no universal "send a rejection back" move the way a listener does.
 
 **`harness`** (test-only) — `UdpLossProxy`: standalone UDP relay that randomly
 drops packets in both directions, for exercising ARQ without OS-level netem.
+
+**`cli`** (manual tool, not part of the build's test suite) — `RelayDemo`:
+binds one `SrtListener`, treats any connection whose StreamID starts with
+`publish/` as the source and every other connection as a player, relaying
+whatever the source sends to all currently-connected players as-is. Run via
+`./gradlew relayDemo` (`-Pport=<n>` to override the default 9000). This is
+what surfaced the ACK-boundary bug above — pushing a real ffmpeg stream
+through it at realistic bitrate was the first time this codebase saw
+sustained real throughput rather than a handful of test packets. A natural,
+minimal early prototype of DESIGN.md's eventual Phase 6
+`srt-java-live-transmit` CLI, though not held to this codebase's usual rigor
+(no design-note javadoc, no tests, by design — see the class's own doc
+comment).
 
 **`interop`** (test-only) — `LibsrtInteropTest`: binds `SrtListener`, launches the
 real `srt-live-transmit` binary as a subprocess against it. Two directions:
@@ -413,6 +462,41 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   integration proof than gosrt's own `dial_test.go` gets, since it exercises
   two independently-built real Roast components together rather than one
   real piece plus a fake.
+- **A new methodology precedent, 2026-08-29**: the ACK-boundary bug above was
+  found and root-caused via manual, sustained-real-throughput interop testing
+  (`RelayDemo` + real ffmpeg) — the first time this codebase was exercised
+  beyond a handful of test packets — and confirmed at the wire level via a
+  `tcpdump -i lo0 -w file.pcap` capture, decoded with a temporary tool that
+  reused our own `SrtPacket.decode`/`AckCif.decode`/`LossListCodec.decode`
+  directly against the raw captured bytes (not manual hex reading, not a
+  third-party SRT dissector). That tool was throwaway and has been removed
+  after use, but the technique — capture on loopback, decode with our own
+  codec — is worth remembering as the way to get wire-level ground truth
+  when app-level logging isn't conclusive enough on its own.
+- **`ReceiveBuffer.computeAckBoundary`** (the ACK-boundary fix above) is
+  grounded at the strongest tier this codebase has used for a piece this
+  architecturally significant: `matchesGosrtTestIssue67` in
+  `ReceiveBufferTest` is a direct port of gosrt's `TestIssue67`
+  (`congestion/live/receive_test.go`) — a real, historical gosrt bug fix for
+  this exact failure category (ack boundary stuck behind a gap), not a
+  self-designed scenario. `ackAndDeliveryBoundariesConvergeWithNoGap` is
+  inspired by gosrt's `TestRecvDropTooLate`, which asserts
+  `lastACKSequenceNumber`/`lastDeliveredSequenceNumber` as genuinely
+  distinct fields — confirming the two-boundary model itself, not just one
+  bug scenario in it.
+- **The user directly challenged a piece of the diagnostic code during this
+  investigation** ("did you write bad netty code? are those log lines
+  synchronous on the main event loop?"). The honest answer was yes for one
+  early version — a first `ReceiveDumpDemo` draft called
+  `FileOutputStream.flush()` per packet inside `onData`, a real
+  synchronous-disk-I/O-on-the-event-loop anti-pattern — already caught and
+  fixed before the question was asked, but the challenge was answered
+  precisely rather than deflected, and cross-checked against the fact that
+  the *original*, always-blocking-I/O-free `RelayDemo` showed the same
+  magnitude of loss, which is what actually rules out the diagnostic code as
+  the (sole) cause. Both temporary diagnostic tools built for this
+  investigation (`ReceiveDumpDemo`, `PcapAnalyzer`) were thrown away after
+  use, per the established "no scope creep beyond what's asked" discipline.
 
 ## Known gaps / deliberately deferred
 
@@ -426,13 +510,40 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   "What's built" and "Testing methodology". No HSv4 fallback and no
   induction/conclusion retry-with-backoff, both matching gosrt's own
   `dial.go` (deferred, not gaps introduced beyond the reference).
-- ~~TLPKTDROP's interaction with ACK generation~~ **Closed** — `ReceiveBuffer`
-  implements TLPKTDROP and feeds abandoned gaps back into `LossList.abandon(...)`
-  via `SrtConnection`'s tick. Note it's a deliberate simplification of gosrt's
-  exact mechanism, not a byte-for-byte port — see `ReceiveBuffer`'s javadoc and
-  `ReceiveBufferTest`'s ported `TestSkipTooLate` for exactly where they diverge
-  (gosrt runs a separate ACK-boundary-vs-delivery-boundary computation this
-  codebase deliberately unifies into one).
+- ~~The ACK boundary stays frozen behind the oldest unresolved gap for the
+  full TLPKTDROP window, starving the peer's send buffer~~ **Closed,
+  2026-08-29** — `ReceiveBuffer.computeAckBoundary` now ports gosrt's real
+  two-boundary design (separate `lastAcked`/`lastDelivered`, walked every
+  tick with TLPKTDROP's "give up across a gap" decision moved into the ACK
+  walk itself), verified against `TestIssue67` (a real historical gosrt bug
+  fix for this identical failure mode) — see "What's built" and "Testing
+  methodology". Root-caused via real interop testing (`RelayDemo` + real
+  ffmpeg, `tcpdump` capture decoded with our own codec — see "Where we are").
+  **However, re-running the same real-ffmpeg reproduction after this fix
+  still shows corruption, essentially unchanged** — this fix was real and
+  independently verified, but turned out not to be the dominant cause of the
+  interop symptom. See the next entry.
+- **NEW, top priority: a second, distinct, not-yet-root-caused source of
+  real data loss/corruption under sustained real throughput.** Found
+  2026-08-29 while re-verifying the ACK-boundary fix above: pushing a real
+  ffmpeg stream through `RelayDemo` still shows MPEG-TS corruption at a
+  similar rate to before the fix. A follow-up diagnostic (decoding `DROPREQ`
+  control packets directly off the wire, no `tcpdump` needed this time)
+  found libsrt replying `DROPREQ` only ~4-10ms after *our very first* NAK
+  for a fresh loss — far too fast to be explained by ACK-boundary lag, since
+  no follow-up ACK could even have been sent in that window. This rules out
+  the just-fixed bug as the (sole) explanation and points at something more
+  fundamental: the leading hypothesis is genuine, frequent packet loss on
+  loopback itself, caused by JVM/event-loop scheduling jitter (a GC pause or
+  a delayed tick leaving the socket's receive buffer to fill and drop under
+  real, sustained throughput — never exercised before `RelayDemo`). Already
+  checked and ruled out during the same investigation: Netty `SO_RCVBUF`/
+  `MAX_MESSAGES_PER_READ` tuning (no effect), and this codebase's own
+  diagnostic code introducing blocking I/O on the event loop (checked
+  directly per the user's own challenge — see "Testing methodology" — and
+  confirmed not the cause, since the original unmodified `RelayDemo` shows
+  the same magnitude of loss). **Not yet root-caused** — needs its own
+  investigation pass before Phase 5/6 work; see "Next steps."
 - ~~No RTT measurement~~ **Closed** — `SrtConnection` now tracks real RTT/RTTVar
   from ACK/ACKACK round trips and feeds them to `AckSender.tick` and the
   periodic NAK interval; see "What's built" and "Testing methodology" (the
@@ -477,18 +588,29 @@ directly from libsrt's own source, not assumed). Both skip themselves via
 
 ## Next steps, in order
 
-1. Real interop confirming `SrtCaller` against libsrt/gosrt acting as
+1. **Root-cause the second, still-open real-throughput loss/corruption
+   issue** (see "Known gaps" — now the top priority, ahead of any Phase 5/6
+   work, since the ACK-boundary bug that was previously #1 here is now
+   fixed). Leading hypothesis: genuine loopback packet loss from
+   JVM/event-loop scheduling jitter under sustained real throughput, not a
+   protocol-logic bug like the one just closed. Netty socket-buffer tuning
+   and this codebase's own blocking I/O are already ruled out. Needs its own
+   investigation pass — likely more `tcpdump`/wire-level diagnosis, or
+   instrumenting actual tick-to-tick timing on the event loop to check the
+   jitter hypothesis directly — before it can be scoped as a fix the way the
+   ACK-boundary bug was.
+2. Real interop confirming `SrtCaller` against libsrt/gosrt acting as
    *listener* — needs `srt-live-transmit` launched with `mode=listener` in its
    URI (the existing interop tests always run it as caller). The connection
    lifecycle's structural gaps are otherwise closed; this is proof against an
    independent implementation, matching how every other piece here eventually
    got that treatment.
-2. With both `SrtListener`/`SrtCaller` and full send/receive paths in place,
+3. With both `SrtListener`/`SrtCaller` and full send/receive paths in place,
    the natural next major milestone is DESIGN.md's Phase 6 (multiplexing &
    polish) or Phase 5 (encryption) — worth a deliberate choice with the user
    rather than assumed, since both are substantial and neither is blocking
    the other.
-3. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
+4. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
    against `SrtListener`, for full belt-and-suspenders confidence beyond
    `srt-live-transmit` — not expected to surface anything new, since ffmpeg
    wraps the same libsrt handshake code already exercised.
