@@ -34,11 +34,13 @@ is also where DESIGN.md's "Extensibility & observability" hooks became real
 rather than aspirational: `onData`/`onLoss`/`onTlpktDrop` on `SrtConnection`
 (`SrtListener.onConnection` now hands out `SrtConnection`, not bare
 `AcceptedConnection` — see "Architecture decisions" for the API-shape note).
-Still missing: KEEPALIVE/SHUTDOWN/ACKACK handling, RTT measurement (NAK
-re-announce interval is a fixed floor, not RTT-adaptive), drift correction, and
-the entire sender-side path (Phase 4) — see "Known gaps."
+KEEPALIVE (echoed back on receipt) and SHUTDOWN (tears down, sends our own
+SHUTDOWN back, fires a new `onClose` hook) are now handled too. Still missing:
+ACKACK handling, RTT measurement (NAK re-announce interval is a fixed floor, not
+RTT-adaptive), drift correction, and the entire sender-side path (Phase 4) — see
+"Known gaps."
 
-127 tests passing (126 default + 1 gated interop), all committed to `main` (no
+129 tests passing (128 default + 1 gated interop), all committed to `main` (no
 branches). Every commit so far has been asked-for explicitly by the user, one
 narrowly-scoped piece at a time — see git log for the exact sequence and
 rationale (commit messages are detailed).
@@ -93,9 +95,15 @@ dropped, never thrown.
   `ReceiveBuffer` for its lifetime, registered as its socket ID's `SrtPacketSink`,
   driven by a ~10ms tick on the connection's own Netty event loop (no
   synchronization needed — packet arrival and the tick both run on that one
-  thread). Only DATA packets are handled; KEEPALIVE/SHUTDOWN/ACKACK are logged
-  and dropped (not implemented yet). Exposes `onData`/`onLoss`/`onTlpktDrop` —
-  see below — and `.metadata()` returning its `AcceptedConnection`.
+  thread). Handles DATA, KEEPALIVE (echoed back on receipt — see "Known gaps"
+  for a real ping-pong risk this inherits from gosrt, verified safe against
+  libsrt specifically), and SHUTDOWN (`close()`: sends our own SHUTDOWN back
+  unconditionally — mirroring gosrt's symmetric teardown, not a one-sided
+  notification — then tears down; idempotent via an `AtomicBoolean` guard,
+  since it's reachable both from a peer's SHUTDOWN on the event loop and from
+  `SrtListener.close()` on an arbitrary thread). ACKACK is still logged and
+  dropped. Exposes `onData`/`onLoss`/`onTlpktDrop`/`onClose` — see below — and
+  `.metadata()` returning its `AcceptedConnection`.
 - `ConnectionRequest` / `AcceptDecision` / `AcceptHandler` / `AcceptedConnection`
   — the extensibility surface added per DESIGN.md's "Extensibility &
   observability" section: rich accept/reject (peer address, StreamID, SRT
@@ -234,17 +242,23 @@ falls back to `references/srt/build/srt-live-transmit`.
 - **No drift correction, no 32-bit wire-timestamp wraparound handling** in
   `ReceiveBuffer` — correct for connections under ~71 minutes; documented in its
   class javadoc, not silent.
-- **KEEPALIVE, SHUTDOWN, ACKACK, and the entire sender-side path (Phase 4)** —
-  untouched. `SrtConnection` logs and drops anything that isn't a DATA packet.
-  This is why a connection can currently receive but not send, and why nothing
-  closes a connection cleanly on the peer's own SHUTDOWN yet.
+- **KEEPALIVE's echo-on-receipt has no rate limit** — ported faithfully from
+  gosrt's `handleKeepAlive`, which doesn't gate it either, but two peers that
+  *both* echo immediately on receipt could in theory tight-loop forever (neither
+  gosrt nor the RFC's own KEEPALIVE section impose a limit). Verified safe
+  against libsrt (doesn't echo on receipt) — reconsider a rate limit before this
+  codebase gets its own keepalive-originating caller/sender side.
+- **ACKACK, and the entire sender-side path (Phase 4)** — untouched.
+  `SrtConnection` logs and drops anything that isn't DATA/KEEPALIVE/SHUTDOWN.
+  This is why a connection can currently receive but not send.
 
 ## Next steps, in order
 
-1. **KEEPALIVE, SHUTDOWN, ACKACK** — `SrtConnection` currently drops all three.
-   ACKACK in particular unlocks RTT measurement (needs the ACK/ACKACK round-trip
-   timing), which unlocks making `AckSender`'s figures and the periodic NAK
-   interval real instead of hardcoded/fixed.
+1. **ACKACK handling + RTT measurement** — `SrtConnection` currently drops
+   ACKACK. Handling it unlocks real RTT/RTTVar tracking (time between sending a
+   Full ACK and receiving its ACKACK reply), which unlocks making `AckSender`'s
+   hardcoded-zero figures and the fixed periodic NAK interval real instead of
+   fake/fixed.
 2. Drift correction and 32-bit wire-timestamp wraparound handling in
    `ReceiveBuffer` — matters once a connection runs long enough to hit either.
 3. The sender-side path (Phase 4) — send buffer, live-mode pacing, NAK-driven
