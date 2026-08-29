@@ -58,12 +58,24 @@ itself — see "Testing methodology." **Confirmed against real libsrt 1.5.7**:
 byte-for-byte correctness — the actual DESIGN.md definition-of-done for
 Phase 4's interop story, not just our own round-trip tests.
 
-155 tests passing (128 default + 2 gated interop + 2 ACKACK/RTT + 5
+**Caller-side handshake is done**: `SrtCaller.connect(...)` connects *out* to
+a peer's listener — new `CallerHandshake` (mirrors `ListenerHandshake`) plus
+the Netty wiring. `SrtConnection` needed no protocol changes at all (it was
+already role-agnostic); one small addition for channel lifecycle only — see
+"What's built". Verified with a real round trip against Roast's own
+`SrtListener` (data flowing both directions), plus rejection and timeout
+paths. **This closes the last structural gap in the connection lifecycle** —
+Roast can now both accept and initiate connections. Real interop confirming
+our caller against libsrt/gosrt acting as *listener* hasn't been done yet —
+see "Next steps."
+
+169 tests passing (128 default + 2 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
-wraparound + 10 `SendBufferTest` + 5 new `SrtConnectionTest` send-side
-cases), all committed to `main` (no branches). Every commit so far has been
-asked-for explicitly by the user, one narrowly-scoped piece at a time — see
-git log for the exact sequence and rationale (commit messages are detailed).
+wraparound + 10 `SendBufferTest` + 5 `SrtConnectionTest` send-side + 11
+`CallerHandshakeTest` + 3 `SrtCallerTest`), all committed to `main` (no
+branches). Every commit so far has been asked-for explicitly by the user, one
+narrowly-scoped piece at a time — see git log for the exact sequence and
+rationale (commit messages are detailed).
 
 ## What's built
 
@@ -145,7 +157,28 @@ dropped, never thrown.
   mirrored by both peers — confirmed in gosrt and in `ListenerHandshake`, which
   echoes the peer's own value back rather than generating a fresh one).
   Exposes `onData`/`onLoss`/`onTlpktDrop`/`onRetransmit`/`onClose` — see
-  below — and `.metadata()` returning its `AcceptedConnection`.
+  below — and `.metadata()` returning its `AcceptedConnection`. Fully
+  role-agnostic: `SrtCaller` (below) constructs the exact same class, unchanged,
+  for a dialed-out connection. The one addition made *for* that: a
+  package-private 5-arg constructor overload carrying an `onChannelOwnerClose`
+  callback, run as part of `close()`'s fixed internal teardown (not the
+  app-facing `onClose` hook, which a caller-created connection's dedicated
+  channel/event-loop-group cleanup can't safely share with an application's
+  own `onClose(...)` call — that would silently clobber it and leak the
+  channel). The public 4-arg constructor (still what `SrtListener` uses)
+  delegates to it with a no-op.
+- `SrtCaller` — connects *out* to a peer's listener: binds a dedicated
+  ephemeral-port channel with the *same* pipeline `SrtListener.bind` uses
+  (`SrtFrameDecoder`/`SrtFrameEncoder`/`SrtSocketIdDemultiplexer` don't care
+  whether a channel talks to one peer or many), drives `CallerHandshake`
+  (below) through it, and on success builds a plain `SrtConnection` — no
+  protocol-layer changes needed there at all. `connect(InetSocketAddress,
+  String)` returns a `CompletableFuture<SrtConnection>`; single-shot, no
+  induction/conclusion retry on packet loss (matches gosrt's `dial.go`, which
+  doesn't retry either — a known simplification vs. real libsrt, which does
+  retry with backoff per spec). No HSv4 fallback (DESIGN.md defers that to
+  Phase 7) and no `SrtConfig` yet, matching `SrtListener`'s existing
+  hardcoded-defaults precedent.
 - `ConnectionRequest` / `AcceptDecision` / `AcceptHandler` / `AcceptedConnection`
   — the extensibility surface added per DESIGN.md's "Extensibility &
   observability" section: rich accept/reject (peer address, StreamID, SRT
@@ -229,6 +262,15 @@ per-attempt state, verified against gosrt's golden vector.
 induction→conclusion exchange as **pure decision logic** — given a decoded
 `HandshakeCif`, produces the `HandshakeCif` to send back. No socket I/O itself;
 `SrtListener` is what actually calls it over a live channel.
+`CallerHandshake` (+ `ConclusionReplyOutcome`): the caller-side mirror, same
+pure-decision-logic contract, ported from gosrt's `dial.go` — builds the
+induction/conclusion requests, validates the induction reply (HSv5 only) and
+the conclusion reply against the same capability checklist
+`ListenerHandshake.validateConclusion` runs, from the caller's side.
+`ConclusionReplyOutcome` adds a third case beyond `ConclusionOutcome`'s
+`Valid`/`Rejected`: `ProtocolViolation` — a caller receiving a broken reply
+has no universal "send a rejection back" move the way a listener does.
+`SrtCaller` is what actually calls it over a live channel.
 
 **`harness`** (test-only) — `UdpLossProxy`: standalone UDP relay that randomly
 drops packets in both directions, for exercising ARQ without OS-level netem.
@@ -358,6 +400,19 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   is a regression test that fails without the fix; `SrtConnectionTest`'s
   `nakOnUnacknowledgedPacketTriggersRetransmit` exercises the real path (an
   actual Netty encoder in the loop) end-to-end.
+- **`CallerHandshake`** has no gosrt test file to port from — checked
+  directly: `dial_test.go`'s tests (`TestDialOK`, `TestDialReject`,
+  `TestDialV4`/`V5`/`V5Pre130`/`V5MissingExtension`,
+  `TestDialWithContextCancel`) are integration-style against a hand-rolled
+  fake listener, not narrow unit tests of an isolated piece the way
+  `send_test.go` was for `SendBuffer`. `CallerHandshakeTest` is self-designed
+  against `dial.go`'s source — same rigor tier as `ListenerHandshake`'s own
+  tests (still not itself re-checked against a gosrt test file either, per
+  the entry above). `SrtCallerTest`, by contrast, verifies a real round trip
+  against Roast's own `SrtListener` in-process — arguably a stronger
+  integration proof than gosrt's own `dial_test.go` gets, since it exercises
+  two independently-built real Roast components together rather than one
+  real piece plus a fake.
 
 ## Known gaps / deliberately deferred
 
@@ -367,7 +422,10 @@ directly from libsrt's own source, not assumed). Both skip themselves via
 - **No `SrtConfig`** — `SrtListener` hardcodes 120ms latency (both directions)
   and SRT version `0x010401` (matching gosrt's own baseline).
 - **Encryption** (KMREQ/KMRSP, PBKDF2, AES-CTR) — Phase 5 in DESIGN.md, untouched.
-- **Caller-side handshake** (dial/connect flow) — only the listener side exists.
+- ~~Caller-side handshake~~ **Closed** — `SrtCaller`/`CallerHandshake`; see
+  "What's built" and "Testing methodology". No HSv4 fallback and no
+  induction/conclusion retry-with-backoff, both matching gosrt's own
+  `dial.go` (deferred, not gaps introduced beyond the reference).
 - ~~TLPKTDROP's interaction with ACK generation~~ **Closed** — `ReceiveBuffer`
   implements TLPKTDROP and feeds abandoned gaps back into `LossList.abandon(...)`
   via `SrtConnection`'s tick. Note it's a deliberate simplification of gosrt's
@@ -419,11 +477,18 @@ directly from libsrt's own source, not assumed). Both skip themselves via
 
 ## Next steps, in order
 
-1. Caller-side handshake (dial/connect flow) — only the listener side exists
-   today; this unlocks Roast connecting *out* to a peer's listener, not just
-   accepting inbound connections. The one remaining structural gap in the
-   connection lifecycle.
-2. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
+1. Real interop confirming `SrtCaller` against libsrt/gosrt acting as
+   *listener* — needs `srt-live-transmit` launched with `mode=listener` in its
+   URI (the existing interop tests always run it as caller). The connection
+   lifecycle's structural gaps are otherwise closed; this is proof against an
+   independent implementation, matching how every other piece here eventually
+   got that treatment.
+2. With both `SrtListener`/`SrtCaller` and full send/receive paths in place,
+   the natural next major milestone is DESIGN.md's Phase 6 (multiplexing &
+   polish) or Phase 5 (encryption) — worth a deliberate choice with the user
+   rather than assumed, since both are substantial and neither is blocking
+   the other.
+3. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
    against `SrtListener`, for full belt-and-suspenders confidence beyond
    `srt-live-transmit` — not expected to surface anything new, since ffmpeg
    wraps the same libsrt handshake code already exercised.
