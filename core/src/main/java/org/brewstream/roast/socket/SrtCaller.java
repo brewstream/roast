@@ -1,0 +1,245 @@
+package org.brewstream.roast.socket;
+
+import io.netty.bootstrap.Bootstrap;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.AddressedEnvelope;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelInitializer;
+import io.netty.channel.DefaultAddressedEnvelope;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
+import io.netty.channel.nio.NioIoHandler;
+import io.netty.channel.socket.DatagramChannel;
+import io.netty.channel.socket.nio.NioDatagramChannel;
+import io.netty.util.concurrent.ScheduledFuture;
+import org.brewstream.roast.codec.SrtFrameDecoder;
+import org.brewstream.roast.codec.SrtFrameEncoder;
+import org.brewstream.roast.handshake.CallerHandshake;
+import org.brewstream.roast.handshake.ConclusionReplyOutcome;
+import org.brewstream.roast.packet.ControlPacket;
+import org.brewstream.roast.packet.ControlType;
+import org.brewstream.roast.packet.SrtPacket;
+import org.brewstream.roast.packet.SrtSocketId;
+import org.brewstream.roast.packet.cif.HandshakeCif;
+import org.brewstream.roast.packet.cif.HandshakeType;
+import org.brewstream.roast.util.CircularNumber;
+
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.security.SecureRandom;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+/**
+ * Connects out to a peer's listener: the caller side of the HSv5 induction→
+ * conclusion exchange ({@link CallerHandshake}), driven over a dedicated Netty
+ * channel bound to an ephemeral local port — the same pipeline
+ * ({@link SrtFrameDecoder}/{@link SrtFrameEncoder}/{@link SrtSocketIdDemultiplexer})
+ * {@link SrtListener} uses, since neither codec cares whether the channel talks to
+ * one known peer or many. One {@code connect()} call, one dedicated channel/event
+ * loop group — unlike a listener's port, shared across many accepted connections,
+ * this one exists only for the resulting {@link SrtConnection} and is torn down
+ * with it (see the package-private constructor overload {@link SrtConnection} uses
+ * for this).
+ *
+ * <p>Everything after {@link #connect}'s bind completes runs on that one channel's
+ * event loop — handshake replies arrive there, the connect timeout fires there —
+ * so, like {@link SrtConnection} itself, this needs no internal synchronization.
+ *
+ * <p>Single-shot: no induction/conclusion retry on packet loss, matching gosrt's
+ * {@code dial.go} (which doesn't retry either) — a known simplification relative to
+ * real libsrt, which does retry with backoff per spec. No HSv4 fallback (DESIGN.md
+ * defers that to Phase 7) and no {@code SrtConfig} yet — latency/version/timeout
+ * are hardcoded, matching {@link SrtListener}'s existing precedent.
+ */
+public final class SrtCaller {
+
+    private static final Logger LOG = Logger.getLogger(SrtCaller.class.getName());
+    private static final SecureRandom RANDOM = new SecureRandom();
+    private static final int DEFAULT_LATENCY_MILLIS = 120;
+    private static final int DEFAULT_SRT_VERSION = 0x010401;
+    private static final long CONNECT_TIMEOUT_SECONDS = 5;
+
+    private final Channel channel;
+    private final EventLoopGroup eventLoopGroup;
+    private final SrtSocketIdDemultiplexer demultiplexer;
+    private final CallerHandshake callerHandshake = new CallerHandshake();
+    private final InetSocketAddress remoteAddress;
+    private final InetAddress localAddress;
+    private final SrtSocketId ownSocketId;
+    private final CircularNumber ownInitialSequenceNumber;
+    private final String streamId;
+    private final CompletableFuture<SrtConnection> result;
+    private final long startNanos = System.nanoTime();
+
+    private ScheduledFuture<?> timeoutTask;
+
+    private SrtCaller(Channel channel, EventLoopGroup eventLoopGroup, SrtSocketIdDemultiplexer demultiplexer,
+            InetSocketAddress remoteAddress, InetAddress localAddress, SrtSocketId ownSocketId,
+            CircularNumber ownInitialSequenceNumber, String streamId, CompletableFuture<SrtConnection> result) {
+        this.channel = channel;
+        this.eventLoopGroup = eventLoopGroup;
+        this.demultiplexer = demultiplexer;
+        this.remoteAddress = remoteAddress;
+        this.localAddress = localAddress;
+        this.ownSocketId = ownSocketId;
+        this.ownInitialSequenceNumber = ownInitialSequenceNumber;
+        this.streamId = streamId;
+        this.result = result;
+    }
+
+    /** Connects to {@code remoteAddress}, completing once the handshake finishes (or failing on rejection/timeout). */
+    public static CompletableFuture<SrtConnection> connect(InetSocketAddress remoteAddress, String streamId) {
+        CompletableFuture<SrtConnection> result = new CompletableFuture<>();
+        SrtSocketIdDemultiplexer demultiplexer = new SrtSocketIdDemultiplexer();
+        EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
+        Bootstrap bootstrap = new Bootstrap()
+                .group(group)
+                .channel(NioDatagramChannel.class)
+                .handler(new ChannelInitializer<DatagramChannel>() {
+                    @Override
+                    protected void initChannel(DatagramChannel ch) {
+                        ch.pipeline().addLast(new SrtFrameDecoder(), new SrtFrameEncoder(), demultiplexer);
+                    }
+                });
+
+        bootstrap.bind(0).addListener((ChannelFutureListener) future -> {
+            if (!future.isSuccess()) {
+                group.shutdownGracefully();
+                result.completeExceptionally(future.cause());
+                return;
+            }
+
+            Channel channel = future.channel();
+            SrtSocketId ownSocketId = new SrtSocketIdGenerator().generate();
+            InetAddress localAddress = ((InetSocketAddress) channel.localAddress()).getAddress();
+            CircularNumber ownInitialSequenceNumber = randomInitialSequenceNumber();
+
+            new SrtCaller(channel, group, demultiplexer, remoteAddress, localAddress, ownSocketId,
+                    ownInitialSequenceNumber, streamId, result)
+                    .start();
+        });
+
+        return result;
+    }
+
+    private void start() {
+        demultiplexer.register(ownSocketId, this::onHandshakeReply);
+        timeoutTask = channel.eventLoop().schedule(this::onTimeout, CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        send(callerHandshake.buildInductionRequest(ownSocketId, localAddress));
+    }
+
+    private void onHandshakeReply(AddressedEnvelope<SrtPacket, InetSocketAddress> msg) {
+        SrtPacket packet = msg.content();
+        if (result.isDone()) {
+            // Already failed (e.g. the connect timeout) - ignore a late reply.
+            packet.body().release();
+            return;
+        }
+        if (!(packet instanceof ControlPacket control) || control.type() != ControlType.HANDSHAKE) {
+            packet.body().release();
+            return;
+        }
+
+        HandshakeCif reply = HandshakeCif.decode(control.body(), false);
+        control.body().release();
+        if (reply == null) {
+            LOG.log(Level.FINE, "Dropping malformed handshake reply from {0}", msg.sender());
+            return;
+        }
+
+        if (reply.handshakeType() == HandshakeType.INDUCTION) {
+            handleInductionReply(reply);
+        } else {
+            handleConclusionReply(reply);
+        }
+    }
+
+    private void handleInductionReply(HandshakeCif reply) {
+        if (!callerHandshake.isSupportedInductionReply(reply)) {
+            fail(new IOException("peer doesn't support SRT handshake v5"));
+            return;
+        }
+        HandshakeCif conclusionRequest = callerHandshake.buildConclusionRequest(
+                reply, ownSocketId, localAddress, ownInitialSequenceNumber, DEFAULT_SRT_VERSION,
+                DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS, streamId);
+        send(conclusionRequest);
+    }
+
+    private void handleConclusionReply(HandshakeCif reply) {
+        ConclusionReplyOutcome outcome = callerHandshake.validateConclusionReply(
+                reply, DEFAULT_SRT_VERSION, DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS);
+
+        if (outcome instanceof ConclusionReplyOutcome.Connected connected) {
+            timeoutTask.cancel(false);
+            demultiplexer.unregister(ownSocketId);
+
+            AcceptedConnection metadata = new AcceptedConnection(
+                    ownSocketId, reply.srtSocketId(), remoteAddress, streamId,
+                    connected.receiveLatencyMillis(), connected.sendLatencyMillis(), connected.srtVersion());
+            SrtConnection connection = new SrtConnection(channel, demultiplexer, metadata, ownInitialSequenceNumber,
+                    () -> {
+                        channel.close();
+                        eventLoopGroup.shutdownGracefully();
+                    });
+
+            if (!result.complete(connection)) {
+                // A racing timeout already failed this connect - don't leak the connection we just built.
+                connection.close();
+            }
+            return;
+        }
+
+        if (outcome instanceof ConclusionReplyOutcome.Rejected rejected) {
+            fail(new IOException("connection rejected: " + rejected.reason()));
+            return;
+        }
+
+        ConclusionReplyOutcome.ProtocolViolation violation = (ConclusionReplyOutcome.ProtocolViolation) outcome;
+        sendShutdown(reply.srtSocketId());
+        fail(new IOException(violation.reason()));
+    }
+
+    private void onTimeout() {
+        fail(new TimeoutException("connection timeout: peer didn't respond"));
+    }
+
+    private void fail(Exception cause) {
+        if (result.isDone()) {
+            return;
+        }
+        timeoutTask.cancel(false);
+        demultiplexer.unregister(ownSocketId);
+        channel.close();
+        eventLoopGroup.shutdownGracefully();
+        result.completeExceptionally(cause);
+    }
+
+    private void sendShutdown(SrtSocketId peerSocketId) {
+        send(new ControlPacket(ControlType.SHUTDOWN, 0, elapsedMicros(), peerSocketId, channel.alloc().buffer(0)));
+    }
+
+    private void send(HandshakeCif cif) {
+        ByteBuf cifBuf = channel.alloc().buffer();
+        cif.encodeTo(cifBuf);
+        send(new ControlPacket(ControlType.HANDSHAKE, 0, elapsedMicros(), SrtSocketId.ZERO, cifBuf));
+    }
+
+    private void send(SrtPacket packet) {
+        channel.writeAndFlush(new DefaultAddressedEnvelope<>(packet, remoteAddress));
+    }
+
+    private int elapsedMicros() {
+        return (int) ((System.nanoTime() - startNanos) / 1000);
+    }
+
+    private static CircularNumber randomInitialSequenceNumber() {
+        int value = RANDOM.nextInt() & (int) SrtPacket.MAX_SEQUENCE_NUMBER;
+        return CircularNumber.of(value, SrtPacket.MAX_SEQUENCE_NUMBER);
+    }
+}

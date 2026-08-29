@@ -120,6 +120,7 @@ public final class SrtConnection {
     private final long startNanos = System.nanoTime();
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final Map<Integer, Long> pendingAcks = new HashMap<>();
+    private final Runnable onChannelOwnerClose;
 
     private long lastPeriodicNakMicros;
     private int fullAckCounter;
@@ -139,9 +140,24 @@ public final class SrtConnection {
 
     public SrtConnection(Channel channel, SrtSocketIdDemultiplexer demultiplexer, AcceptedConnection metadata,
             CircularNumber initialSequenceNumber) {
+        this(channel, demultiplexer, metadata, initialSequenceNumber, () -> { });
+    }
+
+    /**
+     * Used only by {@code SrtCaller}: a caller-created connection owns a dedicated
+     * channel/event-loop-group (1:1, unlike a listener's port shared across many
+     * connections), which {@code onChannelOwnerClose} tears down as part of {@link
+     * #close}'s existing fixed internal teardown — deliberately not routed through
+     * the app-facing {@link #onClose} hook, since that's a single overridable slot
+     * an application setting its own {@code onClose} handler would otherwise
+     * silently clobber, leaking the channel.
+     */
+    SrtConnection(Channel channel, SrtSocketIdDemultiplexer demultiplexer, AcceptedConnection metadata,
+            CircularNumber initialSequenceNumber, Runnable onChannelOwnerClose) {
         this.channel = channel;
         this.demultiplexer = demultiplexer;
         this.metadata = metadata;
+        this.onChannelOwnerClose = onChannelOwnerClose;
         this.lossList = new LossList(initialSequenceNumber);
         this.ackSender = new AckSender(lossList);
         this.receiveBuffer = new ReceiveBuffer(initialSequenceNumber, metadata.receiveLatencyMillis() * 1000L);
@@ -228,6 +244,7 @@ public final class SrtConnection {
         demultiplexer.unregister(metadata.socketId());
         receiveBuffer.dispose();
         sendBuffer.flush();
+        onChannelOwnerClose.run();
         onClose.run();
     }
 
