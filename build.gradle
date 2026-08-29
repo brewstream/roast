@@ -24,6 +24,24 @@ subprojects {
     }
 
     test {
-        useJUnitPlatform()
+        useJUnitPlatform {
+            excludeTags 'interop'
+        }
+    }
+
+    tasks.register('interopTest', Test) {
+        description = 'Runs interop tests against real SRT peers (e.g. srt-live-transmit). ' +
+                'Requires a locally built peer binary - see roast/references/srt. Skips itself ' +
+                '(does not fail) if the binary is not found.'
+        group = 'verification'
+        testClassesDirs = sourceSets.test.output.classesDirs
+        classpath = sourceSets.test.runtimeClasspath
+        useJUnitPlatform {
+            includeTags 'interop'
+        }
+        // Always show what happened - these are slow/environment-dependent, easy to lose track of.
+        testLogging {
+            events 'passed', 'skipped', 'failed'
+        }
     }
 }
