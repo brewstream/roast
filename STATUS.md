@@ -38,15 +38,18 @@ KEEPALIVE (echoed back on receipt) and SHUTDOWN (tears down, sends our own
 SHUTDOWN back, fires a new `onClose` hook) are now handled too. ACKACK is now
 handled as well, unlocking real RTT/RTTVar tracking and an RTT-adaptive periodic
 NAK interval (previously a fixed floor) — see "What's built" and "Testing
-methodology" below. `ReceiveBuffer` now also does TSBPD clock-drift correction,
-fed by the same ACKACK path. Still missing: 32-bit wire-timestamp wraparound
-handling and the entire sender-side path (Phase 4) — see "Known gaps."
+methodology" below. `ReceiveBuffer` now also does TSBPD clock-drift correction
+and 32-bit wire-timestamp wraparound handling, both fed by/tied into the same
+ACKACK/delivery-time machinery. **Phase 3 (receiver path) is now feature-complete
+per DESIGN.md's phased plan** — the only thing left is the entire sender-side
+path (Phase 4); see "Known gaps."
 
-137 tests passing (128 default + 1 gated interop + 2 ACKACK/RTT + 5 new
-`DriftTracerTest` + 2 new `ReceiveBufferTest` drift cases), all committed to
-`main` (no branches). Every commit so far has been asked-for explicitly by the
-user, one narrowly-scoped piece at a time — see git log for the exact sequence
-and rationale (commit messages are detailed).
+141 tests passing (128 default + 1 gated interop + 2 ACKACK/RTT + 5
+`DriftTracerTest` + 2 `ReceiveBufferTest` drift cases + 4 `ReceiveBufferTest`
+wraparound cases), all committed to `main` (no branches). Every commit so far
+has been asked-for explicitly by the user, one narrowly-scoped piece at a
+time — see git log for the exact sequence and rationale (commit messages are
+detailed).
 
 ## What's built
 
@@ -156,9 +159,14 @@ numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
   computed live at `deliver()`-check time (not frozen when a packet is
   buffered) — matches libsrt's `getPktTime()` model, so an already-buffered
   packet's deadline correctly shifts if drift/time-base changes while it's
-  still waiting. No 32-bit wire-timestamp wraparound handling yet (correct
-  under ~71 minutes) — documented in the class javadoc, not silent.
-  `dispose()` releases undelivered buffered payloads on connection teardown.
+  still waiting. Also handles 32-bit wire-timestamp wraparound (`updateWrapPeriod`/
+  `carryoverMicros`, ported from gosrt's `handlePacket` state machine /
+  libsrt's `CTsbpdTime::updateBaseTime`): a full 2^32µs cycle is provisionally
+  applied per-query once a packet's timestamp comes within 30s of wrapping,
+  then permanently folded into the time base once a later packet confirms the
+  wrap actually happened — composes correctly with drift correction since
+  both now live in the same per-query formula. `dispose()` releases
+  undelivered buffered payloads on connection teardown.
 - `DriftTracer` — median-based clock-drift estimator, ported from libsrt's
   generic `DriftTracer<MAX_SPAN, MAX_DRIFT, CLEAR_ON_UPDATE=true>` template
   (`utilities.h`), specialized to libsrt's own constants (1000-sample span,
@@ -273,6 +281,16 @@ falls back to `references/srt/build/srt-live-transmit`.
   checked directly, not assumed. So `DriftTracerTest` and the two new
   `ReceiveBufferTest` drift cases are self-designed directly against libsrt's
   source, same rigor tier as the ACKACK/RTT work above.
+- **32-bit wire-timestamp wraparound** (`ReceiveBuffer.updateWrapPeriod`,
+  `carryoverMicros`) also has **no reference test to ground against, in either
+  implementation** — checked directly (gosrt's `*_test.go` files, libsrt's
+  `test/` directory — nothing wrap/tsbpd-related in either), unlike drift this
+  time both references actually *implement* the behavior, just without unit
+  coverage. The four new `ReceiveBufferTest` wraparound cases are self-designed
+  against both sources; one of them verifies the property most worth
+  double-checking directly — a packet buffered while the wrap was only
+  suspected lands on the exact same deadline once a later packet confirms it,
+  with no discontinuity across that transition.
 
 ## Known gaps / deliberately deferred
 
@@ -300,10 +318,12 @@ falls back to `references/srt/build/srt-live-transmit`.
   built" and "Testing methodology" (the latter for the honest caveat that
   neither reference has test coverage for this piece — gosrt's own drift
   support is dead code).
-- **No 32-bit wire-timestamp wraparound handling** in `ReceiveBuffer` —
-  correct for connections under ~71 minutes; documented in its class javadoc,
-  not silent. This is the remaining half of what used to be one bundled
-  "drift + wraparound" gap.
+- ~~No 32-bit wire-timestamp wraparound handling~~ **Closed** — `ReceiveBuffer`
+  now handles it (`updateWrapPeriod`/`carryoverMicros`); see "What's built"
+  and "Testing methodology" (the latter for the no-reference-test caveat —
+  both gosrt and libsrt implement this, but neither has unit coverage for it).
+  This closes the last item under `ReceiveBuffer`'s known gaps — Phase 3 (the
+  receiver path) is now feature-complete per DESIGN.md.
 - **KEEPALIVE's echo-on-receipt has no rate limit** — ported faithfully from
   gosrt's `handleKeepAlive`, which doesn't gate it either, but two peers that
   *both* echo immediately on receipt could in theory tight-loop forever (neither
@@ -316,12 +336,11 @@ falls back to `references/srt/build/srt-live-transmit`.
 
 ## Next steps, in order
 
-1. 32-bit wire-timestamp wraparound handling in `ReceiveBuffer` — matters once
-   a connection runs long enough (~71 minutes) to hit it.
-2. The sender-side path (Phase 4) — send buffer, live-mode pacing, NAK-driven
+1. The sender-side path (Phase 4) — send buffer, live-mode pacing, NAK-driven
    retransmission, ACK handling. Everything so far is receive-only; a connection
-   can't send anything back yet.
-3. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
+   can't send anything back yet. This is now the only remaining major gap —
+   Phase 3 (the receiver path) is feature-complete.
+2. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
    against `SrtListener`, for full belt-and-suspenders confidence beyond
    `srt-live-transmit` — not expected to surface anything new, since ffmpeg
    wraps the same libsrt handshake code already exercised.
