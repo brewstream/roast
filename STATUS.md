@@ -25,10 +25,18 @@ functionally done for what's needed so far.
 is expected to work, but hasn't been literally exercised. Everything else is
 still verified only against gosrt's golden vectors and our own round-trip tests.
 
-84 tests passing (83 default + 1 interop, gated separately), all committed to
-`main` (no branches). Every commit so far has been asked-for explicitly by the
-user, one narrowly-scoped piece at a time — see git log for the exact sequence
-and rationale (commit messages are detailed).
+**Phase 3 (receiver path) has started**: loss detection/NAK generation and ACK
+timing/variant decision logic exist (`recv` package below), grounded not just
+against gosrt's source but against its actual test suite
+(`congestion/live/receive_test.go`) — see "Known gaps" for what that surfaced.
+Nothing in `recv` is wired to a live connection yet; `ReceiveBuffer`/TSBPD
+delivery/TLPKTDROP don't exist, which is a real behavioral gap now documented
+below, not just an unbuilt feature.
+
+113 tests passing (112 default + 1 gated interop), all committed to `main` (no
+branches). Every commit so far has been asked-for explicitly by the user, one
+narrowly-scoped piece at a time — see git log for the exact sequence and
+rationale (commit messages are detailed).
 
 ## What's built
 
@@ -51,6 +59,9 @@ frames the fixed header.
   `handshakeTypeCode` is a raw int, not a closed enum — any value outside the 5
   known progression types is a legitimate rejection-reason code, not malformed
   data (see `HandshakeCif.isRejection()`/`rejectionReason()`).
+- `AckCif`/`AckVariant` — the ACK CIF's three wire variants (Lite 4B / Small 16B /
+  Full 28B, determined by encoded length, not a marker field), verified against
+  gosrt's `TestFullACK`/`TestSmallACK`/`TestLiteACK` golden vectors.
 
 **`codec`** — `SrtFrameDecoder`/`SrtFrameEncoder`, Netty
 `MessageToMessage(De|En)coder`s bridging `DatagramPacket` ↔ `SrtPacket`, preserving
@@ -84,6 +95,21 @@ dropped, never thrown.
 **`util`** — `CircularNumber`: wrap-aware comparator/arithmetic for 31-bit sequence
 numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
 `circular.Number`.
+
+**`recv`** — the start of Phase 3, none of it wired to a live connection yet:
+- `LossList` — tracks which received-stream sequence numbers are known missing;
+  detects newly-opened gaps for immediate NAK, maintains still-missing ranges for
+  periodic re-announcement, handles partial recovery (splitting a range from the
+  front/back/middle) and the sequence-number wrap boundary.
+- `NakGenerator` — thin wrapper turning `LossList` output into a wire-ready NAK
+  `ControlPacket` via `LossListCodec`.
+- `AckSender` — decides when to send an ACK and which variant (Full ~every 10ms,
+  Light for every 64 packets in between — gosrt's own receiver never emits Small
+  despite the wire format supporting it, neither does this), built directly on
+  `LossList`'s state. RTT/RTTVar/buffer/rate figures are caller-supplied per
+  `tick`, not measured here — that needs pieces that don't exist yet.
+  `nowMicros` must be elapsed time since this receiver's own start, matching
+  gosrt's `lastPeriodicACK` zero-value-start semantics exactly (see "Known gaps").
 
 **`handshake`** — `SynCookie`: MD5-based SYN cookie so a listener can verify an
 INDUCTION cookie was echoed back correctly in CONCLUSION without keeping
@@ -139,6 +165,26 @@ falls back to `references/srt/build/srt-live-transmit`.
 - `SrtPacket.encodeTo`/CIF `encodeTo` methods **consume and release** their
   `ByteBuf` body — a packet that needs sending again (ARQ retransmit) must
   `retainedDuplicate()` into a fresh packet first, not reuse an encoded one.
+- **Ground tests against the reference's actual test files, not just its source**
+  — reading gosrt's source and designing your own scenarios from that reading is
+  not the same guarantee as porting gosrt's own test assertions. See "Testing
+  methodology" below for what this caught.
+
+## Testing methodology
+
+- **Wire-format pieces** (`CircularNumber`, `LossListCodec`, `HandshakeCif`,
+  `SynCookie`, `AckCif`) are verified byte-for-byte against gosrt's own golden hex
+  vectors — real cross-implementation proof, not just internal round-trips.
+- **Decision-logic pieces** (`ListenerHandshake`, `SrtSocketIdGenerator`,
+  `LossList`, `AckSender`) started out tested only against self-designed scenarios
+  based on reading gosrt's source. `LossList`/`AckSender` have since also been
+  cross-checked against gosrt's actual `congestion/live/receive_test.go` (see
+  `matchesGosrt*` tests in `LossListTest`/`AckSenderTest`) — `ListenerHandshake`
+  and `SrtSocketIdGenerator` have **not** been re-checked against a corresponding
+  gosrt test file yet (worth doing before trusting them as strongly as the ported
+  pieces).
+- **Live socket I/O** (`SrtListener`) is verified against real libsrt via
+  `LibsrtInteropTest` — independent proof beyond any Go reference.
 
 ## Known gaps / deliberately deferred
 
@@ -149,21 +195,39 @@ falls back to `references/srt/build/srt-live-transmit`.
   and SRT version `0x010401` (matching gosrt's own baseline).
 - **Encryption** (KMREQ/KMRSP, PBKDF2, AES-CTR) — Phase 5 in DESIGN.md, untouched.
 - **Caller-side handshake** (dial/connect flow) — only the listener side exists.
-- **ARQ, TSBPD/jitter buffering, TLPKTDROP, ACK/ACKACK, the actual data path** —
-  Phase 3, untouched beyond the NAK loss-list wire codec. This is why an accepted
-  connection can't yet send/receive anything.
+- **TLPKTDROP's interaction with ACK generation is not implemented.** Found while
+  grounding tests against gosrt's `receive_test.go` (`TestIssue67`): real SRT
+  forces the ACK boundary to skip past a still-open, unrecovered gap once that
+  gap's packets' TSBPD delivery deadline has passed — otherwise a single lost
+  packet could stall ACK progress (and the sender's flow control) forever.
+  `AckSender` has no TSBPD-deadline awareness at all, so right now `LossList`
+  would keep an unrecovered gap outstanding indefinitely instead of the receiver
+  eventually giving up on it. Documented in `LossListTest`/`AckSenderTest`
+  (`matchesGosrt*` tests) rather than silently unhandled — needs a
+  `ReceiveBuffer`/`TsbpdDeliverer` (which track per-packet delivery deadlines) to
+  fix, so it's blocked on that piece, not forgotten.
+- **ACKACK, TSBPD delivery/drift correction, the actual data path (`ReceiveBuffer`,
+  `TsbpdDeliverer`), and the sender-side path entirely** — Phase 3/4, untouched.
+  This is why an accepted connection can't yet send/receive anything; `LossList`/
+  `AckSender`/`NakGenerator` exist but aren't wired to a live connection.
 
 ## Next steps, in order
 
-1. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
+1. **`ReceiveBuffer`/`TsbpdDeliverer`** — hold out-of-order data packet payloads,
+   deliver them once their TSBPD deadline arrives (with drift correction), and
+   implement TLPKTDROP so `AckSender`/`LossList` can stop waiting on a gap once
+   it's truly too late — closes the known gap above. This is what actually lets
+   an accepted connection produce data, not just complete a handshake.
+2. Wire `LossList`/`AckSender`/`NakGenerator` and the new `ReceiveBuffer` into a
+   live connection (a per-socket-ID `SrtPacketSink` registered with
+   `SrtSocketIdDemultiplexer` once `SrtListener` accepts one — currently nothing
+   is registered there at all). Design its event hooks against DESIGN.md's
+   "Extensibility & observability" list from the start, not retrofitted after.
+3. KEEPALIVE, SHUTDOWN, ACKACK.
+4. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
    against `SrtListener`, for full belt-and-suspenders confidence beyond
    `srt-live-transmit` — not expected to surface anything new, since ffmpeg
    wraps the same libsrt handshake code already exercised.
-2. **Phase 3 receiver path** — receive buffer, NAK generation using the
-   loss-list codec, ACK/ACKACK, TSBPD delivery, KEEPALIVE, SHUTDOWN. This is
-   what actually lets an accepted connection send/receive data — right now it
-   can only complete a handshake. Design its event hooks against DESIGN.md's
-   "Extensibility & observability" list from the start, not retrofitted after.
 
 ## How to pick this back up
 
