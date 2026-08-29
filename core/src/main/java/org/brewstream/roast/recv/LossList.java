@@ -15,9 +15,9 @@ import java.util.List;
  *
  * <p>Mirrors the loss-detection core of gosrt's {@code congestion/live} receiver
  * (congestion/live/receive.go's {@code Push}), without the ACK generation
- * ({@link AckSender}, built on top of this), TSBPD-delivery buffering, or
- * statistics bundled with it there — the latter two are separate, not-yet-built
- * pieces (a {@code ReceiveBuffer} / {@code TsbpdDeliverer}).
+ * ({@link AckSender}, built on top of this), TSBPD-delivery buffering
+ * ({@link ReceiveBuffer}, which reports TLPKTDROP abandonment here via
+ * {@link #abandon}), or statistics bundled with it there.
  *
  * <p>Not thread-safe — callers own synchronization, same as everything else in
  * this module so far.
@@ -64,6 +64,33 @@ public final class LossList {
     /** The highest sequence number seen so far, in order or not. */
     public CircularNumber highestSeen() {
         return maxSeen;
+    }
+
+    /**
+     * Marks everything up to and including {@code upTo} as no longer missing,
+     * even though it was never actually received — for {@link ReceiveBuffer}'s
+     * TLPKTDROP to report giving up on a stale gap, so this stops NAKing it and
+     * {@link AckSender}'s next tick reports the advanced boundary. Also advances
+     * {@link #highestSeen()} if {@code upTo} is beyond it.
+     */
+    public void abandon(CircularNumber upTo) {
+        List<LossRange> updated = new ArrayList<>(missing.size());
+        for (LossRange range : missing) {
+            if (range.end().lessThanOrEqual(upTo)) {
+                continue;
+            }
+            if (range.start().lessThanOrEqual(upTo)) {
+                updated.add(new LossRange(upTo.inc(), range.end()));
+            } else {
+                updated.add(range);
+            }
+        }
+        missing.clear();
+        missing.addAll(updated);
+
+        if (maxSeen.lessThan(upTo)) {
+            maxSeen = upTo;
+        }
     }
 
     private void remove(CircularNumber seq) {

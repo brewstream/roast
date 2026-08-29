@@ -215,4 +215,50 @@ class LossListTest {
 
         assertThat(immediate).containsExactly(new LossRange(seq(1), seq(11)));
     }
+
+    @Test
+    void abandonClearsAFullyStaleRangeAndLeavesHighestSeenUnchangedIfAlreadyPast() {
+        LossList lossList = new LossList(seq(5));
+        lossList.onPacketReceived(seq(5));
+        lossList.onPacketReceived(seq(10)); // gap [6,9], highestSeen=10
+
+        lossList.abandon(seq(9));
+
+        assertThat(lossList.outstanding()).isEmpty();
+        assertThat(lossList.highestSeen()).isEqualTo(seq(10));
+    }
+
+    @Test
+    void abandonPartiallyClearsARangeFromTheFront() {
+        LossList lossList = new LossList(seq(5));
+        lossList.onPacketReceived(seq(5));
+        lossList.onPacketReceived(seq(11)); // gap [6,10]
+
+        lossList.abandon(seq(8));
+
+        assertThat(lossList.outstanding()).containsExactly(new LossRange(seq(9), seq(10)));
+    }
+
+    @Test
+    void abandonAdvancesHighestSeenBeyondItsPreviousValue() {
+        LossList lossList = new LossList(seq(1));
+        lossList.onPacketReceived(seq(1)); // highestSeen=1, no gap
+
+        lossList.abandon(seq(5));
+
+        assertThat(lossList.highestSeen()).isEqualTo(seq(5));
+        assertThat(lossList.outstanding()).isEmpty();
+    }
+
+    @Test
+    void abandonLeavesUnrelatedRangesUntouched() {
+        LossList lossList = new LossList(seq(0));
+        lossList.onPacketReceived(seq(0));
+        lossList.onPacketReceived(seq(5)); // gap [1,4]
+        lossList.onPacketReceived(seq(10)); // gap [6,9]
+
+        lossList.abandon(seq(4));
+
+        assertThat(lossList.outstanding()).containsExactly(new LossRange(seq(6), seq(9)));
+    }
 }
