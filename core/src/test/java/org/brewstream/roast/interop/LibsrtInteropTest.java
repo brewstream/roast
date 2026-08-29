@@ -1,5 +1,6 @@
 package org.brewstream.roast.interop;
 
+import io.netty.buffer.Unpooled;
 import org.brewstream.roast.socket.AcceptDecision;
 import org.brewstream.roast.socket.AcceptedConnection;
 import org.brewstream.roast.socket.ConnectionRequest;
@@ -14,6 +15,7 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.SecureRandom;
@@ -97,6 +99,60 @@ class LibsrtInteropTest {
             // Printed unconditionally by srt-live-transmit's own app code, not gated behind a log level.
             assertThat(peerOutput.toString()).contains("SRT target connected");
         }
+    }
+
+    /**
+     * The reverse direction of {@link #realLibsrtCallerReachesConnected}: once a
+     * real libsrt caller connects, <em>we</em> write data and libsrt reads it —
+     * the actual definition of done for DESIGN.md's Phase 4 interop story
+     * (everything else in this class only confirms the handshake, not that
+     * Roast's send path produces correct bytes on the wire against a real peer).
+     *
+     * <p>Unlike {@link #realLibsrtCallerReachesConnected}, this asserts
+     * byte-for-byte correctness, not just a connectivity string match — safe to
+     * do because srt-live-transmit's log/verbose output goes to stderr by
+     * default ({@code apps/verbose.cpp}'s {@code cverb}), and stats reporting
+     * to stdout is opt-in (not enabled here), so stdout redirected straight to
+     * a file is guaranteed to carry nothing but the raw bytes its
+     * {@code ConsoleTarget} writes for a {@code file://con} output.
+     */
+    @Test
+    void realListenerSendsDataToRealLibsrtCaller() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
+        listener.setAcceptHandler(request -> AcceptDecision.accept());
+
+        byte[] chunk = "roast-send-path-interop\n".getBytes(StandardCharsets.US_ASCII);
+        int writes = 5;
+        listener.onConnection(connection -> {
+            for (int i = 0; i < writes; i++) {
+                connection.write(Unpooled.wrappedBuffer(chunk));
+            }
+        });
+
+        Path outputFile = Files.createTempFile("roast-interop-recv-", ".bin");
+        outputFile.toFile().deleteOnExit();
+        srtLiveTransmit = launchSrtLiveTransmitSending(listener.localAddress().getPort(), outputFile);
+
+        boolean exited = srtLiveTransmit.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        assertThat(exited).as("srt-live-transmit should exit on its own -t timeout").isTrue();
+
+        byte[] expected = new byte[chunk.length * writes];
+        for (int i = 0; i < writes; i++) {
+            System.arraycopy(chunk, 0, expected, i * chunk.length, chunk.length);
+        }
+        assertThat(Files.readAllBytes(outputFile)).isEqualTo(expected);
+    }
+
+    /** {@code srt://} as input (libsrt calls and reads), {@code file://con} as output (raw bytes to stdout). */
+    private Process launchSrtLiveTransmitSending(int listenerPort, Path outputFile) throws IOException {
+        ProcessBuilder builder = new ProcessBuilder(
+                srtLiveTransmitPath().toString(),
+                "-t", "5",
+                "srt://127.0.0.1:" + listenerPort + "?streamid=" + STREAM_ID,
+                "file://con")
+                .redirectOutput(ProcessBuilder.Redirect.to(outputFile.toFile()))
+                .redirectError(ProcessBuilder.Redirect.DISCARD);
+        return builder.start();
     }
 
     private Process launchSrtLiveTransmit(int listenerPort, StringBuilder outputCollector) throws IOException {
