@@ -161,4 +161,85 @@ class ReceiveBufferTest {
         assertThat(seqNumbersOf(result.delivered())).containsExactly(0);
         release(result.delivered());
     }
+
+    // --- 32-bit wire-timestamp wraparound (no reference test exists in gosrt
+    // or libsrt to port - self-designed against both sources' source code;
+    // see STATUS.md's testing methodology). All timestamps below are unsigned
+    // 32-bit microsecond values; ts(long) reinterprets one as the signed int
+    // DataPacket.timestamp() actually stores on the wire.
+
+    private static final long WRAP_PERIOD_MICROS = 30_000_000L;
+    private static final long JUST_PAST_WRAP_THRESHOLD = SrtPacket.MAX_TIMESTAMP - WRAP_PERIOD_MICROS + 1;
+
+    private static int ts(long unsignedValue) {
+        return (int) unsignedValue;
+    }
+
+    @Test
+    void packetPastWrapThresholdEntersWrapPeriodButOwnDeadlineIsUnaffected() {
+        ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 0);
+        // Establishes timeBase = 0; this packet's own timestamp is nowhere near
+        // small enough for carryover (its unsigned value is > 2*WRAP_PERIOD),
+        // so entering the wrap period doesn't touch its own deadline.
+        buffer.add(dataPacket(0, ts(JUST_PAST_WRAP_THRESHOLD)), JUST_PAST_WRAP_THRESHOLD);
+
+        assertThat(buffer.deliver(JUST_PAST_WRAP_THRESHOLD - 1).delivered()).isEmpty();
+        DeliveryResult result = buffer.deliver(JUST_PAST_WRAP_THRESHOLD);
+        assertThat(seqNumbersOf(result.delivered())).containsExactly(0);
+        release(result.delivered());
+    }
+
+    @Test
+    void smallTimestampDuringSuspectedWrapGetsProvisionalCarryover() {
+        ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 0);
+        buffer.add(dataPacket(0, ts(JUST_PAST_WRAP_THRESHOLD)), JUST_PAST_WRAP_THRESHOLD);
+        release(buffer.deliver(JUST_PAST_WRAP_THRESHOLD).delivered()); // out of the way; wrap period stays entered
+
+        buffer.add(dataPacket(1, 5_000_000), 0); // small ts, still within the wrap-suspect window (<= 60s)
+
+        long expectedDeadline = (SrtPacket.MAX_TIMESTAMP + 1) + 5_000_000; // provisional carryover applied
+        assertThat(buffer.deliver(expectedDeadline - 1).delivered()).isEmpty();
+        DeliveryResult result = buffer.deliver(expectedDeadline);
+        assertThat(seqNumbersOf(result.delivered())).containsExactly(1);
+        release(result.delivered());
+    }
+
+    @Test
+    void wrapConfirmationCommitsOffsetConsistentlyForNewPackets() {
+        ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 0);
+        buffer.add(dataPacket(0, ts(JUST_PAST_WRAP_THRESHOLD)), JUST_PAST_WRAP_THRESHOLD);
+        release(buffer.deliver(JUST_PAST_WRAP_THRESHOLD).delivered());
+
+        buffer.add(dataPacket(1, 45_000_000), 0); // lands in [30s, 60s] - confirms and commits the wrap
+
+        long expectedDeadline = (SrtPacket.MAX_TIMESTAMP + 1) + 45_000_000; // timeBase now includes the cycle
+        assertThat(buffer.deliver(expectedDeadline - 1).delivered()).isEmpty();
+        DeliveryResult result = buffer.deliver(expectedDeadline);
+        assertThat(seqNumbersOf(result.delivered())).containsExactly(1);
+        release(result.delivered());
+    }
+
+    /**
+     * The key correctness property: a packet buffered while the wrap was only
+     * suspected (provisional carryover) must land on the exact same deadline
+     * once a later packet confirms and permanently commits the wrap - no
+     * discontinuity from the provisional-to-committed transition.
+     */
+    @Test
+    void bufferedPacketDeadlineIsUnchangedAcrossWrapConfirmation() {
+        ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 0);
+        buffer.add(dataPacket(0, ts(JUST_PAST_WRAP_THRESHOLD)), JUST_PAST_WRAP_THRESHOLD);
+        release(buffer.deliver(JUST_PAST_WRAP_THRESHOLD).delivered());
+
+        buffer.add(dataPacket(1, 5_000_000), 0); // provisional carryover, not yet confirmed
+        assertThat(buffer.deliver(0).delivered()).isEmpty();
+
+        buffer.add(dataPacket(2, 45_000_000), 0); // confirms the wrap, commits the offset
+
+        long expectedSeq1Deadline = (SrtPacket.MAX_TIMESTAMP + 1) + 5_000_000; // unchanged from before confirmation
+        assertThat(buffer.deliver(expectedSeq1Deadline - 1).delivered()).isEmpty();
+        DeliveryResult result = buffer.deliver(expectedSeq1Deadline);
+        assertThat(seqNumbersOf(result.delivered())).containsExactly(1); // seq 2 not due yet, stays buffered
+        release(result.delivered());
+    }
 }

@@ -33,8 +33,9 @@ import java.util.OptionalLong;
  *
  * <p><b>Drift correction</b>: every delivery deadline is computed live (at
  * {@link #deliver}-check time), not frozen when a packet is buffered — {@code
- * timeBaseMicros + packet timestamp + latency + driftTracer.drift()} —
- * matching libsrt's live-query {@code getPktTime()} model
+ * timeBaseMicros + carryoverMicros(timestamp) + packet timestamp + latency +
+ * driftTracer.drift()}, see {@link #tsbpdTimeMicros} — matching libsrt's
+ * live-query {@code getPktTime()} model
  * ({@code srtcore/tsbpd_time.cpp}) rather than gosrt's, which has no working
  * drift implementation at all (a dead field never assigned). This means an
  * already-buffered-but-undelivered packet's deadline re-evaluates if drift
@@ -44,12 +45,27 @@ import java.util.OptionalLong;
  * CTsbpdTime::addDriftSample}. No dedicated test exists in either reference
  * for this piece (STATUS.md's testing methodology section has the detail).
  *
+ * <p><b>32-bit wire-timestamp wraparound</b> (draft-sharabayko-srt.md §4.5.1.1's
+ * "TSBPD Time Base Calculation"): SRT's microsecond timestamps wrap every ~71
+ * minutes (2^32 us). {@link #updateWrapPeriod} runs on every arriving DATA
+ * packet, faithfully ported from gosrt's {@code handlePacket} state machine
+ * (structurally identical to libsrt's {@code CTsbpdTime::updateBaseTime}):
+ * entering a "wrap period" once a packet's timestamp comes within 30s of
+ * wrapping, and permanently folding a full cycle into {@link #timeBaseMicros}
+ * once a later packet's timestamp confirms the wrap actually happened (lands
+ * in the 30-60s window past zero — long enough that it can't be a stray
+ * late-arriving pre-wrap packet). While the wrap is suspected but not yet
+ * confirmed, {@link #carryoverMicros} applies the same cycle provisionally to
+ * just that query, matching libsrt's {@code getBaseTimeNoLock} rather than
+ * gosrt's separate-field approach — a natural fit since delivery time here is
+ * already a live, recomputed-at-{@link #deliver}-time function of stored
+ * state (see "Drift correction" above), not frozen at insertion. Neither
+ * reference has a dedicated test for this piece either (checked directly);
+ * self-designed against both sources — see STATUS.md's testing methodology.
+ *
  * <p>Deliberately simplified for this pass, documented as a known gap (see
  * STATUS.md):
  * <ul>
- *   <li>No 32-bit wire-timestamp wraparound handling (draft-sharabayko-srt.md
- *       §4.5.1.1's "TSBPD Time Base Calculation") — correct for connections
- *       under ~71 minutes (2^32 microseconds), the common case for now.</li>
  *   <li>Unlike gosrt, this doesn't let an acknowledgment boundary run ahead of
  *       the delivery boundary for still-buffered in-order packets that simply
  *       haven't reached their deadline yet — gosrt's ACK reporting and TSBPD
@@ -64,6 +80,8 @@ import java.util.OptionalLong;
  */
 public final class ReceiveBuffer {
 
+    private static final long WRAP_PERIOD_MICROS = 30_000_000L;
+
     private record Entry(CircularNumber seq, int timestamp, DataPacket packet) {
     }
 
@@ -74,6 +92,7 @@ public final class ReceiveBuffer {
     private Long timeBaseMicros;
     private CircularNumber lastDelivered;
     private long firstRttSampleMicros = -1;
+    private boolean tsbpdWrapPeriod;
 
     public ReceiveBuffer(CircularNumber initialSequenceNumber, long latencyMicros) {
         this.latencyMicros = latencyMicros;
@@ -90,6 +109,7 @@ public final class ReceiveBuffer {
         if (timeBaseMicros == null) {
             timeBaseMicros = nowMicros - Integer.toUnsignedLong(packet.timestamp());
         }
+        updateWrapPeriod(packet.timestamp());
 
         CircularNumber seq = CircularNumber.of(packet.sequenceNumber() & 0x7FFF_FFFF, SrtPacket.MAX_SEQUENCE_NUMBER);
         if (seq.lessThanOrEqual(lastDelivered)) {
@@ -98,6 +118,34 @@ public final class ReceiveBuffer {
         }
 
         insertSorted(seq, packet.timestamp(), packet);
+    }
+
+    /**
+     * Ported from gosrt's {@code handlePacket} wrap-period state machine (see
+     * the class javadoc's "32-bit wire-timestamp wraparound" section). Runs on
+     * every arriving DATA packet, ahead of duplicate/belated handling, matching
+     * gosrt's own placement.
+     */
+    private void updateWrapPeriod(int timestamp) {
+        long ts = Integer.toUnsignedLong(timestamp);
+        if (!tsbpdWrapPeriod) {
+            if (ts > SrtPacket.MAX_TIMESTAMP - WRAP_PERIOD_MICROS) {
+                tsbpdWrapPeriod = true;
+            }
+        } else if (ts >= WRAP_PERIOD_MICROS && ts <= 2 * WRAP_PERIOD_MICROS) {
+            tsbpdWrapPeriod = false;
+            timeBaseMicros += SrtPacket.MAX_TIMESTAMP + 1;
+        }
+    }
+
+    /**
+     * The not-yet-permanently-committed portion of a wraparound cycle — see
+     * the class javadoc. Zero once {@link #updateWrapPeriod} has confirmed and
+     * folded a wrap into {@link #timeBaseMicros}, or if no wrap is suspected.
+     */
+    private long carryoverMicros(int timestamp) {
+        long ts = Integer.toUnsignedLong(timestamp);
+        return (tsbpdWrapPeriod && ts <= 2 * WRAP_PERIOD_MICROS) ? SrtPacket.MAX_TIMESTAMP + 1 : 0;
     }
 
     /**
@@ -125,7 +173,7 @@ public final class ReceiveBuffer {
         }
 
         long rttDeltaMicros = (rttSampleMicros - firstRttSampleMicros) / 2;
-        long packetBaseTimeMicros = timeBaseMicros + Integer.toUnsignedLong(packetTimestamp);
+        long packetBaseTimeMicros = timeBaseMicros + carryoverMicros(packetTimestamp) + Integer.toUnsignedLong(packetTimestamp);
         long sampleMicros = arrivalMicros - packetBaseTimeMicros - rttDeltaMicros;
 
         OptionalLong overdriftMicros = driftTracer.update(sampleMicros);
@@ -170,7 +218,8 @@ public final class ReceiveBuffer {
     }
 
     private long tsbpdTimeMicros(Entry entry) {
-        return timeBaseMicros + Integer.toUnsignedLong(entry.timestamp()) + latencyMicros + driftTracer.drift();
+        return timeBaseMicros + carryoverMicros(entry.timestamp()) + Integer.toUnsignedLong(entry.timestamp())
+                + latencyMicros + driftTracer.drift();
     }
 
     private void insertSorted(CircularNumber seq, int timestamp, DataPacket packet) {
