@@ -25,15 +25,20 @@ functionally done for what's needed so far.
 is expected to work, but hasn't been literally exercised. Everything else is
 still verified only against gosrt's golden vectors and our own round-trip tests.
 
-**Phase 3 (receiver path) has started**: loss detection/NAK generation and ACK
-timing/variant decision logic exist (`recv` package below), grounded not just
-against gosrt's source but against its actual test suite
-(`congestion/live/receive_test.go`) — see "Known gaps" for what that surfaced.
-Nothing in `recv` is wired to a live connection yet; `ReceiveBuffer`/TSBPD
-delivery/TLPKTDROP don't exist, which is a real behavioral gap now documented
-below, not just an unbuilt feature.
+**Phase 3 (receiver path) is now wired end-to-end**: `SrtConnection` owns
+`LossList`/`AckSender`/`ReceiveBuffer` per accepted connection and drives them
+over a real ~10ms tick on the connection's own Netty event loop — an accepted
+connection can actually receive DATA, NAK a gap, ACK periodically, and TLPKTDROP
+a stale gap, all verified over real sockets/timers in `SrtConnectionTest`. This
+is also where DESIGN.md's "Extensibility & observability" hooks became real
+rather than aspirational: `onData`/`onLoss`/`onTlpktDrop` on `SrtConnection`
+(`SrtListener.onConnection` now hands out `SrtConnection`, not bare
+`AcceptedConnection` — see "Architecture decisions" for the API-shape note).
+Still missing: KEEPALIVE/SHUTDOWN/ACKACK handling, RTT measurement (NAK
+re-announce interval is a fixed floor, not RTT-adaptive), drift correction, and
+the entire sender-side path (Phase 4) — see "Known gaps."
 
-113 tests passing (112 default + 1 gated interop), all committed to `main` (no
+127 tests passing (126 default + 1 gated interop), all committed to `main` (no
 branches). Every commit so far has been asked-for explicitly by the user, one
 narrowly-scoped piece at a time — see git log for the exact sequence and
 rationale (commit messages are detailed).
@@ -80,36 +85,56 @@ dropped, never thrown.
   changing that shipped interface wasn't worth it for this). Dedupes retried
   CONCLUSIONs (keyed by the peer's advertised socket ID) by resending a cached
   accept response rather than re-running accept logic — more robust than gosrt's
-  silent-drop, since it recovers if our own first reply was lost. **Registers no
-  per-connection data sink** — a DATA packet for an accepted connection is logged
-  and dropped by the demux's existing unknown-socket-id path, which is *correct*
-  Phase 2 behavior (DESIGN.md: "connects... then fails gracefully at data stage"),
-  not a bug to chase.
+  silent-drop, since it recovers if our own first reply was lost. On accept,
+  builds an `SrtConnection` and registers it with the demux for its assigned
+  socket ID (used to just drop DATA packets here — that's now `SrtConnection`'s
+  job); tracks all live connections and closes them in `SrtListener.close()`.
+- `SrtConnection` — a live, accepted connection: owns `LossList`/`AckSender`/
+  `ReceiveBuffer` for its lifetime, registered as its socket ID's `SrtPacketSink`,
+  driven by a ~10ms tick on the connection's own Netty event loop (no
+  synchronization needed — packet arrival and the tick both run on that one
+  thread). Only DATA packets are handled; KEEPALIVE/SHUTDOWN/ACKACK are logged
+  and dropped (not implemented yet). Exposes `onData`/`onLoss`/`onTlpktDrop` —
+  see below — and `.metadata()` returning its `AcceptedConnection`.
 - `ConnectionRequest` / `AcceptDecision` / `AcceptHandler` / `AcceptedConnection`
   — the extensibility surface added per DESIGN.md's "Extensibility &
   observability" section: rich accept/reject (peer address, StreamID, SRT
-  version, requested latency, encryption flag) and a connection-lifecycle hook,
-  not just a bare accept/reject boolean. `AcceptedConnection` is connection
-  *metadata* only — no read/write surface exists yet (needs Phase 3).
+  version, requested latency, encryption flag) and a connection-lifecycle hook.
+  `AcceptedConnection` stays pure *metadata* (peer info, negotiated latency) —
+  `SrtListener.onConnection` hands out the richer `SrtConnection` (wraps it, adds
+  the live hooks), not `AcceptedConnection` directly.
 
 **`util`** — `CircularNumber`: wrap-aware comparator/arithmetic for 31-bit sequence
 numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
 `circular.Number`.
 
-**`recv`** — the start of Phase 3, none of it wired to a live connection yet:
+**`recv`** — Phase 3's receiver path, now wired to a live connection via
+`SrtConnection` above:
 - `LossList` — tracks which received-stream sequence numbers are known missing;
   detects newly-opened gaps for immediate NAK, maintains still-missing ranges for
   periodic re-announcement, handles partial recovery (splitting a range from the
-  front/back/middle) and the sequence-number wrap boundary.
+  front/back/middle) and the sequence-number wrap boundary. `abandon(upTo)`
+  clears a stale gap without it ever having been received — how `ReceiveBuffer`'s
+  TLPKTDROP feeds back into loss tracking.
 - `NakGenerator` — thin wrapper turning `LossList` output into a wire-ready NAK
   `ControlPacket` via `LossListCodec`.
 - `AckSender` — decides when to send an ACK and which variant (Full ~every 10ms,
   Light for every 64 packets in between — gosrt's own receiver never emits Small
   despite the wire format supporting it, neither does this), built directly on
   `LossList`'s state. RTT/RTTVar/buffer/rate figures are caller-supplied per
-  `tick`, not measured here — that needs pieces that don't exist yet.
+  `tick` — `SrtConnection` currently hardcodes them to 0, not measured yet.
   `nowMicros` must be elapsed time since this receiver's own start, matching
-  gosrt's `lastPeriodicACK` zero-value-start semantics exactly (see "Known gaps").
+  gosrt's `lastPeriodicACK` zero-value-start semantics exactly.
+- `ReceiveBuffer` (+ `DeliveryResult`) — holds accepted DATA packets sorted by
+  sequence number, delivers whatever's contiguous-or-abandoned and past its
+  TSBPD deadline (wire timestamp + a per-connection time base + negotiated
+  latency). Combines what DESIGN.md separately names `ReceiveBuffer` and
+  `TsbpdDeliverer` (gosrt keeps them as one struct too). Implements TLPKTDROP:
+  gives up on a stale gap once a later packet's deadline has passed rather than
+  blocking delivery forever. No drift correction and no 32-bit wire-timestamp
+  wraparound handling yet (correct under ~71 minutes) — both documented in the
+  class javadoc, not silent. `dispose()` releases undelivered buffered payloads
+  on connection teardown.
 
 **`handshake`** — `SynCookie`: MD5-based SYN cookie so a listener can verify an
 INDUCTION cookie was echoed back correctly in CONCLUSION without keeping
@@ -195,35 +220,36 @@ falls back to `references/srt/build/srt-live-transmit`.
   and SRT version `0x010401` (matching gosrt's own baseline).
 - **Encryption** (KMREQ/KMRSP, PBKDF2, AES-CTR) — Phase 5 in DESIGN.md, untouched.
 - **Caller-side handshake** (dial/connect flow) — only the listener side exists.
-- **TLPKTDROP's interaction with ACK generation is not implemented.** Found while
-  grounding tests against gosrt's `receive_test.go` (`TestIssue67`): real SRT
-  forces the ACK boundary to skip past a still-open, unrecovered gap once that
-  gap's packets' TSBPD delivery deadline has passed — otherwise a single lost
-  packet could stall ACK progress (and the sender's flow control) forever.
-  `AckSender` has no TSBPD-deadline awareness at all, so right now `LossList`
-  would keep an unrecovered gap outstanding indefinitely instead of the receiver
-  eventually giving up on it. Documented in `LossListTest`/`AckSenderTest`
-  (`matchesGosrt*` tests) rather than silently unhandled — needs a
-  `ReceiveBuffer`/`TsbpdDeliverer` (which track per-packet delivery deadlines) to
-  fix, so it's blocked on that piece, not forgotten.
-- **ACKACK, TSBPD delivery/drift correction, the actual data path (`ReceiveBuffer`,
-  `TsbpdDeliverer`), and the sender-side path entirely** — Phase 3/4, untouched.
-  This is why an accepted connection can't yet send/receive anything; `LossList`/
-  `AckSender`/`NakGenerator` exist but aren't wired to a live connection.
+- ~~TLPKTDROP's interaction with ACK generation~~ **Closed** — `ReceiveBuffer`
+  implements TLPKTDROP and feeds abandoned gaps back into `LossList.abandon(...)`
+  via `SrtConnection`'s tick. Note it's a deliberate simplification of gosrt's
+  exact mechanism, not a byte-for-byte port — see `ReceiveBuffer`'s javadoc and
+  `ReceiveBufferTest`'s ported `TestSkipTooLate` for exactly where they diverge
+  (gosrt runs a separate ACK-boundary-vs-delivery-boundary computation this
+  codebase deliberately unifies into one).
+- **No RTT measurement** — `AckSender`'s RTT/RTTVar/buffer/rate figures and the
+  periodic NAK re-announcement interval are hardcoded (0, and a fixed 20ms floor
+  respectively) in `SrtConnection`, not adaptive. Needs ACK/ACKACK round-trip
+  timing, which needs ACKACK handling (see below) to exist first.
+- **No drift correction, no 32-bit wire-timestamp wraparound handling** in
+  `ReceiveBuffer` — correct for connections under ~71 minutes; documented in its
+  class javadoc, not silent.
+- **KEEPALIVE, SHUTDOWN, ACKACK, and the entire sender-side path (Phase 4)** —
+  untouched. `SrtConnection` logs and drops anything that isn't a DATA packet.
+  This is why a connection can currently receive but not send, and why nothing
+  closes a connection cleanly on the peer's own SHUTDOWN yet.
 
 ## Next steps, in order
 
-1. **`ReceiveBuffer`/`TsbpdDeliverer`** — hold out-of-order data packet payloads,
-   deliver them once their TSBPD deadline arrives (with drift correction), and
-   implement TLPKTDROP so `AckSender`/`LossList` can stop waiting on a gap once
-   it's truly too late — closes the known gap above. This is what actually lets
-   an accepted connection produce data, not just complete a handshake.
-2. Wire `LossList`/`AckSender`/`NakGenerator` and the new `ReceiveBuffer` into a
-   live connection (a per-socket-ID `SrtPacketSink` registered with
-   `SrtSocketIdDemultiplexer` once `SrtListener` accepts one — currently nothing
-   is registered there at all). Design its event hooks against DESIGN.md's
-   "Extensibility & observability" list from the start, not retrofitted after.
-3. KEEPALIVE, SHUTDOWN, ACKACK.
+1. **KEEPALIVE, SHUTDOWN, ACKACK** — `SrtConnection` currently drops all three.
+   ACKACK in particular unlocks RTT measurement (needs the ACK/ACKACK round-trip
+   timing), which unlocks making `AckSender`'s figures and the periodic NAK
+   interval real instead of hardcoded/fixed.
+2. Drift correction and 32-bit wire-timestamp wraparound handling in
+   `ReceiveBuffer` — matters once a connection runs long enough to hit either.
+3. The sender-side path (Phase 4) — send buffer, live-mode pacing, NAK-driven
+   retransmission, ACK handling. Everything so far is receive-only; a connection
+   can't send anything back yet.
 4. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
    against `SrtListener`, for full belt-and-suspenders confidence beyond
    `srt-live-transmit` — not expected to surface anything new, since ffmpeg
