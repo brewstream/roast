@@ -7,6 +7,8 @@ import org.brewstream.roast.packet.ControlType;
 import org.brewstream.roast.packet.DataPacket;
 import org.brewstream.roast.packet.SrtPacket;
 import org.brewstream.roast.packet.SrtSocketId;
+import org.brewstream.roast.packet.cif.AckCif;
+import org.brewstream.roast.packet.cif.AckVariant;
 import org.brewstream.roast.packet.cif.HandshakeCif;
 import org.brewstream.roast.packet.cif.HandshakeExtension;
 import org.brewstream.roast.packet.cif.HandshakeExtensionFlags;
@@ -168,6 +170,32 @@ class SrtConnectionTest {
         closed.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
 
+    @Test
+    void ackAckUpdatesRttReportedInSubsequentFullAcks() throws Exception {
+        SrtConnection connection = connectAndAccept();
+
+        FullAck first = receiveFullAck();
+        assertThat(first.cif().rtt()).isEqualTo(100_000); // unconfirmed yet - gosrt's own initial default
+
+        sendAckAck(connection.metadata().socketId(), first.ackNumber());
+
+        // Keep reading Full ACKs until the RTT actually changes - one or two more
+        // might already have been in flight before our ACKACK was processed.
+        FullAck updated = receiveFullAckWhereRttDiffersFrom(first.cif().rtt());
+        assertThat(updated.cif().rtt()).isLessThan(first.cif().rtt());
+    }
+
+    @Test
+    void ackAckWithUnknownAckNumberIsIgnoredWithoutCrashing() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        receiveFullAck(); // let one go by, ignored
+
+        sendAckAck(connection.metadata().socketId(), 999_999); // matches no pending ack
+
+        FullAck next = receiveFullAck();
+        assertThat(next.cif().rtt()).isEqualTo(100_000); // untouched - the bogus ACKACK matched nothing
+    }
+
     private SrtConnection connectAndAccept() throws Exception {
         listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0));
         listener.setAcceptHandler(request -> AcceptDecision.accept());
@@ -194,7 +222,15 @@ class SrtConnectionTest {
     }
 
     private void sendControl(SrtSocketId destination, ControlType type) throws IOException {
-        ControlPacket packet = new ControlPacket(type, 0, 0, destination, Unpooled.buffer(0));
+        sendControl(destination, type, 0);
+    }
+
+    private void sendAckAck(SrtSocketId destination, int ackNumber) throws IOException {
+        sendControl(destination, ControlType.ACKACK, ackNumber);
+    }
+
+    private void sendControl(SrtSocketId destination, ControlType type, int typeSpecificInfo) throws IOException {
+        ControlPacket packet = new ControlPacket(type, typeSpecificInfo, 0, destination, Unpooled.buffer(0));
         var out = Unpooled.buffer();
         packet.encodeTo(out);
         byte[] bytes = new byte[out.readableBytes()];
@@ -209,6 +245,34 @@ class SrtConnectionTest {
         List<LossRange> ranges = LossListCodec.decode(control.body());
         control.body().release();
         return ranges;
+    }
+
+    private record FullAck(int ackNumber, AckCif cif) {
+    }
+
+    private FullAck receiveFullAck() throws IOException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline) {
+            ControlPacket control = receiveControl(ControlType.ACK);
+            AckCif cif = AckCif.decode(control.body());
+            int ackNumber = control.typeSpecificInfo();
+            control.body().release();
+            if (cif != null && cif.variant() == AckVariant.FULL) {
+                return new FullAck(ackNumber, cif);
+            }
+        }
+        throw new AssertionError("No Full ACK received within " + TIMEOUT_SECONDS + "s");
+    }
+
+    private FullAck receiveFullAckWhereRttDiffersFrom(int rtt) throws IOException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline) {
+            FullAck ack = receiveFullAck();
+            if (ack.cif().rtt() != rtt) {
+                return ack;
+            }
+        }
+        throw new AssertionError("RTT never changed from " + rtt + " within " + TIMEOUT_SECONDS + "s");
     }
 
     /** Reads incoming packets until one of the given type is found (skipping others, e.g. periodic ACKs). */

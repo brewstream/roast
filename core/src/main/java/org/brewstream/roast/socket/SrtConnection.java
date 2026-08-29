@@ -20,7 +20,9 @@ import org.brewstream.roast.recv.ReceiveBuffer;
 import org.brewstream.roast.util.CircularNumber;
 
 import java.net.InetSocketAddress;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -35,10 +37,10 @@ import java.util.logging.Logger;
  * on that one thread, so (like its three collaborators individually) this class
  * needs no internal synchronization.
  *
- * <p>DATA, KEEPALIVE, and SHUTDOWN are handled. ACKACK isn't yet (needs RTT
- * measurement machinery this pass doesn't add) — anything else arriving for this
- * socket ID is logged and dropped, matching this codebase's established "drop
- * what you don't handle yet" pattern rather than crashing the connection.
+ * <p>DATA, KEEPALIVE, SHUTDOWN, and ACKACK are handled — anything else arriving
+ * for this socket ID is logged and dropped, matching this codebase's
+ * established "drop what you don't handle yet" pattern rather than crashing
+ * the connection.
  *
  * <p>KEEPALIVE is echoed back immediately on receipt, matching gosrt's
  * {@code handleKeepAlive} (connection.go) exactly — worth flagging: if a peer
@@ -50,16 +52,27 @@ import java.util.logging.Logger;
  * is this codebase's actual interop target so far — reconsider a rate limit
  * before this codebase gets its own keepalive-originating side.
  *
- * <p>RTT/RTTVar/buffer/rate figures fed to {@link AckSender#tick} are hardcoded
- * to 0 — not measured yet, same gap {@code AckSender} already documents. The
- * periodic NAK re-announcement interval is a fixed 20ms floor (gosrt's own floor
- * when RTT isn't known), not RTT-adaptive either.
+ * <p><b>RTT measurement</b>: every Full ACK we send is recorded (ack number →
+ * send time); when the matching ACKACK arrives (its packet-header
+ * Type-specific Information field echoes that ack number), the elapsed time
+ * becomes an RTT sample, folded into a running estimate via
+ * draft-sharabayko-srt.md §4.10's smoothing (matching gosrt's {@code
+ * rtt.Recalculate} exactly: {@code rtt = rtt*0.875 + sample*0.125},
+ * {@code rttVar = rttVar*0.75 + |rtt-sample|*0.25}, seeded at gosrt's own
+ * defaults of 100ms/50ms before any sample arrives). This feeds both the RTT/
+ * RTTVar figures {@link AckSender#tick} reports and the periodic NAK
+ * re-announcement interval — {@code (rtt + 4*rttVar) / 2}, floored at 20ms,
+ * gosrt's own {@code NAKInterval()} formula — replacing the fixed floor this
+ * class used before any RTT was known. Buffer/rate figures are still hardcoded
+ * to 0 — that needs the receive-side stats this codebase doesn't track yet.
  */
 public final class SrtConnection {
 
     private static final Logger LOG = Logger.getLogger(SrtConnection.class.getName());
     private static final long TICK_INTERVAL_MILLIS = 10;
-    private static final long PERIODIC_NAK_INTERVAL_MICROS = 20_000;
+    private static final long MIN_NAK_INTERVAL_MICROS = 20_000;
+    private static final double INITIAL_RTT_MICROS = 100_000;
+    private static final double INITIAL_RTT_VAR_MICROS = 50_000;
 
     private final Channel channel;
     private final SrtSocketIdDemultiplexer demultiplexer;
@@ -70,9 +83,12 @@ public final class SrtConnection {
     private final ScheduledFuture<?> scheduledTick;
     private final long startNanos = System.nanoTime();
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final Map<Integer, Long> pendingAcks = new HashMap<>();
 
     private long lastPeriodicNakMicros;
     private int fullAckCounter;
+    private double rttMicros = INITIAL_RTT_MICROS;
+    private double rttVarMicros = INITIAL_RTT_VAR_MICROS;
 
     private volatile Consumer<ByteBuf> onData = payload -> {
     };
@@ -162,10 +178,42 @@ public final class SrtConnection {
                 close();
                 return;
             }
+            if (control.type() == ControlType.ACKACK) {
+                control.body().release();
+                handleAckAck(control.typeSpecificInfo());
+                return;
+            }
         }
 
         LOG.log(Level.FINE, "Dropping unhandled packet type for socket {0}", metadata.socketId());
         packet.body().release();
+    }
+
+    /**
+     * {@code ackNumber} is the ACKACK's echoed Type-specific Information field.
+     * Cleans up any older still-pending ack numbers too — once a later one is
+     * confirmed, earlier ones are presumed stale (matches gosrt's
+     * {@code handleACKACK}), so this map can't grow forever against a
+     * compliant peer.
+     */
+    private void handleAckAck(int ackNumber) {
+        Long sentAtMicros = pendingAcks.remove(ackNumber);
+        if (sentAtMicros == null) {
+            LOG.log(Level.FINE, "Got ACKACK for unknown ack number {0} on socket {1}", new Object[]{ackNumber, metadata.socketId()});
+            return;
+        }
+        recalculateRtt(elapsedMicros() - sentAtMicros);
+        pendingAcks.keySet().removeIf(pending -> pending < ackNumber);
+    }
+
+    private void recalculateRtt(long sampleMicros) {
+        double sample = sampleMicros;
+        rttMicros = rttMicros * 0.875 + sample * 0.125;
+        rttVarMicros = rttVarMicros * 0.75 + Math.abs(rttMicros - sample) * 0.25;
+    }
+
+    private long nakIntervalMicros() {
+        return Math.max(MIN_NAK_INTERVAL_MICROS, (long) ((rttMicros + 4 * rttVarMicros) / 2));
     }
 
     private void handleData(DataPacket data) {
@@ -182,10 +230,11 @@ public final class SrtConnection {
     }
 
     private void tick() {
-        ackSender.tick(elapsedMicros(), 0, 0, 0, 0, 0, 0).ifPresent(this::sendAck);
+        ackSender.tick(elapsedMicros(), (int) Math.round(rttMicros), (int) Math.round(rttVarMicros), 0, 0, 0, 0)
+                .ifPresent(this::sendAck);
 
         long now = elapsedMicros();
-        if (now - lastPeriodicNakMicros >= PERIODIC_NAK_INTERVAL_MICROS) {
+        if (now - lastPeriodicNakMicros >= nakIntervalMicros()) {
             lastPeriodicNakMicros = now;
             List<LossRange> outstanding = lossList.outstanding();
             if (!outstanding.isEmpty()) {
@@ -220,7 +269,11 @@ public final class SrtConnection {
     private void sendAck(AckCif ackCif) {
         // "Acknowledgement Number": a sequential counter for Full ACKs (0 otherwise), per
         // draft-sharabayko-srt.md - lives in the packet header, not the CIF. See AckCif's javadoc.
-        int ackNumber = ackCif.variant() == AckVariant.FULL ? ++fullAckCounter : 0;
+        int ackNumber = 0;
+        if (ackCif.variant() == AckVariant.FULL) {
+            ackNumber = ++fullAckCounter;
+            pendingAcks.put(ackNumber, elapsedMicros());
+        }
         ByteBuf cifBuf = channel.alloc().buffer();
         ackCif.encodeTo(cifBuf);
         send(new ControlPacket(ControlType.ACK, ackNumber, (int) elapsedMicros(), metadata.peerSocketId(), cifBuf));

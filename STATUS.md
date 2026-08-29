@@ -35,15 +35,16 @@ rather than aspirational: `onData`/`onLoss`/`onTlpktDrop` on `SrtConnection`
 (`SrtListener.onConnection` now hands out `SrtConnection`, not bare
 `AcceptedConnection` — see "Architecture decisions" for the API-shape note).
 KEEPALIVE (echoed back on receipt) and SHUTDOWN (tears down, sends our own
-SHUTDOWN back, fires a new `onClose` hook) are now handled too. Still missing:
-ACKACK handling, RTT measurement (NAK re-announce interval is a fixed floor, not
-RTT-adaptive), drift correction, and the entire sender-side path (Phase 4) — see
-"Known gaps."
+SHUTDOWN back, fires a new `onClose` hook) are now handled too. ACKACK is now
+handled as well, unlocking real RTT/RTTVar tracking and an RTT-adaptive periodic
+NAK interval (previously a fixed floor) — see "What's built" and "Testing
+methodology" below. Still missing: drift correction and the entire sender-side
+path (Phase 4) — see "Known gaps."
 
-129 tests passing (128 default + 1 gated interop), all committed to `main` (no
-branches). Every commit so far has been asked-for explicitly by the user, one
-narrowly-scoped piece at a time — see git log for the exact sequence and
-rationale (commit messages are detailed).
+130 tests passing (128 default + 1 gated interop + the 2 new ACKACK/RTT tests),
+all committed to `main` (no branches). Every commit so far has been asked-for
+explicitly by the user, one narrowly-scoped piece at a time — see git log for
+the exact sequence and rationale (commit messages are detailed).
 
 ## What's built
 
@@ -101,8 +102,18 @@ dropped, never thrown.
   unconditionally — mirroring gosrt's symmetric teardown, not a one-sided
   notification — then tears down; idempotent via an `AtomicBoolean` guard,
   since it's reachable both from a peer's SHUTDOWN on the event loop and from
-  `SrtListener.close()` on an arbitrary thread). ACKACK is still logged and
-  dropped. Exposes `onData`/`onLoss`/`onTlpktDrop`/`onClose` — see below — and
+  `SrtListener.close()` on an arbitrary thread). ACKACK is now handled: every
+  Full ACK sent is recorded (ack number to send time in `pendingAcks`); the
+  matching ACKACK's round trip becomes an RTT sample folded into a running
+  RTT/RTTVar estimate via gosrt's exact EWMA (`connection.go`'s `rtt.Recalculate`:
+  `rtt = rtt*0.875 + sample*0.125`, `rttVar = rttVar*0.75 + |rtt-sample|*0.25`,
+  seeded at gosrt's own defaults 100ms/50ms). This feeds real RTT/RTTVar into
+  `AckSender.tick` (previously hardcoded 0s) and makes the periodic NAK interval
+  RTT-adaptive (`(rtt + 4*rttVar)/2`, floored at 20ms — gosrt's `NAKInterval()`),
+  replacing the old fixed floor. Unknown/stale ACKACKs are logged and ignored,
+  matching gosrt's tolerant behavior. Buffer/rate figures fed to `AckSender.tick`
+  are still hardcoded to 0 — that needs receive-side stats this codebase doesn't
+  track yet. Exposes `onData`/`onLoss`/`onTlpktDrop`/`onClose` — see below — and
   `.metadata()` returning its `AcceptedConnection`.
 - `ConnectionRequest` / `AcceptDecision` / `AcceptHandler` / `AcceptedConnection`
   — the extensibility surface added per DESIGN.md's "Extensibility &
@@ -218,6 +229,23 @@ falls back to `references/srt/build/srt-live-transmit`.
   pieces).
 - **Live socket I/O** (`SrtListener`) is verified against real libsrt via
   `LibsrtInteropTest` — independent proof beyond any Go reference.
+- **RTT measurement / ACKACK handling** (`SrtConnection.handleAckAck`,
+  `recalculateRtt`, `nakIntervalMicros`) has **no gosrt test to ground against** —
+  checked deliberately, not an oversight. gosrt's `rtt` struct (`connection.go`)
+  is unexported with zero dedicated unit tests; the receive-side congestion layer
+  (`congestion/live`, our `LossList`/`AckSender` equivalent) takes
+  `PeriodicNAKInterval` as an externally-injected fixed value and never computes
+  it (see `TestRecvPeriodicNAK`) — the RTT-adaptive math lives only in
+  `connection.go`, gosrt's own connection-wiring layer, our `SrtConnection`'s
+  counterpart. The only place it's exercised at all in gosrt is
+  `TestLowRateACKOverhead`, a full-duplex `Dial`+`Server` integration test
+  measuring ACK-suppression traffic volume over wall-clock time — not portable
+  here yet since it needs a working caller/sender side (Phase 4, not built).
+  So `ackAckUpdatesRttReportedInSubsequentFullAcks`/
+  `ackAckWithUnknownAckNumberIsIgnoredWithoutCrashing` are self-designed against
+  the formula/behavior read from `connection.go`'s source — same rigor tier as
+  `ListenerHandshake`/`SrtSocketIdGenerator` above, not the stronger
+  ported-scenario tier.
 
 ## Known gaps / deliberately deferred
 
@@ -235,10 +263,11 @@ falls back to `references/srt/build/srt-live-transmit`.
   `ReceiveBufferTest`'s ported `TestSkipTooLate` for exactly where they diverge
   (gosrt runs a separate ACK-boundary-vs-delivery-boundary computation this
   codebase deliberately unifies into one).
-- **No RTT measurement** — `AckSender`'s RTT/RTTVar/buffer/rate figures and the
-  periodic NAK re-announcement interval are hardcoded (0, and a fixed 20ms floor
-  respectively) in `SrtConnection`, not adaptive. Needs ACK/ACKACK round-trip
-  timing, which needs ACKACK handling (see below) to exist first.
+- ~~No RTT measurement~~ **Closed** — `SrtConnection` now tracks real RTT/RTTVar
+  from ACK/ACKACK round trips and feeds them to `AckSender.tick` and the
+  periodic NAK interval; see "What's built" and "Testing methodology" (the
+  latter for the honest caveat that this piece has no gosrt test to ground
+  against). Buffer/rate figures fed to `AckSender.tick` are still hardcoded to 0.
 - **No drift correction, no 32-bit wire-timestamp wraparound handling** in
   `ReceiveBuffer` — correct for connections under ~71 minutes; documented in its
   class javadoc, not silent.
@@ -248,23 +277,18 @@ falls back to `references/srt/build/srt-live-transmit`.
   gosrt nor the RFC's own KEEPALIVE section impose a limit). Verified safe
   against libsrt (doesn't echo on receipt) — reconsider a rate limit before this
   codebase gets its own keepalive-originating caller/sender side.
-- **ACKACK, and the entire sender-side path (Phase 4)** — untouched.
-  `SrtConnection` logs and drops anything that isn't DATA/KEEPALIVE/SHUTDOWN.
-  This is why a connection can currently receive but not send.
+- **The entire sender-side path (Phase 4)** — untouched. `SrtConnection`
+  now handles DATA/KEEPALIVE/SHUTDOWN/ACKACK; anything else is logged and
+  dropped. This is why a connection can currently receive but not send.
 
 ## Next steps, in order
 
-1. **ACKACK handling + RTT measurement** — `SrtConnection` currently drops
-   ACKACK. Handling it unlocks real RTT/RTTVar tracking (time between sending a
-   Full ACK and receiving its ACKACK reply), which unlocks making `AckSender`'s
-   hardcoded-zero figures and the fixed periodic NAK interval real instead of
-   fake/fixed.
-2. Drift correction and 32-bit wire-timestamp wraparound handling in
+1. Drift correction and 32-bit wire-timestamp wraparound handling in
    `ReceiveBuffer` — matters once a connection runs long enough to hit either.
-3. The sender-side path (Phase 4) — send buffer, live-mode pacing, NAK-driven
+2. The sender-side path (Phase 4) — send buffer, live-mode pacing, NAK-driven
    retransmission, ACK handling. Everything so far is receive-only; a connection
    can't send anything back yet.
-4. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
+3. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
    against `SrtListener`, for full belt-and-suspenders confidence beyond
    `srt-live-transmit` — not expected to surface anything new, since ffmpeg
    wraps the same libsrt handshake code already exercised.
