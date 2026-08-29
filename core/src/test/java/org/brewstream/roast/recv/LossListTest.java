@@ -163,4 +163,56 @@ class LossListTest {
 
         assertThat(lossList.outstanding()).isEmpty();
     }
+
+    /**
+     * Ported from gosrt's congestion/live/receive_test.go TestRecvNAK: receive
+     * 0-4 in order (no loss), then 7-9 (opening gap [5,6]). gosrt's test also
+     * asserts the ACK boundary after a tick, but that assertion depends on
+     * TSBPD-deadline-forced skip-ahead (its packets' PktTsbpdTime values happen
+     * to have already elapsed by the tick under test) - a TLPKTDROP-adjacent
+     * mechanism this codebase doesn't have yet, so only the loss-detection
+     * portion is ported here. See AckSenderTest for the ACK-side equivalents that
+     * don't depend on that mechanism.
+     */
+    @Test
+    void matchesGosrtTestRecvNak() {
+        LossList lossList = new LossList(seq(0));
+        for (long i = 0; i <= 4; i++) {
+            assertThat(lossList.onPacketReceived(seq(i))).isEmpty();
+        }
+        assertThat(lossList.highestSeen()).isEqualTo(seq(4));
+
+        List<LossRange> immediate = List.of();
+        for (long i = 7; i <= 9; i++) {
+            List<LossRange> result = lossList.onPacketReceived(seq(i));
+            if (!result.isEmpty()) {
+                immediate = result;
+            }
+        }
+
+        assertThat(immediate).containsExactly(new LossRange(seq(5), seq(6)));
+        assertThat(lossList.outstanding()).containsExactly(new LossRange(seq(5), seq(6)));
+        assertThat(lossList.highestSeen()).isEqualTo(seq(9));
+    }
+
+    /**
+     * Ported from gosrt's TestIssue67 — a real regression test in the reference
+     * implementation — up through its first NAK assertion: a single packet (seq
+     * 0), then a jump straight to seq 12, opens gap [1,11]. gosrt's test continues
+     * from there to show the ACK boundary later jumping from 2 all the way to 13
+     * in one tick once the gap's packets' TSBPD delivery deadlines pass — that's
+     * TLPKTDROP forcing the receiver to give up on a stale gap, not plain ACK/NAK
+     * behavior, and isn't reproducible here without a ReceiveBuffer/TsbpdDeliverer.
+     * Without that mechanism, this LossList (correctly, for what it's scoped to
+     * do) would keep the gap outstanding forever instead of abandoning it.
+     */
+    @Test
+    void matchesGosrtTestIssue67LossDetection() {
+        LossList lossList = new LossList(seq(0));
+        lossList.onPacketReceived(seq(0));
+
+        List<LossRange> immediate = lossList.onPacketReceived(seq(12));
+
+        assertThat(immediate).containsExactly(new LossRange(seq(1), seq(11)));
+    }
 }

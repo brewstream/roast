@@ -28,6 +28,13 @@ import java.util.Optional;
  * yet (RTT needs ACK/ACKACK round-trip timing; buffer/rate figures need the
  * receive buffer). This class is purely the timing/threshold decision and CIF
  * construction, not the measurement. Not thread-safe, same as {@link LossList}.
+ *
+ * <p><b>{@code nowMicros} contract:</b> matches gosrt's {@code lastPeriodicACK},
+ * which starts at its zero-value — there is no "always send a Full ACK on the
+ * very first tick" shortcut. The first Full ACK fires once {@code nowMicros}
+ * itself reaches {@link #FULL_ACK_INTERVAL_MICROS}, so callers must pass
+ * microseconds elapsed since this receiver's own start (DESIGN.md's "never wall
+ * clock on the wire" — same rule applies to this internal clock), not epoch time.
  */
 public final class AckSender {
 
@@ -36,7 +43,6 @@ public final class AckSender {
 
     private final LossList lossList;
 
-    private boolean sentFirstFullAck;
     private long lastFullAckMicros;
     private int packetsSinceLastAck;
 
@@ -57,8 +63,7 @@ public final class AckSender {
      */
     public Optional<AckCif> tick(long nowMicros, int rtt, int rttVar, int availableBufferSize,
             int packetsReceivingRate, int estimatedLinkCapacity, int receivingRate) {
-        if (!sentFirstFullAck || nowMicros - lastFullAckMicros >= FULL_ACK_INTERVAL_MICROS) {
-            sentFirstFullAck = true;
+        if (nowMicros - lastFullAckMicros >= FULL_ACK_INTERVAL_MICROS) {
             lastFullAckMicros = nowMicros;
             packetsSinceLastAck = 0;
             CircularNumber lastAck = contiguousBoundary().inc();
