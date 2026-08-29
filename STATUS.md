@@ -52,9 +52,13 @@ estimate the receive side already tracks). See "What's built" and "Known
 gaps" for what's still missing (real bandwidth pacing beyond gosrt's own
 informational model, message chunking/MSS, live stats, caller-side
 handshake). Wiring this in surfaced and fixed a real bug in `SendBuffer`
-itself — see "Testing methodology."
+itself — see "Testing methodology." **Confirmed against real libsrt 1.5.7**:
+`LibsrtInteropTest.realListenerSendsDataToRealLibsrtCaller` has a real
+`srt-live-transmit` call our listener and read data *we* write, asserting
+byte-for-byte correctness — the actual DESIGN.md definition-of-done for
+Phase 4's interop story, not just our own round-trip tests.
 
-155 tests passing (128 default + 1 gated interop + 2 ACKACK/RTT + 5
+155 tests passing (128 default + 2 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 5 new `SrtConnectionTest` send-side
 cases), all committed to `main` (no branches). Every commit so far has been
@@ -230,11 +234,18 @@ induction→conclusion exchange as **pure decision logic** — given a decoded
 drops packets in both directions, for exercising ARQ without OS-level netem.
 
 **`interop`** (test-only) — `LibsrtInteropTest`: binds `SrtListener`, launches the
-real `srt-live-transmit` binary as a subprocess against it, asserts on both sides
-independently (our hooks fire with correct fields, *and* the peer's own stdout
-confirms `"SRT target connected"`). Skips itself via `Assumptions` (build stays
-green) if the binary isn't found — checks `$SRT_LIVE_TRANSMIT` env var first,
-falls back to `references/srt/build/srt-live-transmit`.
+real `srt-live-transmit` binary as a subprocess against it. Two directions:
+`realLibsrtCallerReachesConnected` — libsrt pushes data to us, asserts on both
+sides independently (our hooks fire with correct fields, *and* the peer's own
+stdout confirms `"SRT target connected"`); `realListenerSendsDataToRealLibsrtCaller`
+— we push data (`SrtConnection.write`) to libsrt, asserting byte-for-byte on
+what it actually received (libsrt's own log/verbose output goes to stderr by
+default, stats-to-stdout is opt-in and left off, so stdout redirected straight
+to a file is guaranteed clean of anything but the raw bytes — confirmed
+directly from libsrt's own source, not assumed). Both skip themselves via
+`Assumptions` (build stays green) if the binary isn't found — checks
+`$SRT_LIVE_TRANSMIT` env var first, falls back to
+`references/srt/build/srt-live-transmit`.
 
 ## Architecture decisions in force
 
@@ -401,20 +412,18 @@ falls back to `references/srt/build/srt-live-transmit`.
   - **ACK-sent/received hooks and live pollable stats** generally — still
     just `onRetransmit` added this pass, matching how `onData`/`onLoss`/
     `onTlpktDrop` were rolled out incrementally too.
-- **Caller-side handshake** (dial/connect flow) is unaffected by the above —
-  still only the listener side exists (see earlier gap). Real interop for the
-  send path (a real peer receiving data *from* Roast) needs either that, or
-  testing the send path against a real peer that connects *to* our listener
-  and then reads — not yet exercised either way.
+  ~~Real interop for the send path~~ **Closed** — see `LibsrtInteropTest`'s
+  `realListenerSendsDataToRealLibsrtCaller` above; didn't need the
+  caller-side handshake first, since Roast only needed to be the *listener*
+  here, with libsrt calling in and reading.
 
 ## Next steps, in order
 
-1. Real interop for the send path — a real peer (libsrt/gosrt) receiving data
-   Roast sends, over the connections `SrtListener` already accepts (doesn't
-   need caller-side handshake first).
-2. Caller-side handshake (dial/connect flow) — unlocks Roast connecting out to
-   a peer's listener, not just accepting inbound connections.
-3. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
+1. Caller-side handshake (dial/connect flow) — only the listener side exists
+   today; this unlocks Roast connecting *out* to a peer's listener, not just
+   accepting inbound connections. The one remaining structural gap in the
+   connection lifecycle.
+2. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
    against `SrtListener`, for full belt-and-suspenders confidence beyond
    `srt-live-transmit` — not expected to surface anything new, since ffmpeg
    wraps the same libsrt handshake code already exercised.
