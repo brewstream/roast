@@ -81,7 +81,7 @@ class HandshakeCifTest {
                 new HandshakeExtensionFlags(true, true, true, true, true, true, false, false),
                 100, 100);
         HandshakeCif cif = new HandshakeCif(
-                false, 5, 0, 5, seq(42), 1500, 100, HandshakeType.CONCLUSION,
+                false, 5, 0, 5, seq(42), 1500, 100, HandshakeType.CONCLUSION.code(),
                 SrtSocketId.of(0x274921), 0x123456, localhost(), extension, "/live/stream.foobar");
 
         var out = ByteBufAllocator.DEFAULT.buffer();
@@ -98,7 +98,7 @@ class HandshakeCifTest {
                 new HandshakeExtensionFlags(true, true, true, true, true, true, false, false),
                 100, 100);
         HandshakeCif original = new HandshakeCif(
-                false, 5, 0, 5, seq(42), 1500, 100, HandshakeType.CONCLUSION,
+                false, 5, 0, 5, seq(42), 1500, 100, HandshakeType.CONCLUSION.code(),
                 SrtSocketId.of(0x274921), 0x123456, localhost(), extension, "/live/stream.foobar");
 
         var buf = ByteBufAllocator.DEFAULT.buffer();
@@ -134,7 +134,7 @@ class HandshakeCifTest {
     }
 
     @Test
-    void decodeReturnsNullForUnrecognizedHandshakeType() {
+    void decodeTreatsUnrecognizedHandshakeTypeAsRejectionNotMalformed() {
         var buf = ByteBufAllocator.DEFAULT.buffer();
         buf.writeInt(5); // version
         buf.writeShort(0); // encryptionField
@@ -142,12 +142,39 @@ class HandshakeCifTest {
         buf.writeInt(0); // initialPacketSequenceNumber
         buf.writeInt(1500); // mtu
         buf.writeInt(100); // flowWindow
-        buf.writeInt(0x1234); // unrecognized handshake type
+        buf.writeInt(RejectionReason.ROGUE.code()); // not one of the 5 progression values
         buf.writeInt(0); // srtSocketId
         buf.writeInt(0); // synCookie
         buf.writeZero(16); // peerAddress
 
-        assertThat(HandshakeCif.decode(buf, false)).isNull();
+        HandshakeCif cif = HandshakeCif.decode(buf, false);
+
+        assertThat(cif).isNotNull();
+        assertThat(cif.handshakeType()).isNull();
+        assertThat(cif.isRejection()).isTrue();
+        assertThat(cif.rejectionReason()).isEqualTo(RejectionReason.ROGUE);
+        buf.release();
+    }
+
+    @Test
+    void decodeTreatsUnnamedRejectionCodeAsRejectionWithNullReason() {
+        var buf = ByteBufAllocator.DEFAULT.buffer();
+        buf.writeInt(5);
+        buf.writeShort(0);
+        buf.writeShort(0);
+        buf.writeInt(0);
+        buf.writeInt(1500);
+        buf.writeInt(100);
+        buf.writeInt(0x1234); // not a progression value, and not a named RejectionReason
+        buf.writeInt(0);
+        buf.writeInt(0);
+        buf.writeZero(16);
+
+        HandshakeCif cif = HandshakeCif.decode(buf, false);
+
+        assertThat(cif).isNotNull();
+        assertThat(cif.isRejection()).isTrue();
+        assertThat(cif.rejectionReason()).isNull();
         buf.release();
     }
 

@@ -16,6 +16,12 @@ import java.nio.charset.StandardCharsets;
  * (encryption, Phase 5) and Congestion Control blocks are recognized but skipped by
  * their declared length. {@code isRequest} isn't wire data — it's which side is
  * sending, needed to pick the HSREQ vs. HSRSP extension tag on encode.
+ *
+ * <p>{@code handshakeTypeCode} is the raw wire value rather than a {@link HandshakeType}
+ * because a rejection isn't a separate field — it's signaled by putting a
+ * {@link RejectionReason} code (or any other value outside the 5 known progression
+ * values) directly into this field. Use {@link #handshakeType()} for the normal case
+ * and {@link #isRejection()}/{@link #rejectionReason()} for the rejection case.
  */
 public record HandshakeCif(
         boolean isRequest,
@@ -25,7 +31,7 @@ public record HandshakeCif(
         CircularNumber initialPacketSequenceNumber,
         int maxTransmissionUnitSize,
         int maxFlowWindowSize,
-        HandshakeType handshakeType,
+        int handshakeTypeCode,
         SrtSocketId srtSocketId,
         int synCookie,
         InetAddress peerAddress,
@@ -34,11 +40,27 @@ public record HandshakeCif(
 
     public static final int BASE_LENGTH = 48;
 
+    /** Null if {@link #isRejection()} — this field holds a rejection reason instead. */
+    public HandshakeType handshakeType() {
+        return HandshakeType.fromCode(handshakeTypeCode);
+    }
+
+    /** Per gosrt's {@code IsHandshake}/{@code IsRejection}: anything not a known progression value is a rejection. */
+    public boolean isRejection() {
+        return handshakeType() == null;
+    }
+
+    /** Null if {@link #isRejection()} is false, or if it's a rejection code with no name in {@link RejectionReason}. */
+    public RejectionReason rejectionReason() {
+        return RejectionReason.fromCode(handshakeTypeCode);
+    }
+
     /**
      * Decodes a handshake CIF. Returns {@code null} for anything malformed: fewer
-     * than {@link #BASE_LENGTH} bytes, an unrecognized handshake type or peer
-     * address, or a truncated/mis-sized extension block — a corrupt handshake
-     * should be dropped like any other bad datagram, not crash the pipeline.
+     * than {@link #BASE_LENGTH} bytes, an unrecognized peer address, or a
+     * truncated/mis-sized extension block — a corrupt handshake should be dropped
+     * like any other bad datagram, not crash the pipeline. An unrecognized
+     * handshake-type code is NOT treated as malformed — see {@link #isRejection()}.
      */
     public static HandshakeCif decode(ByteBuf in, boolean isRequest) {
         if (in.readableBytes() < BASE_LENGTH) {
@@ -52,10 +74,7 @@ public record HandshakeCif(
                 CircularNumber.of(in.readInt() & 0x7FFF_FFFF, SrtPacket.MAX_SEQUENCE_NUMBER);
         int maxTransmissionUnitSize = in.readInt();
         int maxFlowWindowSize = in.readInt();
-        HandshakeType handshakeType = HandshakeType.fromCode(in.readInt());
-        if (handshakeType == null) {
-            return null;
-        }
+        int handshakeTypeCode = in.readInt();
         SrtSocketId srtSocketId = SrtSocketId.of(in.readInt());
         int synCookie = in.readInt();
         InetAddress peerAddress = PeerAddressCodec.decode(in);
@@ -63,9 +82,9 @@ public record HandshakeCif(
             return null;
         }
 
-        if (handshakeType != HandshakeType.CONCLUSION || extensionField == 0 || !in.isReadable()) {
+        if (handshakeTypeCode != HandshakeType.CONCLUSION.code() || extensionField == 0 || !in.isReadable()) {
             return new HandshakeCif(isRequest, version, encryptionField, extensionField,
-                    initialPacketSequenceNumber, maxTransmissionUnitSize, maxFlowWindowSize, handshakeType,
+                    initialPacketSequenceNumber, maxTransmissionUnitSize, maxFlowWindowSize, handshakeTypeCode,
                     srtSocketId, synCookie, peerAddress, null, null);
         }
 
@@ -92,7 +111,7 @@ public record HandshakeCif(
         }
 
         return new HandshakeCif(isRequest, version, encryptionField, extensionField,
-                initialPacketSequenceNumber, maxTransmissionUnitSize, maxFlowWindowSize, handshakeType,
+                initialPacketSequenceNumber, maxTransmissionUnitSize, maxFlowWindowSize, handshakeTypeCode,
                 srtSocketId, synCookie, peerAddress, handshakeExtension, streamId);
     }
 
@@ -103,7 +122,7 @@ public record HandshakeCif(
         out.writeInt((int) initialPacketSequenceNumber.value());
         out.writeInt(maxTransmissionUnitSize);
         out.writeInt(maxFlowWindowSize);
-        out.writeInt(handshakeType.code());
+        out.writeInt(handshakeTypeCode);
         out.writeInt(srtSocketId.value());
         out.writeInt(synCookie);
         PeerAddressCodec.encode(peerAddress, out);
