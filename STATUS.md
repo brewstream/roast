@@ -9,20 +9,26 @@ touching the connection layer's public API again).
 
 ## Where we are
 
-Mid **Phase 2** (handshake) per DESIGN.md §5's phased plan. Phase 1 (packet
-codec) is functionally done for what's needed so far. **The handshake now runs
-end-to-end over a real UDP socket** (`SrtListener`, loopback-tested) — induction
-and conclusion both work, connections get accepted or rejected, `onConnection`
-fires. What's still missing before Phase 2 is actually *done*: Phase 0's
-ffmpeg/libsrt interop harness has **not** been stood up, so nothing here has ever
-been tested against a real SRT peer (ffmpeg, libsrt, srt-live-transmit) —
-everything is verified against gosrt's own golden vectors, internal round-trip
-tests, and (for `SrtListener`) a hand-built fake caller using our own real codec
-classes over real loopback sockets.
+**Phase 2 (handshake) is essentially done** per DESIGN.md §5's phased plan and its
+own stated definition of done: a real SRT peer reaches "connected" against
+`SrtListener`. Confirmed 2026-08-29 against real **libsrt 1.5.7**
+(`srt-live-transmit`, built from source at `roast/references/srt`) — induction,
+cookie verification, StreamID/extension parsing, TSBPD negotiation, and the
+accept/`onConnection` hooks all checked out correctly against an independent
+implementation, not just our own code. This is `LibsrtInteropTest`
+(`@Tag("interop")`, run via `./gradlew interopTest`), not the default `test` task
+— see "Architecture decisions" below for why. Phase 1 (packet codec) is
+functionally done for what's needed so far.
 
-83 tests passing, all committed to `main` (no branches). Every commit so far has
-been asked-for explicitly by the user, one narrowly-scoped piece at a time — see
-git log for the exact sequence and rationale (commit messages are detailed).
+**Not yet tried:** `ffmpeg`'s own `srt://` muxer specifically (only libsrt's own
+`srt-live-transmit` tool) — ffmpeg wraps the same libsrt handshake code, so this
+is expected to work, but hasn't been literally exercised. Everything else is
+still verified only against gosrt's golden vectors and our own round-trip tests.
+
+84 tests passing (83 default + 1 interop, gated separately), all committed to
+`main` (no branches). Every commit so far has been asked-for explicitly by the
+user, one narrowly-scoped piece at a time — see git log for the exact sequence
+and rationale (commit messages are detailed).
 
 ## What's built
 
@@ -90,6 +96,13 @@ induction→conclusion exchange as **pure decision logic** — given a decoded
 **`harness`** (test-only) — `UdpLossProxy`: standalone UDP relay that randomly
 drops packets in both directions, for exercising ARQ without OS-level netem.
 
+**`interop`** (test-only) — `LibsrtInteropTest`: binds `SrtListener`, launches the
+real `srt-live-transmit` binary as a subprocess against it, asserts on both sides
+independently (our hooks fire with correct fields, *and* the peer's own stdout
+confirms `"SRT target connected"`). Skips itself via `Assumptions` (build stays
+green) if the binary isn't found — checks `$SRT_LIVE_TRANSMIT` env var first,
+falls back to `references/srt/build/srt-live-transmit`.
+
 ## Architecture decisions in force
 
 - Package root `org.brewstream.roast` (Gradle group `org.brewstream`), not
@@ -106,15 +119,23 @@ drops packets in both directions, for exercising ARQ without OS-level netem.
   binding (see the connection request/lifecycle hooks above). Read it before
   changing `SrtListener`'s public API or designing the Phase 3 data path's hooks.
 - Tests: JUnit 5 + **AssertJ** for assertions (not `Assertions.assertEquals` etc.)
-  + **Mockito** for collaborator mocks. `SrtListenerTest` is the one exception to
-  "plain synchronous assertions" — it's real socket I/O on an async event-loop
-  thread, so callback assertions go through a `CompletableFuture`.
+  + **Mockito** for collaborator mocks. `SrtListenerTest` and `LibsrtInteropTest`
+  are the exceptions to "plain synchronous assertions" — real socket I/O (and, for
+  the latter, a real subprocess) on async threads, so callback/output assertions
+  go through a `CompletableFuture` / a joined reader thread.
+- **Interop tests are gated separately.** `build.gradle`'s default `test` task
+  excludes `@Tag("interop")`; a dedicated `interopTest` task runs those. Don't add
+  a test that spawns an external process or depends on a locally-built binary to
+  the default `test` task — tag it `interop` instead, and make it skip via
+  `Assumptions` (not fail) when its prerequisite isn't present.
 - Reference implementations cloned locally at `roast/references/` (gitignored,
   never pushed): `gosrt` (Go, MIT — the primary structural/golden-vector
-  reference) and `srt-rfc` (Haivision's actively-maintained spec source,
-  supersedes the expired 2021 IETF `draft-sharabayko-srt-01` datatracker
-  snapshot — SRT never became a formal RFC). `Haivision/srt` (libsrt) has **not**
-  been cloned yet — deferred until real interop testing is needed.
+  reference), `srt-rfc` (Haivision's actively-maintained spec source, supersedes
+  the expired 2021 IETF `draft-sharabayko-srt-01` datatracker snapshot — SRT
+  never became a formal RFC), and `srt` (Haivision's libsrt, MPL-2.0 — built from
+  source, `cmake -DENABLE_APPS=ON .. && make` in `references/srt/build/`, gives
+  `srt-live-transmit` for interop testing; needs OpenSSL and a C++ toolchain,
+  both present via Homebrew on this machine).
 - `SrtPacket.encodeTo`/CIF `encodeTo` methods **consume and release** their
   `ByteBuf` body — a packet that needs sending again (ARQ retransmit) must
   `retainedDuplicate()` into a fresh packet first, not reuse an encoded one.
@@ -134,15 +155,15 @@ drops packets in both directions, for exercising ARQ without OS-level netem.
 
 ## Next steps, in order
 
-1. **Phase 0 interop harness** — install `ffmpeg --enable-libsrt` and
-   `srt-live-transmit`, prove a real caller (ffmpeg) can reach "connected"
-   against `SrtListener`. This is the actual definition of done for Phase 2 per
-   DESIGN.md; nothing built so far has been validated against a real SRT peer —
-   only against our own hand-built fake caller in `SrtListenerTest`.
-2. Only after that: Phase 3 receiver path (receive buffer, NAK generation using
-   the loss-list codec, ACK/ACKACK, TSBPD delivery, KEEPALIVE, SHUTDOWN) — and
-   design its event hooks against DESIGN.md's "Extensibility & observability"
-   list from the start, not retrofitted after.
+1. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
+   against `SrtListener`, for full belt-and-suspenders confidence beyond
+   `srt-live-transmit` — not expected to surface anything new, since ffmpeg
+   wraps the same libsrt handshake code already exercised.
+2. **Phase 3 receiver path** — receive buffer, NAK generation using the
+   loss-list codec, ACK/ACKACK, TSBPD delivery, KEEPALIVE, SHUTDOWN. This is
+   what actually lets an accepted connection send/receive data — right now it
+   can only complete a handshake. Design its event hooks against DESIGN.md's
+   "Extensibility & observability" list from the start, not retrofitted after.
 
 ## How to pick this back up
 
