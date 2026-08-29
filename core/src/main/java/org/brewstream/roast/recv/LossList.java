@@ -14,10 +14,10 @@ import java.util.List;
  * — a new gap can only open beyond the highest sequence number seen so far.
  *
  * <p>Mirrors the loss-detection core of gosrt's {@code congestion/live} receiver
- * (congestion/live/receive.go's {@code Push}), without the ACK generation,
- * TSBPD-delivery buffering, or statistics bundled with it there — those are
- * separate, not-yet-built pieces (an {@code AckSender}, a {@code ReceiveBuffer} /
- * {@code TsbpdDeliverer}).
+ * (congestion/live/receive.go's {@code Push}), without the ACK generation
+ * ({@link AckSender}, built on top of this), TSBPD-delivery buffering, or
+ * statistics bundled with it there — the latter two are separate, not-yet-built
+ * pieces (a {@code ReceiveBuffer} / {@code TsbpdDeliverer}).
  *
  * <p>Not thread-safe — callers own synchronization, same as everything else in
  * this module so far.
@@ -59,6 +59,11 @@ public final class LossList {
     /** Still-missing ranges, oldest first, for periodic NAK re-announcement. */
     public List<LossRange> outstanding() {
         return List.copyOf(missing);
+    }
+
+    /** The highest sequence number seen so far, in order or not. */
+    public CircularNumber highestSeen() {
+        return maxSeen;
     }
 
     private void remove(CircularNumber seq) {
