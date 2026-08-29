@@ -38,13 +38,15 @@ KEEPALIVE (echoed back on receipt) and SHUTDOWN (tears down, sends our own
 SHUTDOWN back, fires a new `onClose` hook) are now handled too. ACKACK is now
 handled as well, unlocking real RTT/RTTVar tracking and an RTT-adaptive periodic
 NAK interval (previously a fixed floor) — see "What's built" and "Testing
-methodology" below. Still missing: drift correction and the entire sender-side
-path (Phase 4) — see "Known gaps."
+methodology" below. `ReceiveBuffer` now also does TSBPD clock-drift correction,
+fed by the same ACKACK path. Still missing: 32-bit wire-timestamp wraparound
+handling and the entire sender-side path (Phase 4) — see "Known gaps."
 
-130 tests passing (128 default + 1 gated interop + the 2 new ACKACK/RTT tests),
-all committed to `main` (no branches). Every commit so far has been asked-for
-explicitly by the user, one narrowly-scoped piece at a time — see git log for
-the exact sequence and rationale (commit messages are detailed).
+137 tests passing (128 default + 1 gated interop + 2 ACKACK/RTT + 5 new
+`DriftTracerTest` + 2 new `ReceiveBufferTest` drift cases), all committed to
+`main` (no branches). Every commit so far has been asked-for explicitly by the
+user, one narrowly-scoped piece at a time — see git log for the exact sequence
+and rationale (commit messages are detailed).
 
 ## What's built
 
@@ -147,13 +149,28 @@ numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
 - `ReceiveBuffer` (+ `DeliveryResult`) — holds accepted DATA packets sorted by
   sequence number, delivers whatever's contiguous-or-abandoned and past its
   TSBPD deadline (wire timestamp + a per-connection time base + negotiated
-  latency). Combines what DESIGN.md separately names `ReceiveBuffer` and
-  `TsbpdDeliverer` (gosrt keeps them as one struct too). Implements TLPKTDROP:
-  gives up on a stale gap once a later packet's deadline has passed rather than
-  blocking delivery forever. No drift correction and no 32-bit wire-timestamp
-  wraparound handling yet (correct under ~71 minutes) — both documented in the
-  class javadoc, not silent. `dispose()` releases undelivered buffered payloads
-  on connection teardown.
+  latency + clock drift). Combines what DESIGN.md separately names
+  `ReceiveBuffer` and `TsbpdDeliverer` (gosrt keeps them as one struct too).
+  Implements TLPKTDROP: gives up on a stale gap once a later packet's deadline
+  has passed rather than blocking delivery forever. Delivery deadlines are
+  computed live at `deliver()`-check time (not frozen when a packet is
+  buffered) — matches libsrt's `getPktTime()` model, so an already-buffered
+  packet's deadline correctly shifts if drift/time-base changes while it's
+  still waiting. No 32-bit wire-timestamp wraparound handling yet (correct
+  under ~71 minutes) — documented in the class javadoc, not silent.
+  `dispose()` releases undelivered buffered payloads on connection teardown.
+- `DriftTracer` — median-based clock-drift estimator, ported from libsrt's
+  generic `DriftTracer<MAX_SPAN, MAX_DRIFT, CLEAR_ON_UPDATE=true>` template
+  (`utilities.h`), specialized to libsrt's own constants (1000-sample span,
+  ±5000µs clamp). `ReceiveBuffer.addDriftSample(...)` (a faithful port of
+  libsrt's `CTsbpdTime::addDriftSample`) feeds it a sample on every ACKACK,
+  called from `SrtConnection.handleAckAck` with the ACKACK's own header
+  timestamp, local arrival time, and the raw (unsmoothed) RTT sample for that
+  exchange; a no-op before `ReceiveBuffer`'s TSBPD time base exists. libsrt's
+  `update()`-then-separately-read-`overdrift()` two-step protocol (fragile —
+  only valid if read immediately after `update()` returns true) is collapsed
+  into a single `OptionalLong` return from `update()` — same information, a
+  deliberate documented API simplification, not a behavior change.
 
 **`handshake`** — `SynCookie`: MD5-based SYN cookie so a listener can verify an
 INDUCTION cookie was echoed back correctly in CONCLUSION without keeping
@@ -246,6 +263,16 @@ falls back to `references/srt/build/srt-live-transmit`.
   the formula/behavior read from `connection.go`'s source — same rigor tier as
   `ListenerHandshake`/`SrtSocketIdGenerator` above, not the stronger
   ported-scenario tier.
+- **Drift correction** (`DriftTracer`, `ReceiveBuffer.addDriftSample`) has
+  **no reference test to ground against, in either implementation** — checked
+  deliberately. gosrt's drift support is dead code (a field declared, never
+  assigned — see "Architecture decisions"/"Known gaps"), so there's nothing to
+  port from there at all. libsrt is the only real implementation
+  (`srtcore/tsbpd_time.{h,cpp}`, `srtcore/utilities.h`'s `DriftTracer`), but
+  its own `test/` directory has zero drift- or tsbpd-related unit tests —
+  checked directly, not assumed. So `DriftTracerTest` and the two new
+  `ReceiveBufferTest` drift cases are self-designed directly against libsrt's
+  source, same rigor tier as the ACKACK/RTT work above.
 
 ## Known gaps / deliberately deferred
 
@@ -268,9 +295,15 @@ falls back to `references/srt/build/srt-live-transmit`.
   periodic NAK interval; see "What's built" and "Testing methodology" (the
   latter for the honest caveat that this piece has no gosrt test to ground
   against). Buffer/rate figures fed to `AckSender.tick` are still hardcoded to 0.
-- **No drift correction, no 32-bit wire-timestamp wraparound handling** in
-  `ReceiveBuffer` — correct for connections under ~71 minutes; documented in its
-  class javadoc, not silent.
+- ~~No drift correction~~ **Closed** — `ReceiveBuffer` now does TSBPD
+  clock-drift correction via `DriftTracer`, fed on every ACKACK; see "What's
+  built" and "Testing methodology" (the latter for the honest caveat that
+  neither reference has test coverage for this piece — gosrt's own drift
+  support is dead code).
+- **No 32-bit wire-timestamp wraparound handling** in `ReceiveBuffer` —
+  correct for connections under ~71 minutes; documented in its class javadoc,
+  not silent. This is the remaining half of what used to be one bundled
+  "drift + wraparound" gap.
 - **KEEPALIVE's echo-on-receipt has no rate limit** — ported faithfully from
   gosrt's `handleKeepAlive`, which doesn't gate it either, but two peers that
   *both* echo immediately on receipt could in theory tight-loop forever (neither
@@ -283,8 +316,8 @@ falls back to `references/srt/build/srt-live-transmit`.
 
 ## Next steps, in order
 
-1. Drift correction and 32-bit wire-timestamp wraparound handling in
-   `ReceiveBuffer` — matters once a connection runs long enough to hit either.
+1. 32-bit wire-timestamp wraparound handling in `ReceiveBuffer` — matters once
+   a connection runs long enough (~71 minutes) to hit it.
 2. The sender-side path (Phase 4) — send buffer, live-mode pacing, NAK-driven
    retransmission, ACK handling. Everything so far is receive-only; a connection
    can't send anything back yet.
