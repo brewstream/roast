@@ -25,11 +25,35 @@ import java.util.OptionalLong;
  * comparison would. gosrt's own receiver uses a plain linked list for the same
  * structure, for the same reason.
  *
- * <p><b>Implements TLPKTDROP</b>: if a buffered packet's own deadline has passed
+ * <p><b>Implements TLPKTDROP</b>, and does so <em>decoupled from delivery</em> —
+ * traced precisely from gosrt's {@code congestion/live/receive.go} this pass
+ * (see the "ACK boundary" paragraph below), not the single-boundary design
+ * this class started with. If a buffered packet's own deadline has passed
  * while an earlier sequence number is still missing, that gap is abandoned
- * rather than blocking delivery forever — reported via
- * {@link DeliveryResult#abandoned()} so a caller can clear it from a paired
+ * rather than blocking delivery forever — reported via {@link
+ * AckBoundaryResult#abandoned()} so a caller can clear it from a paired
  * {@link LossList} (stop NAKing it).
+ *
+ * <p><b>ACK boundary vs. delivery boundary</b>: this class tracks two separate
+ * boundaries, matching gosrt's {@code lastACKSequenceNumber}/{@code
+ * lastDeliveredSequenceNumber} split exactly — confirmed via gosrt's own
+ * {@code TestRecvDropTooLate}, which asserts them as genuinely distinct
+ * fields, and {@code TestIssue67}, a real historical gosrt bug fix for
+ * <em>this exact failure mode</em> (a real interop session against libsrt hit
+ * the same category of bug independently before this was ported — see
+ * STATUS.md). {@link #computeAckBoundary} walks {@link #buffered} from {@link
+ * #lastAcked} forward: a packet whose own deadline has already passed
+ * advances the boundary past it <em>even across a gap</em> — the actual
+ * TLPKTDROP "give up" decision happens here, not in {@link #deliver} — while
+ * a genuinely next-in-sequence packet advances it normally; anything else
+ * stops the walk. This means the ACK boundary can jump past several stale
+ * entries in a single call, not just the front one. {@link #deliver} is then
+ * a purely mechanical hand-out, gated by <em>both</em> that just-computed
+ * boundary and each entry's own deadline — it can never get ahead of what's
+ * been acknowledged, but the ACK computation itself isn't gated by delivery's
+ * own pace. Callers must call {@link #computeAckBoundary} before {@link
+ * #deliver} each tick, passing its result in — matching the order gosrt's own
+ * {@code Tick()} calls {@code periodicACK()} then its delivery loop.
  *
  * <p><b>Drift correction</b>: every delivery deadline is computed live (at
  * {@link #deliver}-check time), not frozen when a packet is buffered — {@code
@@ -63,19 +87,6 @@ import java.util.OptionalLong;
  * reference has a dedicated test for this piece either (checked directly);
  * self-designed against both sources — see STATUS.md's testing methodology.
  *
- * <p>Deliberately simplified for this pass, documented as a known gap (see
- * STATUS.md):
- * <ul>
- *   <li>Unlike gosrt, this doesn't let an acknowledgment boundary run ahead of
- *       the delivery boundary for still-buffered in-order packets that simply
- *       haven't reached their deadline yet — gosrt's ACK reporting and TSBPD
- *       delivery are two separate boundary computations over the same buffer;
- *       here they're the same boundary, computed once, in {@link #deliver}.
- *       This is a deliberate simplification, not an oversight — see
- *       {@code ReceiveBufferTest}'s ported {@code TestSkipTooLate} case for
- *       exactly where the two diverge.</li>
- * </ul>
- *
  * <p>Not thread-safe, same as {@link LossList}/{@link AckSender}.
  */
 public final class ReceiveBuffer {
@@ -90,20 +101,26 @@ public final class ReceiveBuffer {
     private final DriftTracer driftTracer = new DriftTracer();
 
     private Long timeBaseMicros;
+    private CircularNumber lastAcked;
     private CircularNumber lastDelivered;
     private long firstRttSampleMicros = -1;
     private boolean tsbpdWrapPeriod;
 
     public ReceiveBuffer(CircularNumber initialSequenceNumber, long latencyMicros) {
         this.latencyMicros = latencyMicros;
+        this.lastAcked = initialSequenceNumber.dec();
         this.lastDelivered = initialSequenceNumber.dec();
     }
 
     /**
      * Buffers a DATA packet for later delivery, or drops it (releasing its
-     * payload) if it's a duplicate or arrived after its sequence number was
-     * already delivered/abandoned. {@code nowMicros} establishes this buffer's
-     * time base on the very first call — see the class-level wraparound caveat.
+     * payload) if it's belated (at or before {@link #lastDelivered}) or
+     * already acknowledged/abandoned (before {@link #lastAcked} — ported as a
+     * separate check from gosrt's {@code Push}, since that zone can now be
+     * ahead of {@link #lastDelivered} — see the class javadoc's "ACK boundary
+     * vs. delivery boundary" section). {@code nowMicros} establishes this
+     * buffer's time base on the very first call — see the class-level
+     * wraparound caveat.
      */
     public void add(DataPacket packet, long nowMicros) {
         if (timeBaseMicros == null) {
@@ -112,7 +129,7 @@ public final class ReceiveBuffer {
         updateWrapPeriod(packet.timestamp());
 
         CircularNumber seq = CircularNumber.of(packet.sequenceNumber() & 0x7FFF_FFFF, SrtPacket.MAX_SEQUENCE_NUMBER);
-        if (seq.lessThanOrEqual(lastDelivered)) {
+        if (seq.lessThanOrEqual(lastDelivered) || seq.lessThan(lastAcked)) {
             packet.payload().release();
             return;
         }
@@ -183,24 +200,61 @@ public final class ReceiveBuffer {
     }
 
     /**
-     * Delivers everything ready as of {@code nowMicros}: buffered packets that
-     * are next-in-sequence (or become so via TLPKTDROP abandoning what's still
-     * missing before them) and whose own delivery deadline has arrived. The
-     * caller owns each delivered packet's payload from here on.
+     * Ported from gosrt's {@code periodicACK} walk (see the class javadoc's
+     * "ACK boundary vs. delivery boundary" section) — the actual TLPKTDROP
+     * "give up on this gap" decision happens here, not in {@link #deliver}.
+     * Walks {@link #buffered} from {@link #lastAcked} forward: a packet whose
+     * own deadline has already passed advances the boundary to it regardless
+     * of any gap before it (banking the skipped range as abandoned); a
+     * genuinely next-in-sequence packet advances it normally; anything else
+     * stops the walk. Call once per tick, before {@link #deliver}, and pass
+     * its result's {@link AckBoundaryResult#lastAckSequenceNumber()} straight
+     * into that call.
      */
-    public DeliveryResult deliver(long nowMicros) {
-        List<DataPacket> delivered = new ArrayList<>();
+    public AckBoundaryResult computeAckBoundary(long nowMicros) {
         List<LossRange> abandoned = new ArrayList<>();
+
+        for (Entry entry : buffered) {
+            if (entry.seq().lessThanOrEqual(lastAcked)) {
+                continue; // already acked - shouldn't normally happen, mirrors gosrt's own guard
+            }
+
+            if (tsbpdTimeMicros(entry) <= nowMicros) {
+                CircularNumber expected = lastAcked.inc();
+                if (!entry.seq().equals(expected)) {
+                    abandoned.add(new LossRange(expected, entry.seq().dec()));
+                }
+                lastAcked = entry.seq();
+                continue;
+            }
+
+            if (entry.seq().equals(lastAcked.inc())) {
+                lastAcked = entry.seq();
+                continue;
+            }
+
+            break;
+        }
+
+        return new AckBoundaryResult(lastAcked, abandoned);
+    }
+
+    /**
+     * Hands out everything ready as of {@code nowMicros}: buffered packets
+     * that are at or before {@code ackBoundary} (see {@link
+     * #computeAckBoundary}, which must be called first each tick) and whose
+     * own delivery deadline has arrived. Purely mechanical — delivery can
+     * never get ahead of what's been acknowledged, but doesn't independently
+     * decide to give up on anything itself anymore. The caller owns each
+     * delivered packet's payload from here on.
+     */
+    public DeliveryResult deliver(CircularNumber ackBoundary, long nowMicros) {
+        List<DataPacket> delivered = new ArrayList<>();
 
         while (!buffered.isEmpty()) {
             Entry next = buffered.get(0);
-            if (tsbpdTimeMicros(next) > nowMicros) {
+            if (next.seq().greaterThan(ackBoundary) || tsbpdTimeMicros(next) > nowMicros) {
                 break;
-            }
-
-            CircularNumber expected = lastDelivered.inc();
-            if (!next.seq().equals(expected)) {
-                abandoned.add(new LossRange(expected, next.seq().dec()));
             }
 
             delivered.add(next.packet());
@@ -208,7 +262,7 @@ public final class ReceiveBuffer {
             lastDelivered = next.seq();
         }
 
-        return new DeliveryResult(delivered, abandoned);
+        return new DeliveryResult(delivered);
     }
 
     /** Releases every currently-buffered, undelivered packet's payload — call on connection teardown. */

@@ -13,6 +13,7 @@ import org.brewstream.roast.packet.cif.AckCif;
 import org.brewstream.roast.packet.cif.AckVariant;
 import org.brewstream.roast.packet.cif.LossListCodec;
 import org.brewstream.roast.packet.cif.LossRange;
+import org.brewstream.roast.recv.AckBoundaryResult;
 import org.brewstream.roast.recv.AckSender;
 import org.brewstream.roast.recv.DeliveryResult;
 import org.brewstream.roast.recv.LossList;
@@ -159,7 +160,7 @@ public final class SrtConnection {
         this.metadata = metadata;
         this.onChannelOwnerClose = onChannelOwnerClose;
         this.lossList = new LossList(initialSequenceNumber);
-        this.ackSender = new AckSender(lossList);
+        this.ackSender = new AckSender();
         this.receiveBuffer = new ReceiveBuffer(initialSequenceNumber, metadata.receiveLatencyMillis() * 1000L);
         long dropThresholdMicros = Math.max((long) (metadata.sendLatencyMillis() * 1000L * 1.25), 1_000_000L) + 20_000L;
         this.sendBuffer = new SendBuffer(initialSequenceNumber, metadata.peerSocketId(), dropThresholdMicros, this::sendData);
@@ -358,11 +359,28 @@ public final class SrtConnection {
         receiveBuffer.add(data, elapsedMicros());
     }
 
+    /**
+     * Ordered to match gosrt's own {@code Tick()}: the ACK boundary is computed
+     * first ({@link ReceiveBuffer#computeAckBoundary} — the actual TLPKTDROP
+     * "give up" decision happens there now, not in delivery), fed into {@link
+     * LossList#abandon} and the ACK CIF, then periodic NAK, then delivery is
+     * gated by that same just-computed boundary. See {@link ReceiveBuffer}'s
+     * javadoc for why this order matters — delivery must never run ahead of an
+     * ACK boundary computed after it.
+     */
     private void tick() {
-        ackSender.tick(elapsedMicros(), (int) Math.round(rttMicros), (int) Math.round(rttVarMicros), 0, 0, 0, 0)
+        long now = elapsedMicros();
+
+        AckBoundaryResult ackBoundary = receiveBuffer.computeAckBoundary(now);
+        for (LossRange abandoned : ackBoundary.abandoned()) {
+            lossList.abandon(abandoned.end());
+            onTlpktDrop.accept(abandoned);
+        }
+
+        ackSender.tick(now, ackBoundary.lastAckSequenceNumber().inc(),
+                (int) Math.round(rttMicros), (int) Math.round(rttVarMicros), 0, 0, 0, 0)
                 .ifPresent(this::sendAck);
 
-        long now = elapsedMicros();
         if (now - lastPeriodicNakMicros >= nakIntervalMicros()) {
             lastPeriodicNakMicros = now;
             List<LossRange> outstanding = lossList.outstanding();
@@ -371,11 +389,7 @@ public final class SrtConnection {
             }
         }
 
-        DeliveryResult result = receiveBuffer.deliver(elapsedMicros());
-        for (LossRange abandoned : result.abandoned()) {
-            lossList.abandon(abandoned.end());
-            onTlpktDrop.accept(abandoned);
-        }
+        DeliveryResult result = receiveBuffer.deliver(ackBoundary.lastAckSequenceNumber(), now);
         for (DataPacket delivered : result.delivered()) {
             onData.accept(delivered.body());
         }

@@ -30,16 +30,23 @@ class ReceiveBufferTest {
         packets.forEach(p -> p.body().release());
     }
 
+    /** Matches production usage: compute the ACK boundary, then deliver gated by it. */
+    private static DeliveryResult deliverAll(ReceiveBuffer buffer, long nowMicros) {
+        AckBoundaryResult ack = buffer.computeAckBoundary(nowMicros);
+        return buffer.deliver(ack.lastAckSequenceNumber(), nowMicros);
+    }
+
     @Test
     void inOrderPacketsDueOnTimeAreDeliveredInOrder() {
         ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 0);
         buffer.add(dataPacket(0, 0), 0);
         buffer.add(dataPacket(1, 1), 0);
 
-        DeliveryResult result = buffer.deliver(1);
+        AckBoundaryResult ack = buffer.computeAckBoundary(1);
+        assertThat(ack.abandoned()).isEmpty();
+        DeliveryResult result = buffer.deliver(ack.lastAckSequenceNumber(), 1);
 
         assertThat(seqNumbersOf(result.delivered())).containsExactly(0, 1);
-        assertThat(result.abandoned()).isEmpty();
         release(result.delivered());
     }
 
@@ -48,9 +55,9 @@ class ReceiveBufferTest {
         ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 5_000);
         buffer.add(dataPacket(0, 0), 0); // tsbpdTime = 0 + 0 + 5000 = 5000
 
-        assertThat(buffer.deliver(1_000).delivered()).isEmpty();
+        assertThat(deliverAll(buffer, 1_000).delivered()).isEmpty();
 
-        DeliveryResult result = buffer.deliver(5_000);
+        DeliveryResult result = deliverAll(buffer, 5_000);
         assertThat(seqNumbersOf(result.delivered())).containsExactly(0);
         release(result.delivered());
     }
@@ -63,7 +70,7 @@ class ReceiveBufferTest {
         buffer.add(dataPacket(1, 1), 0);
         buffer.add(dataPacket(0, 0), 0);
 
-        DeliveryResult result = buffer.deliver(0);
+        DeliveryResult result = deliverAll(buffer, 0);
 
         assertThat(seqNumbersOf(result.delivered())).containsExactly(0, 1, 2);
         release(result.delivered());
@@ -73,28 +80,27 @@ class ReceiveBufferTest {
     void duplicateOrBelatedArrivalAfterDeliveryIsDroppedAndPayloadReleased() {
         ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 0);
         buffer.add(dataPacket(0, 0), 0);
-        release(buffer.deliver(0).delivered());
+        release(deliverAll(buffer, 0).delivered());
 
         var duplicatePayload = Unpooled.buffer(0);
         DataPacket duplicate = new DataPacket(0, 0, true, 0, false, 1, 0, SrtSocketId.of(1), duplicatePayload);
         buffer.add(duplicate, 0);
 
         assertThat(duplicatePayload.refCnt()).isZero();
-        assertThat(buffer.deliver(1_000_000).delivered()).isEmpty();
+        assertThat(deliverAll(buffer, 1_000_000).delivered()).isEmpty();
     }
 
     /**
-     * Ported from gosrt's congestion/live/receive_test.go TestSkipTooLate, the
-     * delivery-sequence assertions only. gosrt's test also asserts an ACK
-     * boundary of 13 after the second tick, but that value depends on gosrt's
-     * ACK boundary running ahead of delivery for still-buffered in-order packets
-     * (seq 10, 11 there aren't due for delivery yet but are counted as
-     * "acknowledged" anyway) - a distinction this class deliberately doesn't
-     * make (see its class-level javadoc). The delivery outcome - which packets
-     * actually get handed over, and which gap gets abandoned - matches exactly.
+     * Ported from gosrt's congestion/live/receive_test.go TestSkipTooLate,
+     * including the ACK-boundary assertion an earlier version of this test
+     * excluded: {@link ReceiveBuffer#computeAckBoundary} now runs ahead of
+     * delivery the same way gosrt's periodicACK does (see the class javadoc's
+     * "ACK boundary vs. delivery boundary" section), so gosrt's own reported
+     * boundary of 13 (seq 12 + 1) is reproduced exactly, not just the
+     * delivery outcome.
      */
     @Test
-    void matchesGosrtTestSkipTooLateDeliveryOutcome() {
+    void matchesGosrtTestSkipTooLate() {
         ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 0);
         buffer.add(dataPacket(0, 1), 1); // establishes timeBase = 1 - 1 = 0
         buffer.add(dataPacket(1, 2), 0);
@@ -102,9 +108,11 @@ class ReceiveBufferTest {
         buffer.add(dataPacket(3, 4), 0);
         buffer.add(dataPacket(4, 5), 0);
 
-        DeliveryResult first = buffer.deliver(10);
+        AckBoundaryResult firstAck = buffer.computeAckBoundary(10);
+        assertThat(firstAck.abandoned()).isEmpty();
+        assertThat(firstAck.lastAckSequenceNumber()).isEqualTo(seq(4));
+        DeliveryResult first = buffer.deliver(firstAck.lastAckSequenceNumber(), 10);
         assertThat(seqNumbersOf(first.delivered())).containsExactly(0, 1, 2, 3, 4);
-        assertThat(first.abandoned()).isEmpty();
         release(first.delivered());
 
         // Skip straight to seq 8-12 (5,6,7 never arrive), with deadlines far in the future.
@@ -114,11 +122,80 @@ class ReceiveBufferTest {
         buffer.add(dataPacket(11, 22), 0);
         buffer.add(dataPacket(12, 23), 0);
 
-        DeliveryResult second = buffer.deliver(20);
+        AckBoundaryResult secondAck = buffer.computeAckBoundary(20);
+        assertThat(secondAck.abandoned()).containsExactly(new LossRange(seq(5), seq(7)));
+        // gosrt's own "13": seq 9's deadline (20) has passed, so the walk skips the
+        // [5,7] gap to reach it, then keeps advancing through 10/11/12 since they're
+        // each contiguous with the last - all in this one call, ahead of delivery.
+        assertThat(secondAck.lastAckSequenceNumber()).isEqualTo(seq(12));
+        DeliveryResult second = buffer.deliver(secondAck.lastAckSequenceNumber(), 20);
 
+        // Delivery still stops at seq 9 - seq 10's own deadline (21) hasn't passed yet.
         assertThat(seqNumbersOf(second.delivered())).containsExactly(8, 9);
-        assertThat(second.abandoned()).containsExactly(new LossRange(seq(5), seq(7)));
         release(second.delivered());
+    }
+
+    /**
+     * Ported from gosrt's TestIssue67 - a real historical gosrt bug fix for
+     * exactly this failure mode (an ACK boundary that stays frozen behind a
+     * gap even once a later, non-contiguous packet's own deadline has
+     * passed). This is the identical category of bug a real interop session
+     * against libsrt hit independently before this test existed here - see
+     * STATUS.md.
+     */
+    @Test
+    void matchesGosrtTestIssue67() {
+        ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 0);
+        buffer.add(dataPacket(0, 1), 1); // establishes timeBase = 1 - 1 = 0
+
+        // Nothing new arrives for a while - the boundary just sits at 0.
+        for (long now = 10; now <= 90; now += 10) {
+            assertThat(buffer.computeAckBoundary(now).lastAckSequenceNumber()).isEqualTo(seq(0));
+        }
+
+        buffer.add(dataPacket(12, 121), 0); // opens a big gap; not yet due (deadline 121)
+        buffer.add(dataPacket(1, 11), 0); // contiguous with seq 0
+        buffer.add(dataPacket(11, 111), 0); // still gapped from seq 1, not yet due at t=100/110
+
+        assertThat(buffer.computeAckBoundary(100).lastAckSequenceNumber()).isEqualTo(seq(1));
+        assertThat(buffer.computeAckBoundary(110).lastAckSequenceNumber()).isEqualTo(seq(1));
+
+        // seq 11's deadline (111) has now passed - skip the [2,10] gap to reach it,
+        // then keep going since seq 12 is contiguous with it. One call, past the gap.
+        AckBoundaryResult ack = buffer.computeAckBoundary(120);
+        assertThat(ack.abandoned()).containsExactly(new LossRange(seq(2), seq(10)));
+        assertThat(ack.lastAckSequenceNumber()).isEqualTo(seq(12));
+
+        // Idempotent - nothing new to process, the boundary just stays put.
+        assertThat(buffer.computeAckBoundary(130).lastAckSequenceNumber()).isEqualTo(seq(12));
+
+        release(buffer.deliver(seq(12), 120).delivered());
+    }
+
+    /**
+     * Inspired by gosrt's TestRecvDropTooLate: in a clean, gap-free run, the
+     * ACK boundary and the delivery boundary converge to the same point -
+     * the two-boundary design doesn't diverge unless there's actually a gap
+     * to skip past.
+     */
+    @Test
+    void ackAndDeliveryBoundariesConvergeWithNoGap() {
+        ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 0);
+        for (int i = 0; i < 10; i++) {
+            buffer.add(dataPacket(i, i + 1), 0);
+        }
+
+        AckBoundaryResult ack = buffer.computeAckBoundary(10);
+        assertThat(ack.abandoned()).isEmpty();
+        assertThat(ack.lastAckSequenceNumber()).isEqualTo(seq(9));
+        DeliveryResult result = buffer.deliver(ack.lastAckSequenceNumber(), 10);
+        assertThat(seqNumbersOf(result.delivered())).containsExactly(0, 1, 2, 3, 4, 5, 6, 7, 8, 9);
+        release(result.delivered());
+
+        // A late re-arrival of an already-delivered sequence number is dropped.
+        var latePayload = Unpooled.buffer(0);
+        buffer.add(new DataPacket(3, 0, true, 0, false, 1, 4, SrtSocketId.of(1), latePayload), 0);
+        assertThat(latePayload.refCnt()).isZero();
     }
 
     @Test
@@ -134,8 +211,8 @@ class ReceiveBufferTest {
         // If the pre-timeBase samples above had silently accumulated, the
         // completed span would already have banked an overdrift and shifted
         // this deadline past 10_000 (latency alone).
-        assertThat(buffer.deliver(9_999).delivered()).isEmpty();
-        DeliveryResult result = buffer.deliver(10_000);
+        assertThat(deliverAll(buffer, 9_999).delivered()).isEmpty();
+        DeliveryResult result = deliverAll(buffer, 10_000);
         assertThat(seqNumbersOf(result.delivered())).containsExactly(0);
         release(result.delivered());
     }
@@ -145,7 +222,7 @@ class ReceiveBufferTest {
         ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 10_000);
         buffer.add(dataPacket(0, 0), 0); // establishes timeBase = 0 - 0 = 0; deadline = 10_000 pre-drift
 
-        assertThat(buffer.deliver(9_999).delivered()).isEmpty();
+        assertThat(deliverAll(buffer, 9_999).delivered()).isEmpty();
 
         // A consistent 8_000us drift sample (same RTT every time, so the
         // RTT-delta term stays 0) exceeds the 5_000us clamp once the span
@@ -156,8 +233,8 @@ class ReceiveBufferTest {
             buffer.addDriftSample(0, 8_000, 100_000);
         }
 
-        assertThat(buffer.deliver(17_999).delivered()).isEmpty();
-        DeliveryResult result = buffer.deliver(18_000);
+        assertThat(deliverAll(buffer, 17_999).delivered()).isEmpty();
+        DeliveryResult result = deliverAll(buffer, 18_000);
         assertThat(seqNumbersOf(result.delivered())).containsExactly(0);
         release(result.delivered());
     }
@@ -183,8 +260,8 @@ class ReceiveBufferTest {
         // so entering the wrap period doesn't touch its own deadline.
         buffer.add(dataPacket(0, ts(JUST_PAST_WRAP_THRESHOLD)), JUST_PAST_WRAP_THRESHOLD);
 
-        assertThat(buffer.deliver(JUST_PAST_WRAP_THRESHOLD - 1).delivered()).isEmpty();
-        DeliveryResult result = buffer.deliver(JUST_PAST_WRAP_THRESHOLD);
+        assertThat(deliverAll(buffer, JUST_PAST_WRAP_THRESHOLD - 1).delivered()).isEmpty();
+        DeliveryResult result = deliverAll(buffer, JUST_PAST_WRAP_THRESHOLD);
         assertThat(seqNumbersOf(result.delivered())).containsExactly(0);
         release(result.delivered());
     }
@@ -193,13 +270,13 @@ class ReceiveBufferTest {
     void smallTimestampDuringSuspectedWrapGetsProvisionalCarryover() {
         ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 0);
         buffer.add(dataPacket(0, ts(JUST_PAST_WRAP_THRESHOLD)), JUST_PAST_WRAP_THRESHOLD);
-        release(buffer.deliver(JUST_PAST_WRAP_THRESHOLD).delivered()); // out of the way; wrap period stays entered
+        release(deliverAll(buffer, JUST_PAST_WRAP_THRESHOLD).delivered()); // out of the way; wrap period stays entered
 
         buffer.add(dataPacket(1, 5_000_000), 0); // small ts, still within the wrap-suspect window (<= 60s)
 
         long expectedDeadline = (SrtPacket.MAX_TIMESTAMP + 1) + 5_000_000; // provisional carryover applied
-        assertThat(buffer.deliver(expectedDeadline - 1).delivered()).isEmpty();
-        DeliveryResult result = buffer.deliver(expectedDeadline);
+        assertThat(deliverAll(buffer, expectedDeadline - 1).delivered()).isEmpty();
+        DeliveryResult result = deliverAll(buffer, expectedDeadline);
         assertThat(seqNumbersOf(result.delivered())).containsExactly(1);
         release(result.delivered());
     }
@@ -208,13 +285,13 @@ class ReceiveBufferTest {
     void wrapConfirmationCommitsOffsetConsistentlyForNewPackets() {
         ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 0);
         buffer.add(dataPacket(0, ts(JUST_PAST_WRAP_THRESHOLD)), JUST_PAST_WRAP_THRESHOLD);
-        release(buffer.deliver(JUST_PAST_WRAP_THRESHOLD).delivered());
+        release(deliverAll(buffer, JUST_PAST_WRAP_THRESHOLD).delivered());
 
         buffer.add(dataPacket(1, 45_000_000), 0); // lands in [30s, 60s] - confirms and commits the wrap
 
         long expectedDeadline = (SrtPacket.MAX_TIMESTAMP + 1) + 45_000_000; // timeBase now includes the cycle
-        assertThat(buffer.deliver(expectedDeadline - 1).delivered()).isEmpty();
-        DeliveryResult result = buffer.deliver(expectedDeadline);
+        assertThat(deliverAll(buffer, expectedDeadline - 1).delivered()).isEmpty();
+        DeliveryResult result = deliverAll(buffer, expectedDeadline);
         assertThat(seqNumbersOf(result.delivered())).containsExactly(1);
         release(result.delivered());
     }
@@ -229,16 +306,16 @@ class ReceiveBufferTest {
     void bufferedPacketDeadlineIsUnchangedAcrossWrapConfirmation() {
         ReceiveBuffer buffer = new ReceiveBuffer(seq(0), 0);
         buffer.add(dataPacket(0, ts(JUST_PAST_WRAP_THRESHOLD)), JUST_PAST_WRAP_THRESHOLD);
-        release(buffer.deliver(JUST_PAST_WRAP_THRESHOLD).delivered());
+        release(deliverAll(buffer, JUST_PAST_WRAP_THRESHOLD).delivered());
 
         buffer.add(dataPacket(1, 5_000_000), 0); // provisional carryover, not yet confirmed
-        assertThat(buffer.deliver(0).delivered()).isEmpty();
+        assertThat(deliverAll(buffer, 0).delivered()).isEmpty();
 
         buffer.add(dataPacket(2, 45_000_000), 0); // confirms the wrap, commits the offset
 
         long expectedSeq1Deadline = (SrtPacket.MAX_TIMESTAMP + 1) + 5_000_000; // unchanged from before confirmation
-        assertThat(buffer.deliver(expectedSeq1Deadline - 1).delivered()).isEmpty();
-        DeliveryResult result = buffer.deliver(expectedSeq1Deadline);
+        assertThat(deliverAll(buffer, expectedSeq1Deadline - 1).delivered()).isEmpty();
+        DeliveryResult result = deliverAll(buffer, expectedSeq1Deadline);
         assertThat(seqNumbersOf(result.delivered())).containsExactly(1); // seq 2 not due yet, stays buffered
         release(result.delivered());
     }
