@@ -44,4 +44,15 @@ subprojects {
             events 'passed', 'skipped', 'failed'
         }
     }
+
+    tasks.register('relayDemo', JavaExec) {
+        description = 'Manual publish/play relay demo (see RelayDemo.java) - not part of the test suite.'
+        group = 'application'
+        classpath = sourceSets.main.runtimeClasspath
+        mainClass = 'org.brewstream.roast.cli.RelayDemo'
+        standardInput = System.in
+        if (project.hasProperty('port')) {
+            args = [project.property('port')]
+        }
+    }
 }
