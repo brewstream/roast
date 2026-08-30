@@ -265,6 +265,17 @@ public final class ReceiveBuffer {
         return new DeliveryResult(delivered);
     }
 
+    /**
+     * How many packets are currently held awaiting delivery — i.e. how much of
+     * the receive window is in use. Feeds the "available buffer size" figure a
+     * Full ACK reports to the peer (see {@code SrtConnection.tick}); a peer's
+     * sender treats that figure as its flow-control window, so it has to
+     * reflect reality.
+     */
+    public int bufferedCount() {
+        return buffered.size();
+    }
+
     /** Releases every currently-buffered, undelivered packet's payload — call on connection teardown. */
     public void dispose() {
         buffered.forEach(entry -> entry.packet().body().release());

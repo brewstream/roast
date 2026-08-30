@@ -67,8 +67,13 @@ import java.util.logging.Logger;
  * RTTVar figures {@link AckSender#tick} reports and the periodic NAK
  * re-announcement interval — {@code (rtt + 4*rttVar) / 2}, floored at 20ms,
  * gosrt's own {@code NAKInterval()} formula — replacing the fixed floor this
- * class used before any RTT was known. Buffer/rate figures are still hardcoded
- * to 0 — that needs the receive-side stats this codebase doesn't track yet.
+ * class used before any RTT was known. The available-buffer-size figure is
+ * real (see {@link #tick} — it was hardcoded to 0, which cost ~35-42% of a
+ * real published stream, since a peer reads it as our flow-control window);
+ * the <em>rate</em> figures are still hardcoded to 0, which needs receive-side
+ * rate stats this codebase doesn't track yet. gosrt reports a fixed
+ * {@code FC} for the buffer figure and real rates; Roast is currently the
+ * other way round.
  *
  * <p><b>Sending</b>: {@link #write} queues a payload on {@link SendBuffer},
  * which owns the sending side's loss list and TLPKTDROP the same way {@link
@@ -109,6 +114,19 @@ public final class SrtConnection {
     private static final long MIN_NAK_INTERVAL_MICROS = 20_000;
     private static final double INITIAL_RTT_MICROS = 100_000;
     private static final double INITIAL_RTT_VAR_MICROS = 50_000;
+
+    /**
+     * The receive window this connection advertises, in packets — matches
+     * {@code CallerHandshake}'s own advertised flow window, and is what a Full
+     * ACK's "available buffer size" is measured against. Not yet the
+     * <em>negotiated</em> value (the handshake echoes the peer's number back;
+     * threading that through {@code AcceptedConnection} is a separate change) —
+     * but a fixed, honest window is what gosrt reports too ({@code
+     * connection.go}'s {@code sendACK} sets {@code AvailableBufferSize} to its
+     * configured {@code FC}, default 25600, and carries a TODO noting it isn't
+     * the real available figure either).
+     */
+    private static final int RECEIVE_FLOW_WINDOW_PACKETS = 8192;
 
     private final Channel channel;
     private final SrtSocketIdDemultiplexer demultiplexer;
@@ -367,6 +385,17 @@ public final class SrtConnection {
      * gated by that same just-computed boundary. See {@link ReceiveBuffer}'s
      * javadoc for why this order matters — delivery must never run ahead of an
      * ACK boundary computed after it.
+     *
+     * <p><b>The available-buffer-size figure is load-bearing, not cosmetic.</b>
+     * It used to be hardcoded to 0 (alongside the rate figures, which still
+     * are). A peer's sender reads it as this receiver's flow-control window:
+     * advertising 0 tells it we cannot accept anything, so it stops sending and
+     * drops packets it decides can no longer be delivered in time, announcing
+     * them with DROPREQ instead. Against real ffmpeg/libsrt that silently cost
+     * ~35% of the published stream — the packets were never put on the wire at
+     * all, which is why every receive-side loss counter stayed clean while the
+     * relayed output was visibly corrupt. See STATUS.md for the full
+     * investigation.
      */
     private void tick() {
         long now = elapsedMicros();
@@ -377,8 +406,9 @@ public final class SrtConnection {
             onTlpktDrop.accept(abandoned);
         }
 
+        int availableBufferSize = Math.max(0, RECEIVE_FLOW_WINDOW_PACKETS - receiveBuffer.bufferedCount());
         ackSender.tick(now, ackBoundary.lastAckSequenceNumber().inc(),
-                (int) Math.round(rttMicros), (int) Math.round(rttVarMicros), 0, 0, 0, 0)
+                (int) Math.round(rttMicros), (int) Math.round(rttVarMicros), availableBufferSize, 0, 0, 0)
                 .ifPresent(this::sendAck);
 
         if (now - lastPeriodicNakMicros >= nakIntervalMicros()) {

@@ -186,6 +186,25 @@ class SrtConnectionTest {
         assertThat(updated.cif().rtt()).isLessThan(first.cif().rtt());
     }
 
+    /**
+     * Regression test for a real, expensive bug: this figure used to be
+     * hardcoded to 0. A peer's sender reads it as our flow-control window, so
+     * advertising 0 tells it we can't accept anything - real libsrt responded
+     * by collapsing its window to 0 and dropping ~42% of a published live
+     * stream before it ever hit the wire (confirmed via its own pktSndDrop/
+     * pktFlowWindow counters). Every receive-side loss counter stayed clean
+     * throughout, because the packets were never sent at all. See STATUS.md.
+     */
+    @Test
+    void fullAckAdvertisesRealReceiveWindowNotZero() throws Exception {
+        connectAndAccept();
+
+        AckCif cif = receiveFullAck().cif();
+
+        // An empty receive buffer means the whole window is available.
+        assertThat(cif.availableBufferSize()).isEqualTo(8192);
+    }
+
     @Test
     void ackAckWithUnknownAckNumberIsIgnoredWithoutCrashing() throws Exception {
         SrtConnection connection = connectAndAccept();
