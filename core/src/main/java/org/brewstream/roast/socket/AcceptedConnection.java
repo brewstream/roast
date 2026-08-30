@@ -17,5 +17,20 @@ public record AcceptedConnection(
         String streamId,
         int receiveLatencyMillis,
         int sendLatencyMillis,
-        int srtVersion) {
+        int srtVersion,
+        int flowWindowSize) {
+
+    /**
+     * The flow window agreed during the handshake, in packets — both sides of
+     * this codebase's handshake echo the value the other proposed
+     * ({@code ListenerHandshake.buildAcceptResponse} /
+     * {@code CallerHandshake.buildConclusionRequest}), so this is literally the
+     * number we committed to on the wire. {@link SrtConnection} bounds the
+     * "available buffer size" it reports in Full ACKs by it, which is what a
+     * peer's sender treats as its flow-control window — see that class's
+     * {@code tick}.
+     */
+    public int flowWindowSize() {
+        return flowWindowSize;
+    }
 }

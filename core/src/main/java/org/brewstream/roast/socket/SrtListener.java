@@ -167,7 +167,8 @@ public final class SrtListener {
         HandshakeExtension negotiated = response.handshakeExtension();
         AcceptedConnection metadata = new AcceptedConnection(
                 assignedSocketId, request.srtSocketId(), msg.sender(), request.streamId(),
-                negotiated.receiveTsbpdDelayMillis(), negotiated.sendTsbpdDelayMillis(), negotiated.srtVersion());
+                negotiated.receiveTsbpdDelayMillis(), negotiated.sendTsbpdDelayMillis(), negotiated.srtVersion(),
+                response.maxFlowWindowSize());
         SrtConnection connection = new SrtConnection(
                 channel, demultiplexer, metadata, request.initialPacketSequenceNumber());
         connections.put(assignedSocketId, connection);

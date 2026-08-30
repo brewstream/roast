@@ -45,6 +45,8 @@ class SrtConnectionTest {
 
     private static final InetAddress LOCALHOST = loopback();
     private static final int TIMEOUT_SECONDS = 5;
+    /** What a caller advertises unless a test needs a distinguishable value. */
+    private static final int DEFAULT_FLOW_WINDOW = 8192;
     private static final SrtSocketId CALLER_SOCKET_ID = SrtSocketId.of(0x9000);
 
     private SrtListener listener;
@@ -202,7 +204,21 @@ class SrtConnectionTest {
         AckCif cif = receiveFullAck().cif();
 
         // An empty receive buffer means the whole window is available.
-        assertThat(cif.availableBufferSize()).isEqualTo(8192);
+        assertThat(cif.availableBufferSize()).isEqualTo(DEFAULT_FLOW_WINDOW);
+    }
+
+    /**
+     * The window reported is the one actually agreed during the handshake, not a
+     * fixed constant - negotiating something other than the built-in fallback is
+     * the only way to tell those two apart.
+     */
+    @Test
+    void fullAckAdvertisesTheNegotiatedFlowWindowNotTheFallback() throws Exception {
+        int negotiated = 4096; // deliberately != the 8192 fallback
+
+        connectAndAccept(negotiated);
+
+        assertThat(receiveFullAck().cif().availableBufferSize()).isEqualTo(negotiated);
     }
 
     @Test
@@ -301,14 +317,18 @@ class SrtConnectionTest {
     }
 
     private SrtConnection connectAndAccept() throws Exception {
+        return connectAndAccept(DEFAULT_FLOW_WINDOW);
+    }
+
+    private SrtConnection connectAndAccept(int flowWindowSize) throws Exception {
         listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0));
         listener.setAcceptHandler(request -> AcceptDecision.accept());
         CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
         listener.onConnection(connected::complete);
         caller = newCaller();
 
-        HandshakeCif inductionReply = sendAndReceiveHandshake(inductionRequest());
-        sendAndReceiveHandshake(conclusionRequest(inductionReply.synCookie()));
+        HandshakeCif inductionReply = sendAndReceiveHandshake(inductionRequest(flowWindowSize));
+        sendAndReceiveHandshake(conclusionRequest(inductionReply.synCookie(), flowWindowSize));
 
         return connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
@@ -478,16 +498,24 @@ class SrtConnectionTest {
     }
 
     private static HandshakeCif inductionRequest() {
+        return inductionRequest(DEFAULT_FLOW_WINDOW);
+    }
+
+    private static HandshakeCif inductionRequest(int flowWindowSize) {
         return new HandshakeCif(
-                true, 5, 0, 0, seq(1), 1500, 8192, HandshakeType.INDUCTION.code(),
+                true, 5, 0, 0, seq(1), 1500, flowWindowSize, HandshakeType.INDUCTION.code(),
                 CALLER_SOCKET_ID, 0, LOCALHOST, null, null);
     }
 
     private static HandshakeCif conclusionRequest(int synCookie) {
+        return conclusionRequest(synCookie, DEFAULT_FLOW_WINDOW);
+    }
+
+    private static HandshakeCif conclusionRequest(int synCookie, int flowWindowSize) {
         HandshakeExtension extension = new HandshakeExtension(
                 0x010401, new HandshakeExtensionFlags(true, true, true, true, true, true, false, false), 120, 120);
         return new HandshakeCif(
-                true, 5, 0, 5, seq(1), 1500, 8192, HandshakeType.CONCLUSION.code(),
+                true, 5, 0, 5, seq(1), 1500, flowWindowSize, HandshakeType.CONCLUSION.code(),
                 CALLER_SOCKET_ID, synCookie, LOCALHOST, extension, "live/test");
     }
 

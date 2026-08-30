@@ -116,17 +116,17 @@ public final class SrtConnection {
     private static final double INITIAL_RTT_VAR_MICROS = 50_000;
 
     /**
-     * The receive window this connection advertises, in packets — matches
-     * {@code CallerHandshake}'s own advertised flow window, and is what a Full
-     * ACK's "available buffer size" is measured against. Not yet the
-     * <em>negotiated</em> value (the handshake echoes the peer's number back;
-     * threading that through {@code AcceptedConnection} is a separate change) —
-     * but a fixed, honest window is what gosrt reports too ({@code
-     * connection.go}'s {@code sendACK} sets {@code AvailableBufferSize} to its
-     * configured {@code FC}, default 25600, and carries a TODO noting it isn't
-     * the real available figure either).
+     * Fallback receive window, in packets, used only when the handshake didn't
+     * yield a usable one — matches {@code CallerHandshake}'s own advertised
+     * default. Normally {@link AcceptedConnection#flowWindowSize()} (the value
+     * actually agreed on the wire) is used instead; this exists so a peer that
+     * advertises 0, or a malformed handshake, can't silently reproduce the
+     * advertise-a-zero-window bug that cost ~35-42% of a real stream (see
+     * {@link #tick}). gosrt sidesteps the question by always reporting its own
+     * configured {@code FC} ({@code connection.go}'s {@code sendACK}, default
+     * 25600) rather than anything negotiated.
      */
-    private static final int RECEIVE_FLOW_WINDOW_PACKETS = 8192;
+    private static final int FALLBACK_RECEIVE_FLOW_WINDOW_PACKETS = 8192;
 
     private final Channel channel;
     private final SrtSocketIdDemultiplexer demultiplexer;
@@ -137,6 +137,7 @@ public final class SrtConnection {
     private final ReceiveRateEstimator receiveRateEstimator = new ReceiveRateEstimator();
     private final SendBuffer sendBuffer;
     private final ScheduledFuture<?> scheduledTick;
+    private final int receiveFlowWindowPackets;
     private final long startNanos = System.nanoTime();
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final Map<Integer, Long> pendingAcks = new HashMap<>();
@@ -181,6 +182,9 @@ public final class SrtConnection {
         this.lossList = new LossList(initialSequenceNumber);
         this.ackSender = new AckSender();
         this.receiveBuffer = new ReceiveBuffer(initialSequenceNumber, metadata.receiveLatencyMillis() * 1000L);
+        this.receiveFlowWindowPackets = metadata.flowWindowSize() > 0
+                ? metadata.flowWindowSize()
+                : FALLBACK_RECEIVE_FLOW_WINDOW_PACKETS;
         long dropThresholdMicros = Math.max((long) (metadata.sendLatencyMillis() * 1000L * 1.25), 1_000_000L) + 20_000L;
         this.sendBuffer = new SendBuffer(initialSequenceNumber, metadata.peerSocketId(), dropThresholdMicros, this::sendData);
 
@@ -412,7 +416,7 @@ public final class SrtConnection {
         }
 
         receiveRateEstimator.tick(now);
-        int availableBufferSize = Math.max(0, RECEIVE_FLOW_WINDOW_PACKETS - receiveBuffer.bufferedCount());
+        int availableBufferSize = Math.max(0, receiveFlowWindowPackets - receiveBuffer.bufferedCount());
         ackSender.tick(now, ackBoundary.lastAckSequenceNumber().inc(),
                 (int) Math.round(rttMicros), (int) Math.round(rttVarMicros), availableBufferSize,
                 receiveRateEstimator.packetsPerSecond(),
