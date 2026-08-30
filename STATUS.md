@@ -1023,8 +1023,13 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   the peer's value rather than negotiating down to our own limit (no config
   object to hold ours). **Congestion Control extension** parsing/mismatch
   rejection is still skipped entirely; noted inline there.
-- **No `SrtConfig`** — `SrtListener` hardcodes 120ms latency (both directions)
-  and SRT version `0x010401` (matching gosrt's own baseline).
+- ~~No `SrtConfig`~~ **Closed** — `SrtConfig` is an immutable record with
+  `defaults()` and `with*` copies; see "What's built". Six knobs deliberately,
+  with the passphrase kept out of it (it belongs on `AcceptDecision`, per
+  stream, not in a settings object an application might log). Still internal and
+  *not* a knob: the peer idle timeout above — both references make it tunable,
+  but `SrtConnection` has no view of the config today and the plumbing is a
+  larger change than the fix was.
 - **Encryption** — **feature-complete and proven
   against real libsrt**, which keys with a shared passphrase and decrypts
   payloads we encrypted (`LibsrtInteropTest.realLibsrtCallerDecryptsWhatWeEncrypt`).
@@ -1140,12 +1145,36 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   both gosrt and libsrt implement this, but neither has unit coverage for it).
   This closes the last item under `ReceiveBuffer`'s known gaps — Phase 3 (the
   receiver path) is now feature-complete.
-- **KEEPALIVE's echo-on-receipt has no rate limit** — ported faithfully from
-  gosrt's `handleKeepAlive`, which doesn't gate it either, but two peers that
-  *both* echo immediately on receipt could in theory tight-loop forever (neither
-  gosrt nor the RFC's own KEEPALIVE section impose a limit). Verified safe
-  against libsrt (doesn't echo on receipt) — reconsider a rate limit before this
-  codebase gets its own keepalive-originating caller/sender side.
+- ~~KEEPALIVE's echo-on-receipt has no rate limit~~ / ~~no KEEPALIVE
+  origination, no peer idle timeout~~ **Closed, 2026-08-30** — the design's
+  "KEEPALIVE (~1s) and connection expiry (peer idle timeout, default 5s)" was the
+  last unmet item on the protocol feature checklist, and it was a real leak: a
+  peer that vanished without a SHUTDOWN (pulled cable, killed process) left its
+  connection ticking forever, sending ACKs into the void and sitting in
+  `SrtListener`'s maps for the life of the process. `SrtConnection` now reaps
+  after 5s of total silence — both references' default, with *any* inbound packet
+  resetting the clock, matching gosrt, which resets at the top of `handlePacket`
+  before it has even looked at the packet type.
+
+  The keepalive half resolved the rate-limit worry above rather than deferring
+  it again. The two references each have a coherent half of the mechanism and
+  the halves do not mix: gosrt echoes on receipt and never originates; libsrt
+  originates on an idle send timer and never echoes. Roast now follows libsrt
+  wholesale — originate after 1s of sending nothing, and never echo. Keeping the
+  echo *and* adding origination is precisely the tight loop the old entry warned
+  about, and it would have been self-inflicted.
+
+  Worth recording honestly: the origination branch is a **backstop that never
+  fires today**, because `AckSender` emits a full ACK every 10ms whether or not
+  any data arrived, so the last-send clock never ages near a second. That is
+  measured, not assumed — instrumenting the branch across the whole suite
+  recorded zero firings. libsrt pairs the same periodic-ACK timer with the same
+  last-send check, so this is a faithful port rather than dead weight, but it
+  only starts earning its keep if that ACK cadence ever changes.
+
+  Tests: `SrtConnectionTest.aPeerThatGoesSilentIsReapedRatherThanLeaked` (also
+  asserts the listener's map is emptied, not just that the connection closed) and
+  `keepAliveIsNotEchoedBack`. Both verified to fail when the change is reverted.
 - ~~The entire sender-side path (Phase 4)~~ **Underway** — `SrtConnection` now
   handles DATA/KEEPALIVE/SHUTDOWN/ACK/NAK/ACKACK and can `write(...)` data
   out; see "What's built". Remaining pieces of Phase 4, still deferred:

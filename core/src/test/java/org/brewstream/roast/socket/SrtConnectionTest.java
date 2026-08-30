@@ -29,6 +29,7 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -54,6 +55,8 @@ class SrtConnectionTest {
     /** What a caller advertises unless a test needs a distinguishable value. */
     private static final int DEFAULT_FLOW_WINDOW = 8192;
     private static final SrtSocketId CALLER_SOCKET_ID = SrtSocketId.of(0x9000);
+    /** Mirrors SrtConnection's own PEER_IDLE_TIMEOUT_MICROS. */
+    private static final int PEER_IDLE_TIMEOUT_SECONDS = 5;
 
     private SrtListener listener;
     private DatagramSocket caller;
@@ -158,13 +161,44 @@ class SrtConnectionTest {
         connection.close();
     }
 
+    /**
+     * Receiving a KEEPALIVE must not produce one in reply. This used to echo,
+     * following gosrt; now that Roast originates keepalives on an idle send timer
+     * (libsrt's model), doing both would let two Roast peers bounce keepalives off
+     * each other at wire speed with nothing to damp it.
+     */
     @Test
-    void keepAliveIsEchoedBack() throws Exception {
+    void keepAliveIsNotEchoedBack() throws Exception {
         SrtConnection connection = connectAndAccept();
 
         sendControl(connection.metadata().socketId(), ControlType.KEEPALIVE);
 
-        receiveControl(ControlType.KEEPALIVE).body().release();
+        // ACKs stream continuously, so this window sees plenty of traffic - it is
+        // an assertion about what that traffic contains, not that it is empty.
+        assertThat(controlTypesReceivedWithin(500))
+                .as("a received KEEPALIVE must not be echoed")
+                .doesNotContain(ControlType.KEEPALIVE);
+    }
+
+    /**
+     * A peer that vanishes without a SHUTDOWN - a pulled cable, a killed process -
+     * must be reaped. Without an idle timeout the connection ticks on forever,
+     * sending ACKs into the void, and stays registered in the listener's maps for
+     * the life of the process.
+     */
+    @Test
+    void aPeerThatGoesSilentIsReapedRatherThanLeaked() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        CompletableFuture<Void> closed = new CompletableFuture<>();
+        connection.onClose(() -> closed.complete(null));
+        assertThat(listener.connections()).hasSize(1);
+
+        // The fake caller simply stops reading and sending from here on.
+        closed.get(PEER_IDLE_TIMEOUT_SECONDS + 5, TimeUnit.SECONDS);
+
+        assertThat(listener.connections())
+                .as("the reaped connection must not linger in the listener's map")
+                .isEmpty();
     }
 
     @Test
@@ -910,6 +944,40 @@ class SrtConnectionTest {
     }
 
     /** Reads incoming packets until one of the given type is found (skipping others, e.g. periodic ACKs). */
+    /**
+     * Every control type the fake caller sees over the next {@code millis} — for
+     * asserting that something is <em>absent</em> from the outbound traffic, which
+     * {@link #receiveControl} can't express.
+     */
+    private List<ControlType> controlTypesReceivedWithin(long millis) throws IOException {
+        List<ControlType> seen = new ArrayList<>();
+        int previousTimeout = caller.getSoTimeout();
+        caller.setSoTimeout(100);
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(millis);
+        try {
+            while (System.nanoTime() < deadline) {
+                byte[] buffer = new byte[2048];
+                DatagramPacket incoming = new DatagramPacket(buffer, buffer.length);
+                try {
+                    caller.receive(incoming);
+                } catch (SocketTimeoutException e) {
+                    continue;
+                }
+                ByteBuf buf = Unpooled.wrappedBuffer(incoming.getData(), 0, incoming.getLength());
+                SrtPacket packet = SrtPacket.decode(buf);
+                if (packet instanceof ControlPacket control) {
+                    seen.add(control.type());
+                }
+                if (packet != null) {
+                    packet.body().release();
+                }
+            }
+        } finally {
+            caller.setSoTimeout(previousTimeout);
+        }
+        return seen;
+    }
+
     private ControlPacket receiveControl(ControlType type) throws IOException {
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
         while (System.nanoTime() < deadline) {

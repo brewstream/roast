@@ -51,15 +51,15 @@ import java.util.logging.Logger;
  * established "drop what you don't handle yet" pattern rather than crashing
  * the connection.
  *
- * <p>KEEPALIVE is echoed back immediately on receipt, matching gosrt's
- * {@code handleKeepAlive} (connection.go) exactly — worth flagging: if a peer
- * mirrors this same "echo on receipt" behavior (this codebase's own future
- * caller/sender side might), two such peers talking to each other could in
- * theory tight-loop echoing each other's keepalives forever, since neither
- * gosrt nor the RFC's own KEEPALIVE description gates this with a rate limit.
- * Verified safe against libsrt specifically (it doesn't echo on receipt), which
- * is this codebase's actual interop target so far — reconsider a rate limit
- * before this codebase gets its own keepalive-originating side.
+ * <p><b>KEEPALIVE follows libsrt's model, not gosrt's:</b> originate one when
+ * nothing has gone out for a second, and on receipt do nothing beyond the
+ * proof-of-life every inbound packet already provides. The two references differ
+ * here, and each is internally consistent — gosrt echoes on receipt and never
+ * originates, libsrt originates on an idle send timer and never echoes — but the
+ * halves do not mix. This class used to echo, which was safe only for as long as
+ * nothing here originated; combining the two would let two Roast peers echo each
+ * other's keepalives at wire speed with nothing to damp it, since neither gosrt
+ * nor the RFC's KEEPALIVE section rate-limits the echo.
  *
  * <p><b>RTT measurement</b>: every Full ACK we send is recorded (ack number →
  * send time); when the matching ACKACK arrives (its packet-header
@@ -120,6 +120,24 @@ public final class SrtConnection {
     private static final double INITIAL_RTT_VAR_MICROS = 50_000;
 
     /**
+     * How long a peer may stay silent before we treat it as gone. Five seconds is
+     * both references' default (gosrt's {@code PeerIdleTimeout}, libsrt's
+     * {@code SRTO_PEERIDLETIMEO}), and <em>any</em> packet resets it — data, ACK,
+     * KEEPALIVE alike — so only a genuinely dead peer reaches it. Deliberately not
+     * an {@code SrtConfig} knob for now: both references make it tunable, but
+     * {@code SrtConnection} has no view of the config today, and the plumbing is a
+     * bigger change than the fix.
+     */
+    private static final long PEER_IDLE_TIMEOUT_MICROS = 5_000_000;
+
+    /**
+     * Send a KEEPALIVE when nothing else has gone out for this long — libsrt's
+     * {@code COMM_KEEPALIVE_PERIOD_US}, measured from the last packet we sent
+     * rather than the last one we received.
+     */
+    private static final long KEEPALIVE_INTERVAL_MICROS = 1_000_000;
+
+    /**
      * Fallback receive window, in packets, used only when the handshake didn't
      * yield a usable one — matches {@code CallerHandshake}'s own advertised
      * default. Normally {@link AcceptedConnection#flowWindowSize()} (the value
@@ -168,6 +186,17 @@ public final class SrtConnection {
     private long packetsDropped;
 
     private long lastPeriodicNakMicros;
+    /**
+     * When we last heard anything at all from the peer, and when we last sent
+     * anything to it — the two clocks behind {@link #PEER_IDLE_TIMEOUT_MICROS} and
+     * {@link #KEEPALIVE_INTERVAL_MICROS}. Both are written and read on the event
+     * loop only, like {@link #lastPeriodicNakMicros}, so neither needs to be
+     * volatile. Starting at zero (the connection epoch) is correct: a peer that
+     * never says anything after the handshake is reaped on the same schedule as
+     * one that goes quiet later.
+     */
+    private long lastReceiveMicros;
+    private long lastSendMicros;
     private int fullAckCounter;
     private double rttMicros = INITIAL_RTT_MICROS;
     private double rttVarMicros = INITIAL_RTT_VAR_MICROS;
@@ -398,6 +427,11 @@ public final class SrtConnection {
     }
 
     private void onPacket(AddressedEnvelope<SrtPacket, InetSocketAddress> msg) {
+        // Every inbound packet counts as proof of life, whatever it turns out to
+        // be - matching gosrt, which resets its idle timer at the top of
+        // handlePacket before it has looked at the type at all.
+        lastReceiveMicros = elapsedMicros();
+
         SrtPacket packet = msg.content();
         if (packet instanceof DataPacket data) {
             handleData(data);
@@ -406,8 +440,10 @@ public final class SrtConnection {
 
         if (packet instanceof ControlPacket control) {
             if (control.type() == ControlType.KEEPALIVE) {
+                // Nothing to do beyond the idle-timer reset every inbound packet
+                // already got above - see this class's javadoc on why this no
+                // longer echoes.
                 control.body().release();
-                sendKeepAlive();
                 return;
             }
             if (control.type() == ControlType.SHUTDOWN) {
@@ -639,6 +675,18 @@ public final class SrtConnection {
     private void tick() {
         long now = elapsedMicros();
 
+        // Checked before anything else, and returning rather than falling through:
+        // close() tears down on this same thread, cancelling this task and
+        // disposing the receive buffer, so the rest of the tick would be operating
+        // on a connection that no longer exists. libsrt checks its own expiry in
+        // the same place, and bails the same way.
+        if (now - lastReceiveMicros >= PEER_IDLE_TIMEOUT_MICROS) {
+            LOG.log(Level.FINE, () -> "closing " + metadata.socketId() + ": nothing received from "
+                    + metadata.peerAddress() + " for " + (PEER_IDLE_TIMEOUT_MICROS / 1_000_000) + "s");
+            close();
+            return;
+        }
+
         AckBoundaryResult ackBoundary = receiveBuffer.computeAckBoundary(now);
         for (LossRange abandoned : ackBoundary.abandoned()) {
             packetsDropped += abandoned.end().value() - abandoned.start().value() + 1;
@@ -670,6 +718,17 @@ public final class SrtConnection {
         }
 
         sendBuffer.tick(elapsedMicros());
+
+        // Keeps us visible to a peer applying the same idle rule we do. This is a
+        // backstop, not something that fires in normal operation: AckSender emits
+        // a full ACK every 10ms whether or not any data arrived, so lastSendMicros
+        // never ages anywhere near a second. Measured, not assumed - instrumenting
+        // this branch across the whole suite recorded zero firings. It earns its
+        // place the moment that ACK cadence changes; libsrt pairs the identical
+        // periodic-ACK timer with the identical last-send keepalive check.
+        if (now - lastSendMicros >= KEEPALIVE_INTERVAL_MICROS) {
+            sendKeepAlive();
+        }
     }
 
     /** {@link SendBuffer}'s deliver callback: fires {@link #onRetransmit} for a resend, then sends it. */
@@ -830,6 +889,7 @@ public final class SrtConnection {
     }
 
     private void send(SrtPacket packet) {
+        lastSendMicros = elapsedMicros();
         channel.writeAndFlush(new DefaultAddressedEnvelope<>(packet, metadata.peerAddress()));
     }
 
