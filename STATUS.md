@@ -230,7 +230,7 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-313 tests passing (128 default + 8 gated interop + 2 ACKACK/RTT + 5
+324 tests passing (128 default + 8 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
@@ -925,6 +925,15 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `ReceiveRateEstimatorTest`'s consuming half are both self-designed against
   gosrt's source — same rigor tier as this codebase's RTT/drift/wraparound
   pieces, not the stronger ported-scenario tier.
+- **A CLI is the first honest consumer of your own API, 2026-08-30.** Writing
+  `srt-java-live-transmit` found an inconsistency no test had:
+  `AcceptedConnection.streamId()` could be null when a peer sent no StreamID,
+  while `ConnectionRequest` already normalised the same field — so the pair
+  disagreed and every consumer had to null-check or trip over it, which the CLI
+  promptly did against a real `srt-live-transmit`. Internal tests all
+  constructed connections *with* a StreamID, so none of them met the case. The
+  same exercise showed the documented `./gradlew` invocation corrupts a piped
+  stream. Both were found by running the thing, not by reading it.
 - **The weak-assertion trap, third time, 2026-08-30.** The libsrt key-rotation
   test passed on its first run — and would have passed identically if nothing
   had rotated at all, since libsrt decrypts happily with the original key. It
@@ -1215,8 +1224,23 @@ was Phase 3-5 work and is done.
   partial interval, which for a short-lived connection can be most of it. The
   connection is passed alongside the snapshot so a sink can tag by StreamID or
   peer address. A Micrometer binding is a few lines in the embedder's code.
-- **README, Javadoc pass, and `srt-java-live-transmit`** — `RelayDemo` is the
-  rough prototype, explicitly not held to this codebase's standards.
+- ~~**`srt-java-live-transmit`**~~ **Done.** Mirrors libsrt's tool so command
+  lines move between the two unchanged. `SrtUri` parses the URI separately so
+  it's testable without spawning a process; an unknown parameter is an error
+  rather than ignored (silently dropping a misspelled `passphrse` is how
+  someone ends up sure encryption is on when it isn't). Verified against real
+  libsrt and ffmpeg in both directions. Running it found two things reading it
+  wouldn't: `java.net.URI` can't parse `srt://:9000` at all (null host *and*
+  port -1), and `AcceptedConnection.streamId()` could be null where
+  `ConnectionRequest` already normalised it — now impossible to construct.
+  `RelayDemo` stays as the rough pub/sub toy it always was.
+- ~~**README**~~ **Done**, with a real launcher behind it: the obvious
+  `./gradlew liveTransmit | ffplay -` example doesn't work, because Gradle
+  writes progress to stdout and corrupts the media. The `application` plugin
+  now produces `srt-java-live-transmit` via `installDist`. Every example was
+  run verbatim rather than written from memory, which is the only reason that
+  surfaced.
+- **Javadoc pass** — the remaining Phase 6 item.
 
 ## Next steps, in order
 
