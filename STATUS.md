@@ -90,12 +90,72 @@ fix still shows corruption, essentially unchanged.** A follow-up diagnostic
 only ~4-10ms after our *very first* NAK for a fresh loss — too fast to be
 explained by ACK-boundary lag (we hadn't had time to send a follow-up ACK
 yet). So the ACK-boundary fix was real and correct, but **not the dominant
-cause** of the interop symptom — a second, distinct, not-yet-root-caused
-issue remains, most likely genuine frequent packet loss on loopback itself
-(JVM/event-loop scheduling jitter is the leading suspect; Netty socket-buffer
-sizing and this codebase's own blocking I/O were both checked and ruled out
-during the same investigation). **Not yet investigated further** — this is
-the actual top priority now, ahead of any Phase 5/6 work; see "Next steps."
+cause** of the interop symptom — a second, distinct issue remains. This is
+the actual top priority now, ahead of any Phase 5/6 work.
+
+**2026-08-29, later the same day: a much more thorough elimination pass**,
+prompted by direct challenge ("are you sure about them?") to verify every
+ruled-out cause with a real measurement rather than a plausible-sounding
+guess. Two control experiments first: the identical `ffmpeg` source relayed
+through **libsrt's own `srt-live-transmit`** (as a pure two-port relay, no
+Roast in the loop) and separately through **gosrt's own `contrib/server`**
+(built locally via `brew install go`, a real gosrt-based pub/sub relay, same
+architecture as `RelayDemo`) both play back **clean** — ruling out "ffplay is
+just being nosy" and ruling out "the no-real-pacing design itself is the
+cause" (gosrt's own `congestion/live/send.go` `Tick()` was read directly this
+session and confirmed to blast every ripe packet in one pass with no
+enforced pacing either — the same design `SendBuffer` is ported from — yet
+it doesn't reproduce this). The bug is real and specific to Roast.
+
+From there, every plausible cause was checked with direct evidence, not
+assumed, and each is now genuinely ruled out:
+- **OS-level network loss/corruption** — `netstat -s -p udp`'s full counter
+  set (not just one field) diffed before/after a repro run: `datagrams
+  received` and `delivered` matched exactly (+33,272 each), and `bad
+  checksum`/`bad data length field`/`dropped due to full socket buffers` all
+  stayed flat at baseline. Zero.
+- **SRT-protocol-level loss** — both `SrtConnection`'s own bookkeeping
+  (receive/deliver/send counters, `LossList.outstanding()`) *and* an
+  independent real receiver (`srt-live-transmit` with `-statsout`/`-f`, i.e.
+  libsrt's own `pktRcvLoss`/`pktRcvDrop`/`pktRcvRetrans` counters) report
+  zero loss, drop, or retransmit for entire repro runs.
+- **Content corruption or reordering, end-to-end** — CRC32 cross-checks at
+  three points, closing the whole pipeline: (1) what `ReceiveBuffer` delivers
+  from the publisher leg vs. what `SendBuffer`/`send()` actually hands off
+  for the player leg — every sent packet is byte-identical to something
+  genuinely received, at a consistent buffering-delay offset, zero
+  mismatches; (2) the raw bytes `srt-live-transmit` wrote to disk, decoded
+  independently with `ffmpeg`, still show the same corruption — proving it's
+  not an artifact of `ffmpeg`'s own SRT client specifically; (3) **the
+  decisive check**: a real `tcpdump -i lo0 -w ... 'udp port 9000'` capture
+  (run by the user, root-owned, read-only to us) decoded with our own
+  `SrtPacket.decode` and cross-checked against every packet
+  `SrtConnection.send()` believed it sent — **zero unmatched**. What Roast's
+  own code believes it transmits is exactly what physically leaves the
+  interface. The encoder, the socket write, and the wire are all clean.
+- **Event-loop scheduling lag** — the original "JVM/event-loop jitter"
+  hypothesis was itself checked, not just assumed: instrumented `tick()`
+  timing directly (gap since the previous tick, tick duration, packets
+  delivered per tick). Tick-to-tick gaps never once exceeded the 20ms
+  threshold checked for; ticks fire on schedule. That specific mechanism is
+  ruled out, though the broader "something about Roast's real-world timing
+  differs from the references" intuition it was chasing turned out to be
+  worth keeping — see below.
+
+**Given every layer from decode through the physical wire is now proven
+correct, content-wise, loss-wise, and timing-wise (ticks aren't late), the
+remaining explanation has to be a protocol-level difference in *what* Roast
+negotiates or reports** — something valid-looking on the wire that still
+causes the peer's own SRT stack (libsrt, via `ffmpeg`'s client, since this
+symptom is specific to *Roast being the sender* and doesn't reproduce with
+gosrt/libsrt as the sender) to reconstruct incorrectly, despite receiving a
+complete, correctly-ordered, byte-perfect stream. **Leading candidate, not
+yet confirmed**: MSS/payload-size negotiation — already a documented known
+gap (`ListenerHandshake` skips it entirely, see "Known gaps") — since a
+peer-vs-Roast MSS mismatch is exactly the kind of thing that would be
+"correct enough to never trip an ARQ/loss counter" while still confusing the
+peer's own reassembly. **Not yet investigated** — this is the next concrete
+step, ahead of any Phase 5/6 work; see "Next steps."
 
 169 tests passing (128 default + 2 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
@@ -473,6 +533,33 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   after use, but the technique — capture on loopback, decode with our own
   codec — is worth remembering as the way to get wire-level ground truth
   when app-level logging isn't conclusive enough on its own.
+- **Eliminating a candidate means measuring it, not describing a plausible
+  mechanism for it, 2026-08-29.** The "second issue" investigation (see
+  "Where we are"/"Known gaps") first floated "JVM/event-loop scheduling
+  jitter" as a leading hypothesis based on reasoning about the code, without
+  a direct measurement — called out directly by the user ("are you sure
+  about them?"), which was the right challenge. Redone properly: `tick()`
+  gained temporary timing instrumentation (gap since previous tick, tick
+  duration) — no lag was ever found, so that specific hypothesis was
+  actually wrong, not confirmed. From there, every remaining candidate was
+  checked the same rigorous way: a *full* `netstat -s -p udp` counter diff
+  (not just one field) for network-level loss; both Roast's own receive/send
+  counters *and* an independent real receiver's own protocol stats
+  (`srt-live-transmit -statsout`, libsrt's `pktRcvLoss`/`pktRcvDrop`) for
+  SRT-level loss; and CRC32 checksums planted at three points — the
+  publisher-receive point, the player-send point, and (via a user-run
+  `tcpdump` capture decoded with our own `SrtPacket.decode`, since this
+  process can't get raw-socket/BPF permission itself) the actual bytes on
+  the wire — to verify content end-to-end rather than assume a passthrough
+  relay can't corrupt anything. Each check either genuinely confirmed
+  "clean" with a number to point to, or would have caught a real problem;
+  none were rhetorical. Two control experiments (libsrt's own
+  `srt-live-transmit` and a locally-built gosrt `contrib/server`, each
+  relaying the identical source) were run *before* any of this, specifically
+  to confirm the symptom is real and Roast-specific rather than an artifact
+  of the test setup or the player. This is the same discipline the earlier
+  ACK-boundary bug was root-caused with, just applied one level more
+  skeptically after an unverified guess slipped through once.
 - **`ReceiveBuffer.computeAckBoundary`** (the ACK-boundary fix above) is
   grounded at the strongest tier this codebase has used for a piece this
   architecturally significant: `matchesGosrtTestIssue67` in
@@ -524,26 +611,32 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   independently verified, but turned out not to be the dominant cause of the
   interop symptom. See the next entry.
 - **NEW, top priority: a second, distinct, not-yet-root-caused source of
-  real data loss/corruption under sustained real throughput.** Found
-  2026-08-29 while re-verifying the ACK-boundary fix above: pushing a real
-  ffmpeg stream through `RelayDemo` still shows MPEG-TS corruption at a
-  similar rate to before the fix. A follow-up diagnostic (decoding `DROPREQ`
-  control packets directly off the wire, no `tcpdump` needed this time)
-  found libsrt replying `DROPREQ` only ~4-10ms after *our very first* NAK
-  for a fresh loss — far too fast to be explained by ACK-boundary lag, since
-  no follow-up ACK could even have been sent in that window. This rules out
-  the just-fixed bug as the (sole) explanation and points at something more
-  fundamental: the leading hypothesis is genuine, frequent packet loss on
-  loopback itself, caused by JVM/event-loop scheduling jitter (a GC pause or
-  a delayed tick leaving the socket's receive buffer to fill and drop under
-  real, sustained throughput — never exercised before `RelayDemo`). Already
-  checked and ruled out during the same investigation: Netty `SO_RCVBUF`/
-  `MAX_MESSAGES_PER_READ` tuning (no effect), and this codebase's own
-  diagnostic code introducing blocking I/O on the event loop (checked
-  directly per the user's own challenge — see "Testing methodology" — and
-  confirmed not the cause, since the original unmodified `RelayDemo` shows
-  the same magnitude of loss). **Not yet root-caused** — needs its own
-  investigation pass before Phase 5/6 work; see "Next steps."
+  real data corruption under sustained real throughput — narrowed
+  significantly, 2026-08-29, but not yet closed.** Found while re-verifying
+  the ACK-boundary fix above: pushing a real ffmpeg stream through
+  `RelayDemo` still shows MPEG-TS corruption at a similar rate to before the
+  fix, and control experiments with libsrt's `srt-live-transmit` and a
+  locally-built gosrt `contrib/server` both relaying the *identical* source
+  play back clean — this is real, and specific to Roast.
+  A subsequent thorough elimination pass (prompted by direct pushback on an
+  earlier, unverified "JVM/event-loop jitter" guess) directly measured, and
+  ruled out with hard evidence: OS-level network loss/corruption (full
+  `netstat -s -p udp` counter diff, zero drops or checksum errors), SRT
+  protocol-level loss (zero across both Roast's own counters and an
+  independent libsrt receiver's `pktRcvLoss`/`pktRcvDrop` stats), content
+  corruption or reordering anywhere in the pipeline (CRC32-verified
+  end-to-end — decode → buffer → relay → encode → **actual wire bytes**,
+  the last leg confirmed via a real `tcpdump` capture decoded with our own
+  codec, zero mismatches), and event-loop scheduling lag (tick timing
+  instrumented directly; ticks fire on schedule, no lag found). See "Where
+  we are" for the full list and "Testing methodology" for how each was
+  checked. **Leading candidate, not yet confirmed**: a protocol-level
+  parameter Roast doesn't correctly negotiate — MSS/payload-size is the
+  prime suspect, since it's already a documented gap (`ListenerHandshake`
+  skips it) and is exactly the kind of mismatch that would stay invisible to
+  every loss/drop counter while still confusing the peer's own reassembly.
+  **Not yet root-caused** — needs its own investigation pass before Phase
+  5/6 work; see "Next steps."
 - ~~No RTT measurement~~ **Closed** — `SrtConnection` now tracks real RTT/RTTVar
   from ACK/ACKACK round trips and feeds them to `AckSender.tick` and the
   periodic NAK interval; see "What's built" and "Testing methodology" (the
@@ -588,17 +681,18 @@ directly from libsrt's own source, not assumed). Both skip themselves via
 
 ## Next steps, in order
 
-1. **Root-cause the second, still-open real-throughput loss/corruption
-   issue** (see "Known gaps" — now the top priority, ahead of any Phase 5/6
-   work, since the ACK-boundary bug that was previously #1 here is now
-   fixed). Leading hypothesis: genuine loopback packet loss from
-   JVM/event-loop scheduling jitter under sustained real throughput, not a
-   protocol-logic bug like the one just closed. Netty socket-buffer tuning
-   and this codebase's own blocking I/O are already ruled out. Needs its own
-   investigation pass — likely more `tcpdump`/wire-level diagnosis, or
-   instrumenting actual tick-to-tick timing on the event loop to check the
-   jitter hypothesis directly — before it can be scoped as a fix the way the
-   ACK-boundary bug was.
+1. **Root-cause the second, still-open real-throughput corruption issue**
+   (see "Known gaps" — top priority, ahead of any Phase 5/6 work). Network
+   loss, SRT-protocol-level loss, content/order corruption anywhere in the
+   pipeline (verified all the way to actual wire bytes), and event-loop
+   scheduling lag are all now directly ruled out with real measurements, not
+   assumptions — see "Testing methodology" for exactly how. Next concrete
+   step: investigate MSS/payload-size negotiation specifically (the leading
+   remaining candidate, and an already-documented gap in `ListenerHandshake`)
+   — check what `ffmpeg`'s libsrt client actually negotiates/expects for MSS
+   during the handshake and whether Roast's unconditional "just use gosrt's
+   baseline default" response diverges from it in a way that would stay
+   invisible to loss counters but still confuse the peer's own reassembly.
 2. Real interop confirming `SrtCaller` against libsrt/gosrt acting as
    *listener* — needs `srt-live-transmit` launched with `mode=listener` in its
    URI (the existing interop tests always run it as caller). The connection
