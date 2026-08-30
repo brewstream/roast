@@ -230,7 +230,7 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-291 tests passing (128 default + 6 gated interop + 2 ACKACK/RTT + 5
+300 tests passing (128 default + 7 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
@@ -925,6 +925,23 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `ReceiveRateEstimatorTest`'s consuming half are both self-designed against
   gosrt's source — same rigor tier as this codebase's RTT/drift/wraparound
   pieces, not the stronger ported-scenario tier.
+- **Two ordering bugs from one small change, both caught by tests rather than
+  by reading, 2026-08-30.** Making `close()` drain instead of discard looked
+  trivial. First, teardown ran on the *calling* thread, so a `write()` already
+  marshaled onto the event loop hadn't reached the send buffer when the drain
+  ran — the data was lost. Moving teardown onto the event loop fixed the
+  ordering. Then the write was *still* dropped, because `close()` sets its
+  idempotence flag the moment close is **requested**, and the queued write task
+  checked that same flag. "Close requested" and "torn down" are genuinely
+  different states, and conflating them silently discards in-flight data. Both
+  are the kind of async-ordering fault that reads as correct on the page.
+- **Writing a test for something that "already works" is worth doing anyway,
+  2026-08-30.** Multiplexing had worked since Phase 2 and `RelayDemo`
+  exercised it daily, so it felt like coverage. The first real test found an
+  unbounded leak: `SrtListener` never removed anything from its connection map
+  or handshake-dedup cache, so a churning relay retained every connection it
+  ever accepted and reported dead ones to anything polling stats. A demo
+  exercising a happy path is not a test of the lifecycle around it.
 - **Make the failure mode impossible rather than documented, 2026-08-30.** The
   observability listeners were first designed to run on the connection's event
   loop with a javadoc contract saying they must not block — which is only a
@@ -1140,6 +1157,38 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `realListenerSendsDataToRealLibsrtCaller` above; didn't need the
   caller-side handshake first, since Roast only needed to be the *listener*
   here, with libsrt calling in and reading.
+
+## Phase 6 (multiplexing & polish) — underway
+
+DESIGN.md scopes this as making Roast usable by someone who isn't us: many
+sockets on one port, graceful close, Javadoc, README, an
+`srt-java-live-transmit` CLI, and polish on the *stats surface* (an external
+metrics-sink adapter) — explicitly **not** where hooks first get added, which
+was Phase 3-5 work and is done.
+
+- ~~**Graceful close**~~ **Done.** `close()` now drains both directions
+  instead of discarding. The receive side was the one costing data: a peer
+  finishing a stream and shutting down left up to a full latency window of
+  packets already received and merely waiting on TSBPD deadlines, so the tail
+  of every stream was silently truncated. Both references discard here
+  (gosrt's `close` flushes; libsrt defaults live-mode linger to 0), so this
+  deliberately goes further. Nothing waits: outbound is bounded by what's
+  queued, inbound by what's arrived. Two ordering bugs surfaced building it —
+  see "Testing methodology".
+- ~~**Multiplexing asserted**~~ **Done.** `MultiplexingTest` covers
+  cross-talk, distinct socket IDs, closing one connection leaving its
+  neighbours working, and per-connection stats. Writing it found a real leak
+  (below).
+- **Configuration** — the remaining blocker for the last phase 0-5 item
+  (exercising key rotation against a real peer needs a configurable schedule),
+  and what would retire `SrtListener`/`SrtCaller`'s hardcoded latency, version
+  and timeout defaults. Note the earlier review point: a passphrase does not
+  belong in a general settings bag, so whatever shape this takes should not
+  absorb `AcceptDecision`'s.
+- **Metrics-sink adapter** over `ConnectionStats` (Micrometer or similar),
+  living outside this module or added without changing that type.
+- **README, Javadoc pass, and `srt-java-live-transmit`** — `RelayDemo` is the
+  rough prototype, explicitly not held to this codebase's standards.
 
 ## Next steps, in order
 
