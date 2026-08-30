@@ -223,13 +223,13 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-248 tests passing (128 default + 3 gated interop + 2 ACKACK/RTT + 5
+254 tests passing (128 default + 5 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
 `ReceiveRateEstimatorTest` + 12 `KeyMaterialCifTest` + 16 `StreamKeyWrapperTest`
 + 17 `PayloadCipherTest` + 19 `EncryptionContextTest` + 3 `HandshakeCifTest` KM
-+ 11 `CallerHandshakeTest`
++ 6 `SrtConnectionTest` encryption + 11 `CallerHandshakeTest`
 + 3 `SrtCallerTest`),
 all committed to `main` (no branches). Every commit so far has been asked-for
 explicitly by the user, one narrowly-scoped piece at a time — see git log for
@@ -813,6 +813,26 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `packet/handshake_test.go` rather than `crypto_test.go` as first claimed:
   **name the specific test you intend to port, and open it, before treating a
   piece as grounded.**
+- **A test written for a documented edge case found a real bug in it,
+  2026-08-30.** `SrtConnection.encryptIfConfigured`'s javadoc explained why
+  retransmissions must be re-encrypted, unlike gosrt. Writing the test for that
+  claim showed the retransmission going out as *plaintext*:
+  `retainedDuplicate()` shares the original's memory, so encrypting in place
+  rewrote the plaintext `SendBuffer` retains, and the resend's second
+  encryption pass — CTR against a keystream fixed by the sequence number —
+  restored the cleartext. Documenting an edge case is not the same as testing
+  it; this is the second ByteBuf-aliasing bug in this codebase (see the earlier
+  `SendBuffer` one), and both were found only by exercising the retransmission
+  path specifically.
+- **Chasing an interop failure is worth doing before assuming it's your bug,
+  2026-08-30.** An encrypted-payload interop test failed; instrumenting showed
+  249 control packets and zero DATA, and `srt-live-transmit`'s *own* stats
+  confirmed it never transmits when reading a redirected file. That is a
+  property of the tool, not of Roast — and it explains why the pre-existing
+  `realLibsrtCallerReachesConnected` only ever asserted connection. The same
+  hunt turned up a genuine accept-ordering race in `SrtListener` (see "What's
+  built"). Neither would have surfaced without checking where the packets
+  actually went.
 - **The 16th/17th-packet bandwidth-probe trick** — neither half has a gosrt
   test to ground against (`send_test.go` has no probe cases and
   `receive_test.go` has no rate/capacity cases, both checked directly), so
@@ -837,7 +857,9 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   skipped in `ListenerHandshake` for lack of a config object; noted inline there.
 - **No `SrtConfig`** — `SrtListener` hardcodes 120ms latency (both directions)
   and SRT version `0x010401` (matching gosrt's own baseline).
-- **Encryption** (Phase 5 in DESIGN.md) — **started, wire format only**.
+- **Encryption** (Phase 5 in DESIGN.md) — **working Roast-to-Roast; encrypted
+  DATA not yet proven against libsrt**, see "Next steps". The handshake key
+  exchange *is* proven against real libsrt.
   `KeyMaterialCif`/`KeyEncryption` parse and build the Key Material message
   the KMREQ/KMRSP extensions carry, verified byte-for-byte against gosrt's
   own `TestKM` golden vector. Everything else is still untouched and is the
@@ -977,32 +999,28 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
    composes them. See "What's built". The remaining step is
    deliberately the one that was saved for last, because it's the only one
    that changes live behavior:
-   - ~~Key management on the connection~~ **done** — `EncryptionContext`
-     holds the salt and both SEKs, produces and adopts KM messages, and
-     encrypts/decrypts with the right key. Still not referenced by any
-     connection code.
-   - **How the passphrase reaches a connection.** Explicitly *not* by
-     inventing an `SrtConfig` to put a secret in (see `EncryptionContext`
-     above). Options worth weighing: a narrow purpose-named holder passed to
-     `SrtListener.bind`/`SrtCaller.connect`, or supplying the context itself
-     per connection. Note `AcceptHandler` already sees `ConnectionRequest`
-     and could plausibly decide a passphrase per stream — that's an
-     extensibility angle DESIGN.md's §4 would like, and worth considering
-     before picking.
-   - ~~KM extension parsing in `HandshakeCif`~~ **done** — parsed and emitted,
-     verified against gosrt's complete V5 golden vector. Still to do: honour
-     the handshake's Encryption Field (the advertised key length), which is
-     currently carried but not acted on.
-   - **`SrtConnection` wiring**: encrypt on send with the active key and set
-     the DATA header's KK field; decrypt on receive by that field. Note the
-     header already carries `kk` as a raw int, so no packet-layer change is
-     needed.
+   - ~~Key management on the connection~~, ~~passphrase delivery~~, ~~KM
+     extension parsing~~ and ~~`SrtConnection` encrypt/decrypt~~ — **all
+     done**. An encrypted connection works end to end Roast-to-Roast, and a
+     real libsrt peer completes an encrypted *handshake* with us.
+   - **Encrypted DATA does not yet interoperate with libsrt.** Sending it
+     encrypted payloads produced nothing on its side, while the identical
+     unencrypted test passes — so the key exchange is agreed but the data path
+     isn't. Leading suspects, none checked yet: which key (even/odd) libsrt
+     expects us to encrypt with after *it* announced the material, whether it
+     expects us to announce our own key material for our own direction rather
+     than reusing its, and whether its receive context is keyed for the
+     direction we're sending. Start by reading libsrt's `CCryptoControl` to see
+     which context decrypts an inbound packet.
+   - **The reverse direction can't be driven with `srt-live-transmit` at all**:
+     reading a redirected file it connects but never transmits (its own
+     `pktSent` stats stay empty). Use `ffmpeg`'s `srt://` muxer with
+     `passphrase=` instead — it links libsrt and is known to actually send,
+     since it's what drove the whole `RelayDemo` investigation.
    - **Rotation policy**: gosrt's `kmPreAnnounce`/`kmRefreshRate` countdowns
-     live in its `pop`, worth reading before designing this. Neither
-     reference unit-tests it.
-   - **Interop**: a real `srt-live-transmit` run with `passphrase=` on both
-     sides is the actual definition of done here, exactly as it was for the
-     handshake and send path.
+     live in its `pop`, worth reading before designing this. Neither reference
+     unit-tests it. `EncryptionContext.switchActiveKey()` is the mechanism it
+     would drive.
 2. Phase 6 (multiplexing & polish) — the alternative major milestone,
    independent of Phase 5 and not blocked by it. Many connections per port,
    live pollable stats, and the `srt-java-live-transmit` CLI that `RelayDemo`
