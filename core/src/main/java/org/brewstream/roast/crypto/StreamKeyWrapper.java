@@ -72,6 +72,18 @@ public final class StreamKeyWrapper {
      *         AES size
      */
     public static byte[] deriveKeyEncryptingKey(String passphrase, byte[] salt, int keyLength) {
+        return deriveKeyEncryptingKey(passphrase.toCharArray(), salt, keyLength);
+    }
+
+    /**
+     * As {@link #deriveKeyEncryptingKey(String, byte[], int)}, but taking the
+     * passphrase as a {@code char[]} the caller can zero afterwards — a
+     * {@code String} would sit in the heap, immutable and un-clearable, for as
+     * long as the JVM felt like keeping it. This is the overload
+     * {@code EncryptionContext} uses; the {@code String} one exists for tests
+     * and for callers that already have one.
+     */
+    public static byte[] deriveKeyEncryptingKey(char[] passphrase, byte[] salt, int keyLength) {
         requireLegalKeyLength(keyLength);
         if (salt.length < PBKDF2_SALT_BYTES) {
             throw new IllegalArgumentException(
@@ -81,7 +93,7 @@ public final class StreamKeyWrapper {
         // Only the trailing 8 bytes - see the class javadoc.
         byte[] pbkdf2Salt = Arrays.copyOfRange(salt, salt.length - PBKDF2_SALT_BYTES, salt.length);
         PBEKeySpec spec = new PBEKeySpec(
-                passphrase.toCharArray(), pbkdf2Salt, PBKDF2_ITERATIONS, keyLength * Byte.SIZE);
+                passphrase, pbkdf2Salt, PBKDF2_ITERATIONS, keyLength * Byte.SIZE);
         try {
             SecretKeyFactory factory = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA1");
             return factory.generateSecret(spec).getEncoded();
