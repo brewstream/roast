@@ -223,12 +223,12 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-209 tests passing (128 default + 3 gated interop + 2 ACKACK/RTT + 5
+226 tests passing (128 default + 3 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
 `ReceiveRateEstimatorTest` + 12 `KeyMaterialCifTest` + 16 `StreamKeyWrapperTest`
-+ 11 `CallerHandshakeTest` + 3 `SrtCallerTest`),
++ 17 `PayloadCipherTest` + 11 `CallerHandshakeTest` + 3 `SrtCallerTest`),
 all committed to `main` (no branches). Every commit so far has been asked-for
 explicitly by the user, one narrowly-scoped piece at a time — see git log for
 the exact sequence and rationale (commit messages are detailed).
@@ -473,6 +473,21 @@ numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
   width. `unwrap` returns `null` rather than throwing when the integrity check
   fails, since a wrong passphrase is an expected peer condition to answer with
   a "bad secret" rejection.
+- `PayloadCipher` — AES-CTR encryption/decryption of a DATA packet's payload;
+  one method does both directions, since CTR is its own inverse. The counter
+  construction is the subtle part (draft-sharabayko-srt.md §6.1.2): the salt's
+  14 most significant bytes, with the big-endian packet sequence number XORed
+  over bytes 10-13 and a zero block counter in the last two — so the sequence
+  number *overlaps* the nonce's tail rather than sitting beside it, and the
+  salt's final two bytes go deliberately unused. That gives every packet a
+  distinct keystream with no per-packet state, which is what lets a receiver
+  decrypt packet N without having seen N-1. Verified against gosrt's
+  `TestEncode`/`TestDecode` golden vectors (a real 1316-byte MPEG-TS payload,
+  all three key lengths, both keys, both directions); mutation-checked by
+  widening the nonce to all 16 salt bytes, which fails 10 tests. Deliberately
+  stateless about keys — the caller passes the SEK, since choosing between
+  even/odd and rotating them is connection-level key management that doesn't
+  exist yet.
 
 **`handshake`** — `SynCookie`: MD5-based SYN cookie so a listener can verify an
 INDUCTION cookie was echoed back correctly in CONCLUSION without keeping
@@ -548,6 +563,14 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   afterthought — this is BrewStream's actual value proposition over a libsrt
   binding (see the connection request/lifecycle hooks above). Read it before
   changing `SrtListener`'s public API or designing the Phase 3 data path's hooks.
+- **Golden vectors go inline; bulk vectors go in `src/test/resources/`.** Every
+  other ported vector in this codebase is a short hex literal in the test that
+  uses it, which keeps the expected value next to the assertion. The AES-CTR
+  vectors are ~19KB (a real 1316-byte MPEG-TS payload times three key lengths
+  times two keys), so they live in `core/src/test/resources/crypto/` instead —
+  the first test resource here. They were **extracted verbatim from gosrt by
+  script, not retyped**, which is the only safe way to move that much hex; do
+  the same for any future bulk vector rather than hand-copying.
 - Tests: JUnit 5 + **AssertJ** for assertions (not `Assertions.assertEquals` etc.)
   + **Mockito** for collaborator mocks. `SrtListenerTest` and `LibsrtInteropTest`
   are the exceptions to "plain synchronous assertions" — real socket I/O (and, for
@@ -804,8 +827,9 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   derives the KEK from a passphrase (PBKDF2) and wraps/unwraps the SEKs (AES
   Key Wrap), verified against gosrt's golden vectors — so a KM message's
   `wrap` field can now actually be produced and consumed, though nothing calls
-  it yet. **Still untouched**: AES-CTR payload encryption, even/odd key
-  rotation with pre-announce, and wiring any of it into
+  it yet, and `PayloadCipher` does AES-CTR payload encryption/decryption.
+  **Still untouched**: even/odd key rotation with pre-announce, and wiring any
+  of it into
   `ListenerHandshake`/`CallerHandshake`/`SrtConnection`. Deliberately stopped
   before the wiring so nothing is half-connected into the data path — see
   "Next steps".
@@ -927,24 +951,27 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
 
 ## Next steps, in order
 
-1. **Continue Phase 5 (encryption).** Done so far, neither wired to anything:
-   the KM wire format (`KeyMaterialCif`) and KEK derivation + key wrapping
-   (`StreamKeyWrapper`) — see "What's built". What remains:
-   1. **AES-CTR payload encrypt/decrypt**, keyed by the packet sequence
-      number — port gosrt's `TestEncode`/`TestDecode`, which pin the counter
-      construction down with a golden vector (gosrt's
-      `EncryptOrDecryptPayload` documents the counter layout inline: the
-      sequence number in bytes 10-13, XORed against the leading 112 bits of
-      the salt). Still a pure function, still no connection-path changes, so
-      it stays a safe stopping point.
-   2. **Wiring**: KM extension parsing in `HandshakeCif` (the codec exists,
-      the handshake just skips the extension by length today), passphrase
-      config on both handshake sides, encrypt-on-send/decrypt-on-receive in
-      `SrtConnection`, then even/odd key rotation with pre-announce. This is
-      the step that changes live behavior, needs real interop testing against
-      libsrt with a passphrase, and is worth having quota headroom for.
-      Note it will also want an `SrtConfig` of some kind — currently a
-      documented gap, and a passphrase has nowhere to live without it.
+1. **Finish Phase 5 (encryption) — only the wiring is left.** Every piece of
+   the cryptography now exists and is verified against gosrt golden vectors,
+   and *none of it is connected to anything*: `KeyMaterialCif` (the KM wire
+   format), `StreamKeyWrapper` (KEK derivation + SEK wrapping), and
+   `PayloadCipher` (AES-CTR). See "What's built". The remaining step is
+   deliberately the one that was saved for last, because it's the only one
+   that changes live behavior:
+   - **`SrtConfig`** first, or at least a passphrase-carrying equivalent — an
+     already-documented gap, and a passphrase has nowhere to live without it.
+     This also touches `SrtListener`/`SrtCaller`'s currently-hardcoded
+     latency/version defaults, so it's worth a deliberate design pass rather
+     than bolting a passphrase parameter onto both.
+   - **KM extension parsing in `HandshakeCif`** — the codec exists; the
+     handshake still skips KMREQ/KMRSP by declared length.
+   - **Key management on the connection**: hold the even/odd SEKs, pick one
+     per packet, decrypt inbound by the DATA header's KK field, and honour
+     rotation with pre-announce (gosrt's `kmPreAnnounce`/`kmRefreshRate`
+     countdown lives in its `pop`, worth reading before designing this).
+   - **Interop**: a real `srt-live-transmit` run with `passphrase=` on both
+     sides is the actual definition of done here, exactly as it was for the
+     handshake and send path. Expect this step to want real quota headroom.
 2. Phase 6 (multiplexing & polish) — the alternative major milestone,
    independent of Phase 5 and not blocked by it. Many connections per port,
    live pollable stats, and the `srt-java-live-transmit` CLI that `RelayDemo`
