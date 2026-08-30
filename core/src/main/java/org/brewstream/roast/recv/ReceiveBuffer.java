@@ -308,6 +308,29 @@ public final class ReceiveBuffer {
         return buffered.size();
     }
 
+    /**
+     * Hands out every buffered packet in sequence order, ignoring delivery
+     * deadlines, and empties the buffer — for connection teardown, where TSBPD
+     * pacing has nothing left to pace. The caller owns the payloads.
+     *
+     * <p>Without this the end of every stream is silently truncated: a peer that
+     * finishes sending and shuts down leaves up to a full latency window of
+     * packets sitting here, already received and merely waiting on their
+     * deadlines. Both references discard them ({@code gosrt}'s {@code close}
+     * flushes, libsrt defaults live-mode linger to zero); holding data we
+     * already have and then dropping it is a worse trade than a short burst at
+     * end of stream.
+     */
+    public List<DataPacket> drainAll() {
+        List<DataPacket> remaining = new ArrayList<>(buffered.size());
+        for (Entry entry : buffered) {
+            remaining.add(entry.packet());
+            lastDelivered = entry.seq();
+        }
+        buffered.clear();
+        return remaining;
+    }
+
     /** Releases every currently-buffered, undelivered packet's payload — call on connection teardown. */
     public void dispose() {
         buffered.forEach(entry -> entry.packet().body().release());

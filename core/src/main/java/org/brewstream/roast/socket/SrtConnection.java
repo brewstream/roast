@@ -116,6 +116,8 @@ public final class SrtConnection {
     private static final Logger LOG = Logger.getLogger(SrtConnection.class.getName());
     private static final long TICK_INTERVAL_MILLIS = 10;
     private static final long MIN_NAK_INTERVAL_MICROS = 20_000;
+    /** How long {@link #close} waits for teardown to run on the event loop before giving up on it. */
+    private static final long CLOSE_DRAIN_TIMEOUT_MILLIS = 500;
     private static final double INITIAL_RTT_MICROS = 100_000;
     private static final double INITIAL_RTT_VAR_MICROS = 50_000;
 
@@ -143,7 +145,15 @@ public final class SrtConnection {
     private final ScheduledFuture<?> scheduledTick;
     private final int receiveFlowWindowPackets;
     private final long startNanos = System.nanoTime();
+    /** Guards {@link #close} against running teardown twice; set from any thread. */
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    /**
+     * Whether teardown has actually run. Distinct from {@link #closed}, which is
+     * set the moment close is <em>requested</em>: a {@link #write} already
+     * marshaled onto the event loop must still be sent, and checking the
+     * requested-flag would drop it instead. Event-loop only, so no atomic.
+     */
+    private boolean tornDown;
     private final Map<Integer, Long> pendingAcks = new HashMap<>();
     private final Runnable onChannelOwnerClose;
     private final EncryptionContext encryptionContext;
@@ -309,7 +319,7 @@ public final class SrtConnection {
                     + "split messages, so the caller must chunk");
         }
         channel.eventLoop().execute(() -> {
-            if (closed.get()) {
+            if (tornDown) {
                 payload.release();
                 return;
             }
@@ -333,9 +343,49 @@ public final class SrtConnection {
         if (!closed.compareAndSet(false, true)) {
             return;
         }
+        // Teardown runs on the event loop so it queues behind any write() already
+        // marshaled there - otherwise a write immediately followed by a close
+        // drains a send buffer the write hasn't reached yet, and the data is lost.
+        // Reachable from the event loop itself (a peer's SHUTDOWN) and from any
+        // other thread (an application, or SrtListener.close), so both are handled.
+        if (channel.eventLoop().inEventLoop()) {
+            doClose();
+            return;
+        }
+        try {
+            channel.eventLoop().submit(this::doClose).await(CLOSE_DRAIN_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (RuntimeException e) {
+            // The loop is already gone (shutting down); tear down inline so
+            // nothing is left registered or leaked.
+            doClose();
+        }
+    }
+
+    private void doClose() {
+        tornDown = true;
+        // Give already-queued outbound data its chance before announcing the
+        // shutdown, so the peer receives it rather than being told to stop first.
+        // Bounded by whatever is already queued - this waits for nothing.
+        sendBuffer.tick(elapsedMicros());
         sendShutdown();
+
         scheduledTick.cancel(false);
         demultiplexer.unregister(metadata.socketId());
+
+        // Hand over what already arrived. These packets are in hand and merely
+        // waiting on TSBPD deadlines that no longer mean anything now the
+        // connection is ending; discarding them truncates the tail of every
+        // stream. See ReceiveBuffer.drainAll.
+        for (DataPacket remaining : receiveBuffer.drainAll()) {
+            try {
+                onData.accept(remaining.body());
+            } catch (RuntimeException e) {
+                LOG.log(Level.WARNING, "onData threw while draining on close", e);
+                remaining.body().release();
+            }
+        }
         receiveBuffer.dispose();
         sendBuffer.flush();
         if (encryptionContext != null) {

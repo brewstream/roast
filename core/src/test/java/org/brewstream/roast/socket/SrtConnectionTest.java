@@ -33,6 +33,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -695,6 +696,80 @@ class SrtConnectionTest {
         out.readBytes(bytes);
         out.release();
         caller.send(new DatagramPacket(bytes, bytes.length, listener.localAddress()));
+    }
+
+
+    // --- graceful close: neither direction should lose data already in hand
+
+    /**
+     * The end-of-stream truncation this fixes: a peer finishes sending and shuts
+     * down immediately, leaving packets that already arrived sitting in the
+     * receive buffer waiting on TSBPD deadlines. Discarding them silently loses
+     * the tail of every stream.
+     */
+    @Test
+    void dataAlreadyReceivedIsDeliveredWhenThePeerShutsDown() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        List<String> delivered = new CopyOnWriteArrayList<>();
+        connection.onData(payload -> {
+            delivered.add(payload.toString(StandardCharsets.US_ASCII));
+            payload.release();
+        });
+
+        // Arrives and is buffered, but nowhere near its 120ms deadline yet.
+        sendData(connection.metadata().socketId(), 1, 0, "tail-of-stream");
+        sendControl(connection.metadata().socketId(), ControlType.SHUTDOWN);
+
+        receiveControl(ControlType.SHUTDOWN).body().release();
+        assertThat(delivered).containsExactly("tail-of-stream");
+    }
+
+    /** The same on the sending side: data written just before close must still go out. */
+    @Test
+    void dataWrittenJustBeforeCloseIsStillSent() throws Exception {
+        SrtConnection connection = connectAndAccept();
+
+        connection.write(Unpooled.wrappedBuffer("last-words".getBytes(StandardCharsets.US_ASCII)));
+        connection.close();
+
+        DataPacket sent = receiveData();
+        assertThat(sent.body().toString(StandardCharsets.US_ASCII)).isEqualTo("last-words");
+        sent.body().release();
+    }
+
+    /** Draining must not leak: anything still held has its payload released. */
+    @Test
+    void closingWithUndeliveredDataLeaksNothing() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        List<ByteBuf> handed = new CopyOnWriteArrayList<>();
+        connection.onData(handed::add);
+
+        sendData(connection.metadata().socketId(), 1, 0, "a");
+        sendData(connection.metadata().socketId(), 2, 100, "b");
+        Thread.sleep(100); // buffered, not yet due
+
+        connection.close();
+
+        assertThat(handed).isNotEmpty();
+        handed.forEach(buf -> {
+            assertThat(buf.refCnt()).isPositive(); // ownership passed to us
+            buf.release();
+        });
+    }
+
+    /** A throwing onData during the drain must not prevent teardown or leak the payload. */
+    @Test
+    void aThrowingHandlerDuringDrainDoesNotBreakClose() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        connection.onData(payload -> {
+            throw new IllegalStateException("handler blew up during drain");
+        });
+
+        sendData(connection.metadata().socketId(), 1, 0, "x");
+        Thread.sleep(100);
+
+        connection.close(); // must not propagate
+        assertThat(connection.stats()).isNotNull();
     }
 
     private SrtConnection connectAndAccept() throws Exception {
