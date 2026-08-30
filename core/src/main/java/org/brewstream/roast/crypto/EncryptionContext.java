@@ -1,5 +1,6 @@
 package org.brewstream.roast.crypto;
 
+import io.netty.buffer.ByteBuf;
 import org.brewstream.roast.packet.cif.KeyEncryption;
 import org.brewstream.roast.packet.cif.KeyMaterialCif;
 
@@ -198,12 +199,27 @@ public final class EncryptionContext {
         PayloadCipher.encryptOrDecrypt(payload, keyFor(activeKey), salt, packetSequenceNumber);
     }
 
+    /** As {@link #encrypt(byte[], int)}, for a packet payload held in a {@link ByteBuf}. */
+    public void encrypt(ByteBuf payload, int packetSequenceNumber) {
+        requireKeys();
+        PayloadCipher.encryptOrDecrypt(payload, keyFor(activeKey), salt, packetSequenceNumber);
+    }
+
     /**
      * Decrypts a payload in place using the key the DATA header's KK field
      * names. Returns {@code false} if that key isn't held (a packet encrypted
      * with a key we were never told about — droppable, not fatal).
      */
     public boolean decrypt(byte[] payload, int packetSequenceNumber, KeyEncryption key) {
+        if (!hasKeys() || key == null || key == KeyEncryption.BOTH) {
+            return false;
+        }
+        PayloadCipher.encryptOrDecrypt(payload, keyFor(key), salt, packetSequenceNumber);
+        return true;
+    }
+
+    /** As {@link #decrypt(byte[], int, KeyEncryption)}, for a packet payload held in a {@link ByteBuf}. */
+    public boolean decrypt(ByteBuf payload, int packetSequenceNumber, KeyEncryption key) {
         if (!hasKeys() || key == null || key == KeyEncryption.BOTH) {
             return false;
         }

@@ -13,8 +13,11 @@ import org.brewstream.roast.packet.cif.HandshakeCif;
 import org.brewstream.roast.packet.cif.HandshakeExtension;
 import org.brewstream.roast.packet.cif.HandshakeExtensionFlags;
 import org.brewstream.roast.packet.cif.HandshakeType;
+import org.brewstream.roast.packet.cif.KeyEncryption;
+import org.brewstream.roast.packet.cif.RejectionReason;
 import org.brewstream.roast.packet.cif.LossListCodec;
 import org.brewstream.roast.packet.cif.LossRange;
+import org.brewstream.roast.crypto.EncryptionContext;
 import org.brewstream.roast.util.CircularNumber;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -314,6 +317,179 @@ class SrtConnectionTest {
         receiveData().payload().release(); // let it actually get sent first
 
         connection.close();
+    }
+
+
+    // --- encryption (Phase 5): a real handshake with key material, then encrypted data
+    // both ways. The peer here is the raw DatagramSocket driving its own
+    // EncryptionContext, so both sides of the negotiation are exercised for real.
+
+    private static final char[] TEST_PASSPHRASE = "foobarfoobar".toCharArray();
+
+    private EncryptionContext connectAndAcceptEncrypted(CompletableFuture<SrtConnection> connected,
+            char[] listenerPassphrase) throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0));
+        listener.setAcceptHandler(request -> AcceptDecision.accept(listenerPassphrase, 16));
+        listener.onConnection(connected::complete);
+        caller = newCaller();
+
+        EncryptionContext peer = EncryptionContext.generating(TEST_PASSPHRASE, 16);
+        HandshakeCif inductionReply = sendAndReceiveHandshake(inductionRequest());
+        HandshakeCif conclusion = new HandshakeCif(
+                true, 5, 4, 7, seq(1), 1500, DEFAULT_FLOW_WINDOW, HandshakeType.CONCLUSION.code(),
+                CALLER_SOCKET_ID, inductionReply.synCookie(), LOCALHOST,
+                new HandshakeExtension(0x010401,
+                        new HandshakeExtensionFlags(true, true, true, true, true, true, false, false), 120, 120),
+                "live/test", peer.keyMaterial(KeyEncryption.BOTH));
+        HandshakeCif reply = sendAndReceiveHandshake(conclusion);
+
+        assertThat(reply.handshakeTypeCode()).isEqualTo(HandshakeType.CONCLUSION.code());
+        assertThat(reply.keyMaterial()).isNotNull();
+        return peer;
+    }
+
+    @Test
+    void anEncryptedPeersDataIsDecryptedBeforeReachingOnData() throws Exception {
+        CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
+        EncryptionContext peer = connectAndAcceptEncrypted(connected, TEST_PASSPHRASE);
+        SrtConnection connection = connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        CompletableFuture<String> received = new CompletableFuture<>();
+        connection.onData(payload -> {
+            received.complete(payload.toString(StandardCharsets.US_ASCII));
+            payload.release();
+        });
+
+        byte[] plaintext = "encrypted-hello".getBytes(StandardCharsets.US_ASCII);
+        byte[] ciphertext = plaintext.clone();
+        peer.encrypt(ciphertext, 1);
+        assertThat(ciphertext).isNotEqualTo(plaintext); // genuinely encrypted on the wire
+
+        sendDataRaw(connection.metadata().socketId(), 1, 1000, ciphertext, peer.activeKey().code());
+
+        assertThat(received.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo("encrypted-hello");
+    }
+
+    @Test
+    void whatWeSendOnAnEncryptedConnectionIsCiphertextThePeerCanDecrypt() throws Exception {
+        CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
+        EncryptionContext peer = connectAndAcceptEncrypted(connected, TEST_PASSPHRASE);
+        SrtConnection connection = connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        connection.write(Unpooled.wrappedBuffer("secret-payload".getBytes(StandardCharsets.US_ASCII)));
+
+        DataPacket sent = receiveData();
+        byte[] onWire = new byte[sent.body().readableBytes()];
+        sent.body().getBytes(sent.body().readerIndex(), onWire);
+        sent.body().release();
+
+        assertThat(new String(onWire, StandardCharsets.US_ASCII)).isNotEqualTo("secret-payload");
+        assertThat(sent.kk()).isNotZero(); // the header names the key used
+
+        assertThat(peer.decrypt(onWire, sent.sequenceNumber(), KeyEncryption.fromCode(sent.kk()))).isTrue();
+        assertThat(new String(onWire, StandardCharsets.US_ASCII)).isEqualTo("secret-payload");
+    }
+
+    @Test
+    void aPeerWithTheWrongPassphraseIsRejectedWithBadSecret() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0));
+        listener.setAcceptHandler(request -> AcceptDecision.accept("the-right-one".toCharArray(), 16));
+        caller = newCaller();
+
+        EncryptionContext peer = EncryptionContext.generating("the-wrong-one".toCharArray(), 16);
+        HandshakeCif inductionReply = sendAndReceiveHandshake(inductionRequest());
+        HandshakeCif conclusion = new HandshakeCif(
+                true, 5, 4, 7, seq(1), 1500, DEFAULT_FLOW_WINDOW, HandshakeType.CONCLUSION.code(),
+                CALLER_SOCKET_ID, inductionReply.synCookie(), LOCALHOST,
+                new HandshakeExtension(0x010401,
+                        new HandshakeExtensionFlags(true, true, true, true, true, true, false, false), 120, 120),
+                "live/test", peer.keyMaterial(KeyEncryption.BOTH));
+
+        HandshakeCif reply = sendAndReceiveHandshake(conclusion);
+
+        assertThat(reply.isRejection()).isTrue();
+        assertThat(reply.rejectionReason()).isEqualTo(RejectionReason.BADSECRET);
+    }
+
+    @Test
+    void aPeerOfferingNoKeyMaterialIsRejectedWhenAPassphraseIsRequired() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0));
+        listener.setAcceptHandler(request -> AcceptDecision.accept(TEST_PASSPHRASE, 16));
+        caller = newCaller();
+
+        HandshakeCif inductionReply = sendAndReceiveHandshake(inductionRequest());
+        HandshakeCif reply = sendAndReceiveHandshake(conclusionRequest(inductionReply.synCookie()));
+
+        assertThat(reply.isRejection()).isTrue();
+        assertThat(reply.rejectionReason()).isEqualTo(RejectionReason.UNSECURE);
+    }
+
+    /** An unencrypted connection must keep behaving exactly as before. */
+    @Test
+    void anUnencryptedConnectionStillPassesDataThroughUntouched() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        CompletableFuture<String> received = new CompletableFuture<>();
+        connection.onData(payload -> {
+            received.complete(payload.toString(StandardCharsets.US_ASCII));
+            payload.release();
+        });
+
+        sendData(connection.metadata().socketId(), 1, 1000, "plain");
+
+        assertThat(received.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo("plain");
+    }
+
+    private void sendDataRaw(SrtSocketId destination, int seq, int timestamp, byte[] payload, int kk)
+            throws IOException {
+        DataPacket packet = new DataPacket(seq, 0b11, true, kk, false, 1, timestamp, destination,
+                Unpooled.wrappedBuffer(payload));
+        var out = Unpooled.buffer();
+        packet.encodeTo(out);
+        byte[] bytes = new byte[out.readableBytes()];
+        out.readBytes(bytes);
+        out.release();
+        caller.send(new DatagramPacket(bytes, bytes.length, listener.localAddress()));
+    }
+
+
+    /**
+     * The retransmission case the encryptIfConfigured javadoc warns about: because
+     * SendBuffer retains the plaintext and hands out a fresh duplicate per
+     * delivery, a retransmit arrives at the send path as plaintext and must be
+     * encrypted again. gosrt skips re-encrypting retransmissions (it encrypts its
+     * one retained object in place), and porting that guard here would put
+     * retransmitted payloads on the wire in the clear. Same sequence number means
+     * the same keystream, so the retransmit is byte-identical to the original.
+     */
+    @Test
+    void aRetransmissionOnAnEncryptedConnectionIsAlsoEncrypted() throws Exception {
+        CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
+        EncryptionContext peer = connectAndAcceptEncrypted(connected, TEST_PASSPHRASE);
+        SrtConnection connection = connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        connection.write(Unpooled.wrappedBuffer("resend-me".getBytes(StandardCharsets.US_ASCII)));
+        DataPacket first = receiveData();
+        byte[] firstBytes = new byte[first.body().readableBytes()];
+        first.body().getBytes(first.body().readerIndex(), firstBytes);
+        first.body().release();
+
+        sendNak(connection.metadata().socketId(),
+                List.of(new LossRange(seq(first.sequenceNumber()), seq(first.sequenceNumber()))));
+
+        DataPacket resent = receiveData();
+        byte[] resentBytes = new byte[resent.body().readableBytes()];
+        resent.body().getBytes(resent.body().readerIndex(), resentBytes);
+        resent.body().release();
+
+        assertThat(resent.retransmitted()).isTrue();
+        assertThat(resent.kk()).isNotZero();
+        // Not plaintext...
+        assertThat(new String(resentBytes, StandardCharsets.US_ASCII)).isNotEqualTo("resend-me");
+        // ...identical to the original, since the sequence number drives the keystream...
+        assertThat(resentBytes).isEqualTo(firstBytes);
+        // ...and it decrypts.
+        assertThat(peer.decrypt(resentBytes, resent.sequenceNumber(), KeyEncryption.fromCode(resent.kk()))).isTrue();
+        assertThat(new String(resentBytes, StandardCharsets.US_ASCII)).isEqualTo("resend-me");
     }
 
     private SrtConnection connectAndAccept() throws Exception {

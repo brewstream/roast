@@ -12,7 +12,9 @@ import org.brewstream.roast.packet.SrtPacket;
 import org.brewstream.roast.packet.cif.AckCif;
 import org.brewstream.roast.packet.cif.AckVariant;
 import org.brewstream.roast.packet.cif.LossListCodec;
+import org.brewstream.roast.packet.cif.KeyEncryption;
 import org.brewstream.roast.packet.cif.LossRange;
+import org.brewstream.roast.crypto.EncryptionContext;
 import org.brewstream.roast.recv.AckBoundaryResult;
 import org.brewstream.roast.recv.AckSender;
 import org.brewstream.roast.recv.DeliveryResult;
@@ -142,6 +144,7 @@ public final class SrtConnection {
     private final AtomicBoolean closed = new AtomicBoolean(false);
     private final Map<Integer, Long> pendingAcks = new HashMap<>();
     private final Runnable onChannelOwnerClose;
+    private final EncryptionContext encryptionContext;
 
     private long lastPeriodicNakMicros;
     private int fullAckCounter;
@@ -161,7 +164,7 @@ public final class SrtConnection {
 
     public SrtConnection(Channel channel, SrtSocketIdDemultiplexer demultiplexer, AcceptedConnection metadata,
             CircularNumber initialSequenceNumber) {
-        this(channel, demultiplexer, metadata, initialSequenceNumber, () -> { });
+        this(channel, demultiplexer, metadata, initialSequenceNumber, () -> { }, null);
     }
 
     /**
@@ -175,6 +178,18 @@ public final class SrtConnection {
      */
     SrtConnection(Channel channel, SrtSocketIdDemultiplexer demultiplexer, AcceptedConnection metadata,
             CircularNumber initialSequenceNumber, Runnable onChannelOwnerClose) {
+        this(channel, demultiplexer, metadata, initialSequenceNumber, onChannelOwnerClose, null);
+    }
+
+    /**
+     * With encryption. {@code encryptionContext} may be {@code null}, in which
+     * case this connection neither encrypts nor decrypts and behaves exactly as
+     * before - the whole data path below is inert without it.
+     */
+    SrtConnection(Channel channel, SrtSocketIdDemultiplexer demultiplexer, AcceptedConnection metadata,
+            CircularNumber initialSequenceNumber, Runnable onChannelOwnerClose,
+            EncryptionContext encryptionContext) {
+        this.encryptionContext = encryptionContext;
         this.channel = channel;
         this.demultiplexer = demultiplexer;
         this.metadata = metadata;
@@ -268,6 +283,9 @@ public final class SrtConnection {
         demultiplexer.unregister(metadata.socketId());
         receiveBuffer.dispose();
         sendBuffer.flush();
+        if (encryptionContext != null) {
+            encryptionContext.destroy(); // zero the passphrase and keys rather than waiting for GC
+        }
         onChannelOwnerClose.run();
         onClose.run();
     }
@@ -370,6 +388,15 @@ public final class SrtConnection {
     }
 
     private void handleData(DataPacket data) {
+        // Decrypt before anything else observes this packet: a payload we can't
+        // decrypt is dropped outright, and dropping it after it had been counted
+        // as received would leave the loss list and the ACK boundary claiming a
+        // packet that never reached the application.
+        if (!decryptIfNeeded(data)) {
+            data.body().release();
+            return;
+        }
+
         CircularNumber seq = CircularNumber.of(data.sequenceNumber() & 0x7FFF_FFFF, SrtPacket.MAX_SEQUENCE_NUMBER);
         List<LossRange> immediateLoss = lossList.onPacketReceived(seq);
         ackSender.onPacketReceived();
@@ -384,6 +411,32 @@ public final class SrtConnection {
         }
 
         receiveBuffer.add(data, elapsedMicros());
+    }
+
+    /**
+     * Decrypts an inbound payload using the key its KK header field names.
+     * Returns {@code false} if the packet can't be decrypted and should be
+     * dropped: it's encrypted but we hold no keys, or it names a key we were
+     * never told about. An unencrypted packet ({@code kk == 0}) passes through
+     * untouched even on an encrypted connection — rejecting those is a policy
+     * decision that belongs with the handshake, once the negotiated encryption
+     * field says whether cleartext is acceptable at all.
+     */
+    private boolean decryptIfNeeded(DataPacket data) {
+        if (data.kk() == 0) {
+            return true;
+        }
+        if (encryptionContext == null) {
+            LOG.log(Level.FINE, "Dropping encrypted DATA on an unencrypted connection {0}", metadata.socketId());
+            return false;
+        }
+        KeyEncryption key = KeyEncryption.fromCode(data.kk());
+        if (!encryptionContext.decrypt(data.body(), data.sequenceNumber(), key)) {
+            LOG.log(Level.FINE, "Dropping DATA for socket {0}: no usable key for KK={1}",
+                    new Object[]{metadata.socketId(), data.kk()});
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -445,7 +498,51 @@ public final class SrtConnection {
         if (packet.retransmitted()) {
             onRetransmit.accept(packet);
         }
-        send(packet);
+        send(encryptIfConfigured(packet));
+    }
+
+    /**
+     * Encrypts an outgoing payload and stamps the DATA header's KK field with the
+     * key used, so the peer knows which one to decrypt with. A no-op when this
+     * connection has no encryption context, or has one whose keys haven't been
+     * negotiated yet.
+     *
+     * <p><b>Every delivery is encrypted, retransmissions included</b> — which
+     * looks like a difference from gosrt, whose {@code pop} skips re-encrypting a
+     * packet carrying the retransmitted flag. It isn't: gosrt encrypts its one
+     * retained packet object in place on first send, so a retransmit of that same
+     * object is already ciphertext. {@link SendBuffer} instead keeps the
+     * plaintext original and hands out a fresh {@code retainedDuplicate()} per
+     * delivery (see its javadoc), so each delivery arrives here as plaintext and
+     * must be encrypted. Porting gosrt's {@code if !retransmitted} guard across
+     * would put retransmissions on the wire in the clear. The wire result is
+     * identical either way: the same sequence number yields the same keystream,
+     * so a retransmit is byte-for-byte the packet it replaces.
+     */
+    private DataPacket encryptIfConfigured(DataPacket packet) {
+        if (encryptionContext == null || !encryptionContext.hasKeys()) {
+            return packet;
+        }
+        KeyEncryption key = encryptionContext.activeKey();
+        ByteBuf plaintext = packet.payload();
+
+        // Encrypt into a fresh buffer, never in place. What arrives here is a
+        // retainedDuplicate() of the payload SendBuffer retains for
+        // retransmission, and a duplicate SHARES the original's memory - so
+        // encrypting in place would rewrite the retained plaintext into
+        // ciphertext. The retransmission would then be encrypted a second time,
+        // and because CTR is XOR against a keystream fixed by the sequence
+        // number, a second pass restores the plaintext: the resend would go out
+        // in the clear. Caught by
+        // aRetransmissionOnAnEncryptedConnectionIsAlsoEncrypted.
+        ByteBuf ciphertext = channel.alloc().buffer(plaintext.readableBytes());
+        ciphertext.writeBytes(plaintext, plaintext.readerIndex(), plaintext.readableBytes());
+        plaintext.release();
+
+        encryptionContext.encrypt(ciphertext, packet.sequenceNumber());
+        return new DataPacket(packet.sequenceNumber(), packet.pp(), packet.inOrder(), key.code(),
+                packet.retransmitted(), packet.messageNumber(), packet.timestamp(), packet.destination(),
+                ciphertext);
     }
 
     private void sendAckAck(int ackNumber) {

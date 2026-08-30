@@ -1,5 +1,7 @@
 package org.brewstream.roast.crypto;
 
+import io.netty.buffer.ByteBuf;
+
 import javax.crypto.Cipher;
 import javax.crypto.spec.IvParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
@@ -80,6 +82,22 @@ public final class PayloadCipher {
         } catch (GeneralSecurityException e) {
             throw new IllegalStateException("AES-CTR failed", e);
         }
+    }
+
+    /**
+     * As {@link #encryptOrDecrypt(byte[], byte[], byte[], int)}, but operating on
+     * a packet payload in place. The buffer's reader and writer indices are
+     * unchanged — only the bytes between them are rewritten.
+     */
+    public static void encryptOrDecrypt(ByteBuf payload, byte[] sek, byte[] salt, int packetSequenceNumber) {
+        int length = payload.readableBytes();
+        if (length == 0) {
+            return;
+        }
+        byte[] bytes = new byte[length];
+        payload.getBytes(payload.readerIndex(), bytes);
+        encryptOrDecrypt(bytes, sek, salt, packetSequenceNumber);
+        payload.setBytes(payload.readerIndex(), bytes);
     }
 
     /** Visible for testing the counter construction directly — see the class javadoc for the layout. */

@@ -14,6 +14,7 @@ import io.netty.channel.socket.nio.NioDatagramChannel;
 import org.brewstream.roast.codec.SrtFrameDecoder;
 import org.brewstream.roast.codec.SrtFrameEncoder;
 import org.brewstream.roast.handshake.ConclusionOutcome;
+import org.brewstream.roast.crypto.EncryptionContext;
 import org.brewstream.roast.handshake.ListenerHandshake;
 import org.brewstream.roast.handshake.SynCookie;
 import org.brewstream.roast.packet.ControlPacket;
@@ -158,9 +159,30 @@ public final class SrtListener {
             return;
         }
 
+        AcceptDecision.Accept accepted = (AcceptDecision.Accept) decision;
+        EncryptionContext encryptionContext = null;
+        if (accepted.isEncrypted()) {
+            if (request.keyMaterial() == null) {
+                // The application demanded a passphrase; the peer offered no keys at all.
+                send(listenerHandshake.buildRejectResponse(request, RejectionReason.UNSECURE),
+                        request.srtSocketId(), msg.sender());
+                return;
+            }
+            encryptionContext = EncryptionContext.awaitingPeerKeys(accepted.passphrase(), accepted.keyLength());
+            if (!encryptionContext.adopt(request.keyMaterial())) {
+                // Wrong passphrase, or key material we can't use - the one case
+                // BADSECRET exists for.
+                encryptionContext.destroy();
+                send(listenerHandshake.buildRejectResponse(request, RejectionReason.BADSECRET),
+                        request.srtSocketId(), msg.sender());
+                return;
+            }
+        }
+
         SrtSocketId assignedSocketId = socketIdGenerator.generate();
         HandshakeCif response = listenerHandshake.buildAcceptResponse(
-                request, assignedSocketId, DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS);
+                request, assignedSocketId, DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS,
+                encryptionContext != null ? request.keyMaterial() : null);
         acceptedByPeerSocketId.put(request.srtSocketId(), response);
         send(response, request.srtSocketId(), msg.sender());
 
@@ -170,7 +192,8 @@ public final class SrtListener {
                 negotiated.receiveTsbpdDelayMillis(), negotiated.sendTsbpdDelayMillis(), negotiated.srtVersion(),
                 response.maxFlowWindowSize());
         SrtConnection connection = new SrtConnection(
-                channel, demultiplexer, metadata, request.initialPacketSequenceNumber());
+                channel, demultiplexer, metadata, request.initialPacketSequenceNumber(),
+                () -> { }, encryptionContext);
         connections.put(assignedSocketId, connection);
         connectionHandler.accept(connection);
     }

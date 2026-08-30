@@ -5,6 +5,7 @@ import org.brewstream.roast.packet.cif.HandshakeCif;
 import org.brewstream.roast.packet.cif.HandshakeExtension;
 import org.brewstream.roast.packet.cif.HandshakeExtensionFlags;
 import org.brewstream.roast.packet.cif.HandshakeType;
+import org.brewstream.roast.packet.cif.KeyMaterialCif;
 import org.brewstream.roast.packet.cif.RejectionReason;
 
 import java.net.InetAddress;
@@ -109,6 +110,25 @@ public final class ListenerHandshake {
      */
     public HandshakeCif buildAcceptResponse(HandshakeCif request, SrtSocketId assignedSocketId,
             int ourReceiveTsbpdDelayMillis, int ourSendTsbpdDelayMillis) {
+        return buildAcceptResponse(request, assignedSocketId, ourReceiveTsbpdDelayMillis,
+                ourSendTsbpdDelayMillis, null);
+    }
+
+    /**
+     * As above, additionally echoing {@code keyMaterial} back as a KMRSP
+     * extension. SRT's key exchange is a mirror rather than a fresh
+     * announcement: the caller generates the keys and sends them as KMREQ, and
+     * the listener — having proved it can unwrap them with the same passphrase —
+     * returns the identical message to confirm. Pass {@code null} for an
+     * unencrypted connection.
+     *
+     * <p>The response's Encryption Field carries the agreed key length in
+     * 4-byte units (draft-sharabayko-srt.md's Table 2: {@code 2} = 16 bytes,
+     * {@code 3} = 24, {@code 4} = 32), which is how a peer learns the size
+     * without parsing the key material itself.
+     */
+    public HandshakeCif buildAcceptResponse(HandshakeCif request, SrtSocketId assignedSocketId,
+            int ourReceiveTsbpdDelayMillis, int ourSendTsbpdDelayMillis, KeyMaterialCif keyMaterial) {
         HandshakeExtension requested = request.handshakeExtension();
         int receiveDelay = Math.max(ourReceiveTsbpdDelayMillis, requested.sendTsbpdDelayMillis());
         int sendDelay = Math.max(ourSendTsbpdDelayMillis, requested.receiveTsbpdDelayMillis());
@@ -117,12 +137,13 @@ public final class ListenerHandshake {
         HandshakeExtension responseExtension = new HandshakeExtension(srtVersion, flags, receiveDelay, sendDelay);
 
         boolean hasStreamId = request.streamId() != null && !request.streamId().isEmpty();
-        int extensionField = 1 | (hasStreamId ? 4 : 0);
+        int extensionField = 1 | (keyMaterial != null ? 2 : 0) | (hasStreamId ? 4 : 0);
+        int encryptionField = keyMaterial != null ? keyMaterial.keyLength() / 4 : 0;
 
         return new HandshakeCif(
-                false, 5, 0, extensionField,
+                false, 5, encryptionField, extensionField,
                 request.initialPacketSequenceNumber(), request.maxTransmissionUnitSize(),
                 request.maxFlowWindowSize(), HandshakeType.CONCLUSION.code(),
-                assignedSocketId, 0, ownAddress, responseExtension, request.streamId());
+                assignedSocketId, 0, ownAddress, responseExtension, request.streamId(), keyMaterial);
     }
 }
