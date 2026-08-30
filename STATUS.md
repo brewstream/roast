@@ -35,7 +35,14 @@ rather than aspirational: `onData`/`onLoss`/`onTlpktDrop` on `SrtConnection`
 (`SrtListener.onConnection` now hands out `SrtConnection`, not bare
 `AcceptedConnection` — see "Architecture decisions" for the API-shape note).
 KEEPALIVE (echoed back on receipt) and SHUTDOWN (tears down, sends our own
-SHUTDOWN back, fires a new `onClose` hook) are now handled too. ACKACK is now
+SHUTDOWN back, fires a new `onClose` hook) are now handled too, as is
+**DROPREQ**: a peer's "I've given up on these packets" immediately advances the
+acknowledgement boundary instead of letting the stream stall until those
+packets' own deadlines expire. Follows libsrt's `processCtrlDropReq` — gosrt
+marks the type unimplemented — **including its validation**, which matters more
+than the feature: libsrt's own comment calls a reversed range a DoS primitive
+(its buffer walk wraps and clears nearly everything held), and this arrives
+unauthenticated from a peer. ACKACK is now
 handled as well, unlocking real RTT/RTTVar tracking and an RTT-adaptive periodic
 NAK interval (previously a fixed floor) — see "What's built" and "Testing
 methodology" below. `ReceiveBuffer` now also does TSBPD clock-drift correction
@@ -223,7 +230,7 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-287 tests passing (128 default + 6 gated interop + 2 ACKACK/RTT + 5
+291 tests passing (128 default + 6 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
