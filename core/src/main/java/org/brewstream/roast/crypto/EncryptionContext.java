@@ -321,9 +321,19 @@ public final class EncryptionContext {
         return Optional.ofNullable(toAnnounce);
     }
 
-    /** Records that the peer acknowledged our announced key material, stopping the re-announcements. */
-    public void confirmKeyMaterial() {
+    /**
+     * Records that the peer acknowledged our announced key material, stopping
+     * the re-announcements. Ignored — returning {@code false} — unless we are
+     * actually in the pre-announce window, so a stale or unsolicited response
+     * can't confirm a rotation we never announced (gosrt's
+     * {@code handleKMResponse} makes the same check).
+     */
+    public boolean confirmKeyMaterial() {
+        if (preAnnounceCountdown >= kmPreAnnounce) {
+            return false;
+        }
         keyMaterialConfirmed = true;
+        return true;
     }
 
     /** Whether the peer has confirmed the most recently announced key material. */

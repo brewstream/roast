@@ -13,7 +13,9 @@ import org.brewstream.roast.packet.cif.HandshakeCif;
 import org.brewstream.roast.packet.cif.HandshakeExtension;
 import org.brewstream.roast.packet.cif.HandshakeExtensionFlags;
 import org.brewstream.roast.packet.cif.HandshakeType;
+import org.brewstream.roast.packet.cif.ExtensionType;
 import org.brewstream.roast.packet.cif.KeyEncryption;
+import org.brewstream.roast.packet.cif.KeyMaterialCif;
 import org.brewstream.roast.packet.cif.RejectionReason;
 import org.brewstream.roast.packet.cif.LossListCodec;
 import org.brewstream.roast.packet.cif.LossRange;
@@ -490,6 +492,85 @@ class SrtConnectionTest {
         // ...and it decrypts.
         assertThat(peer.decrypt(resentBytes, resent.sequenceNumber(), KeyEncryption.fromCode(resent.kk()))).isTrue();
         assertThat(new String(resentBytes, StandardCharsets.US_ASCII)).isEqualTo("resend-me");
+    }
+
+
+    /**
+     * A peer rotating its key mid-stream: it announces the incoming key in a
+     * USER_DEFINED control packet (subtype KMREQ), we adopt it and acknowledge
+     * with KMRSP, and data encrypted with the new key then decrypts. This is the
+     * inbound half of rotation; the outbound schedule that decides *when* to
+     * announce is unit-tested in EncryptionContextTest, and shares the same
+     * sendKeyMaterial path exercised here by the KMRSP reply.
+     */
+    @Test
+    void aPeersMidStreamKeyRotationIsAdoptedAndAcknowledged() throws Exception {
+        CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
+        EncryptionContext peer = connectAndAcceptEncrypted(connected, TEST_PASSPHRASE);
+        SrtConnection connection = connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        CompletableFuture<String> received = new CompletableFuture<>();
+        connection.onData(payload -> {
+            received.complete(payload.toString(StandardCharsets.US_ASCII));
+            payload.release();
+        });
+
+        // The peer rolls to its odd key and announces it.
+        peer.generateSek(KeyEncryption.ODD);
+        peer.switchActiveKey();
+        assertThat(peer.activeKey()).isEqualTo(KeyEncryption.ODD);
+        sendKeyMaterial(connection.metadata().socketId(), peer.keyMaterial(KeyEncryption.ODD),
+                ExtensionType.KMREQ.code());
+
+        // We must acknowledge it.
+        ControlPacket response = receiveControl(ControlType.USER_DEFINED);
+        assertThat(response.subtype()).isEqualTo(ExtensionType.KMRSP.code());
+        KeyMaterialCif echoed = KeyMaterialCif.decode(response.body());
+        response.body().release();
+        assertThat(echoed).isNotNull();
+        assertThat(echoed.isError()).isFalse();
+        assertThat(echoed.keyEncryption()).isEqualTo(KeyEncryption.ODD);
+
+        // ...and data under the new key must now decrypt.
+        byte[] ciphertext = "rotated-payload".getBytes(StandardCharsets.US_ASCII);
+        peer.encrypt(ciphertext, 1);
+        sendDataRaw(connection.metadata().socketId(), 1, 1000, ciphertext, peer.activeKey().code());
+
+        assertThat(received.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo("rotated-payload");
+    }
+
+    /** A mid-stream rotation we can't unwrap is answered with an error, not silently ignored. */
+    @Test
+    void aMidStreamRotationWithTheWrongPassphraseIsRefused() throws Exception {
+        CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
+        connectAndAcceptEncrypted(connected, TEST_PASSPHRASE);
+        SrtConnection connection = connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        EncryptionContext impostor = EncryptionContext.generating("a-totally-different-one".toCharArray(), 16);
+        sendKeyMaterial(connection.metadata().socketId(), impostor.keyMaterial(KeyEncryption.ODD),
+                ExtensionType.KMREQ.code());
+
+        ControlPacket response = receiveControl(ControlType.USER_DEFINED);
+        assertThat(response.subtype()).isEqualTo(ExtensionType.KMRSP.code());
+        KeyMaterialCif reply = KeyMaterialCif.decode(response.body());
+        response.body().release();
+        assertThat(reply).isNotNull();
+        assertThat(reply.isError()).isTrue();
+        assertThat(reply.errorCode()).isEqualTo(KeyMaterialCif.ERROR_BAD_SECRET);
+    }
+
+    private void sendKeyMaterial(SrtSocketId destination, KeyMaterialCif keyMaterial, int subtype)
+            throws IOException {
+        ByteBuf cif = Unpooled.buffer();
+        keyMaterial.encodeTo(cif);
+        ControlPacket packet = new ControlPacket(
+                ControlType.USER_DEFINED, 0, 0, destination, cif, subtype);
+        var out = Unpooled.buffer();
+        packet.encodeTo(out);
+        byte[] bytes = new byte[out.readableBytes()];
+        out.readBytes(bytes);
+        out.release();
+        caller.send(new DatagramPacket(bytes, bytes.length, listener.localAddress()));
     }
 
     private SrtConnection connectAndAccept() throws Exception {

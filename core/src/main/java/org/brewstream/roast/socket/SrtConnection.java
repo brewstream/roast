@@ -12,7 +12,9 @@ import org.brewstream.roast.packet.SrtPacket;
 import org.brewstream.roast.packet.cif.AckCif;
 import org.brewstream.roast.packet.cif.AckVariant;
 import org.brewstream.roast.packet.cif.LossListCodec;
+import org.brewstream.roast.packet.cif.ExtensionType;
 import org.brewstream.roast.packet.cif.KeyEncryption;
+import org.brewstream.roast.packet.cif.KeyMaterialCif;
 import org.brewstream.roast.packet.cif.LossRange;
 import org.brewstream.roast.crypto.EncryptionContext;
 import org.brewstream.roast.recv.AckBoundaryResult;
@@ -321,6 +323,10 @@ public final class SrtConnection {
                 handleNak(control);
                 return;
             }
+            if (control.type() == ControlType.USER_DEFINED) {
+                handleKeyMaterialUpdate(control);
+                return;
+            }
         }
 
         LOG.log(Level.FINE, "Dropping unhandled packet type for socket {0}", metadata.socketId());
@@ -540,9 +546,72 @@ public final class SrtConnection {
         plaintext.release();
 
         encryptionContext.encrypt(ciphertext, packet.sequenceNumber());
-        return new DataPacket(packet.sequenceNumber(), packet.pp(), packet.inOrder(), key.code(),
+        DataPacket encrypted = new DataPacket(packet.sequenceNumber(), packet.pp(), packet.inOrder(), key.code(),
                 packet.retransmitted(), packet.messageNumber(), packet.timestamp(), packet.destination(),
                 ciphertext);
+
+        // Advance the rotation schedule by this packet, announcing the next key
+        // when the schedule says to. Deliberately after building the packet, so
+        // the KM update goes out behind the DATA it relates to rather than ahead
+        // of it, and so a switch never applies to the packet being built.
+        encryptionContext.onPacketEncrypted()
+                .ifPresent(next -> sendKeyMaterial(next, ExtensionType.KMREQ.code()));
+        return encrypted;
+    }
+
+    /**
+     * Sends a mid-stream Key Material update. Unlike the handshake's KMREQ/KMRSP
+     * extension, this rides in a USER_DEFINED control packet whose subtype names
+     * the SRT message (gosrt's {@code sendKMRequest}: {@code CTRLTYPE_USER} plus
+     * {@code EXTTYPE_KMREQ}).
+     */
+    private void sendKeyMaterial(KeyEncryption key, int subtype) {
+        ByteBuf cif = channel.alloc().buffer();
+        encryptionContext.keyMaterial(key).encodeTo(cif);
+        send(new ControlPacket(ControlType.USER_DEFINED, 0, (int) elapsedMicros(),
+                metadata.peerSocketId(), cif, subtype));
+    }
+
+    /**
+     * A peer's mid-stream key rotation. A KMREQ announces the key it is about to
+     * start using, which we adopt and echo back as KMRSP so it knows we are
+     * ready; a KMRSP confirms an announcement of our own, letting us stop
+     * repeating it.
+     */
+    private void handleKeyMaterialUpdate(ControlPacket control) {
+        if (encryptionContext == null) {
+            LOG.log(Level.FINE, "Dropping key material for unencrypted connection {0}", metadata.socketId());
+            control.body().release();
+            return;
+        }
+
+        KeyMaterialCif keyMaterial = KeyMaterialCif.decode(control.body());
+        control.body().release();
+        if (keyMaterial == null) {
+            LOG.log(Level.FINE, "Dropping malformed key material on socket {0}", metadata.socketId());
+            return;
+        }
+
+        if (control.subtype() == ExtensionType.KMRSP.code()) {
+            encryptionContext.confirmKeyMaterial();
+            return;
+        }
+        if (control.subtype() != ExtensionType.KMREQ.code()) {
+            LOG.log(Level.FINE, "Ignoring user-defined control subtype {0}", control.subtype());
+            return;
+        }
+
+        if (!encryptionContext.adopt(keyMaterial)) {
+            // Wrong passphrase mid-stream, or key material we can't use. Nothing
+            // to renegotiate at this point, so tell the peer rather than
+            // silently dropping everything it sends from here on.
+            ByteBuf cif = channel.alloc().buffer();
+            KeyMaterialCif.error(KeyMaterialCif.ERROR_BAD_SECRET).encodeTo(cif);
+            send(new ControlPacket(ControlType.USER_DEFINED, 0, (int) elapsedMicros(),
+                    metadata.peerSocketId(), cif, ExtensionType.KMRSP.code()));
+            return;
+        }
+        sendKeyMaterial(keyMaterial.keyEncryption(), ExtensionType.KMRSP.code());
     }
 
     private void sendAckAck(int ackNumber) {
