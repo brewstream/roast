@@ -266,6 +266,38 @@ public final class ReceiveBuffer {
     }
 
     /**
+     * Gives up on everything at or before {@code end} immediately, rather than
+     * waiting for its delivery deadline to pass — what a peer's DROPREQ asks
+     * for when its sender has discarded those packets and they are never
+     * coming.
+     *
+     * <p>Only the acknowledgement boundary moves. Anything in the range that
+     * <em>was</em> received is still buffered and still delivered by
+     * {@link #deliver}; the point is to stop waiting for what is missing, not
+     * to discard what arrived.
+     *
+     * <p>Returns {@code false} if the boundary was already at or past
+     * {@code end}, so a caller can tell a redundant DROPREQ from one that
+     * actually advanced anything.
+     */
+    /**
+     * Where the acknowledgement boundary currently sits — the equivalent of the
+     * receive-window start libsrt judges an incoming DROPREQ's distance
+     * against ({@code getStartSeqNo()}).
+     */
+    public CircularNumber acknowledgedBoundary() {
+        return lastAcked;
+    }
+
+    public boolean abandonUpTo(CircularNumber end) {
+        if (end.lessThanOrEqual(lastAcked)) {
+            return false;
+        }
+        lastAcked = end;
+        return true;
+    }
+
+    /**
      * How many packets are currently held awaiting delivery — i.e. how much of
      * the receive window is in use. Feeds the "available buffer size" figure a
      * Full ACK reports to the peer (see {@code SrtConnection.tick}); a peer's

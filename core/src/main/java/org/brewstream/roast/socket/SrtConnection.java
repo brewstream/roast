@@ -378,6 +378,10 @@ public final class SrtConnection {
                 handleNak(control);
                 return;
             }
+            if (control.type() == ControlType.DROPREQ) {
+                handleDropRequest(control);
+                return;
+            }
             if (control.type() == ControlType.USER_DEFINED) {
                 handleKeyMaterialUpdate(control);
                 return;
@@ -430,6 +434,55 @@ public final class SrtConnection {
             recalculateRtt(cif.rtt());
             sendAckAck(control.typeSpecificInfo());
         }
+    }
+
+    /**
+     * A peer's Message Drop Request: its sender has discarded a range of
+     * packets and they are never coming, so stop waiting for them instead of
+     * holding the stream until their TSBPD deadlines expire — up to the
+     * negotiated latency of pointless stall per episode.
+     *
+     * <p>gosrt marks this type "unimplemented", so there is nothing to port
+     * there; this follows libsrt's {@code processCtrlDropReq}, <b>including its
+     * validation, which exists for a reason libsrt spells out in a comment</b>:
+     * a reversed range makes its buffer walk wrap and clear almost everything
+     * held, which it calls a DoS primitive. A peer can send this unauthenticated
+     * at any time, so a reversed or absurdly distant range is discarded rather
+     * than acted on. The CIF is two 32-bit sequence numbers, first and last
+     * inclusive.
+     */
+    private void handleDropRequest(ControlPacket control) {
+        ByteBuf cif = control.body();
+        if (cif.readableBytes() < 8) {
+            LOG.log(Level.FINE, "Dropping undersized DROPREQ on socket {0}", metadata.socketId());
+            cif.release();
+            return;
+        }
+        CircularNumber first = CircularNumber.of(cif.readInt() & 0x7FFF_FFFF, SrtPacket.MAX_SEQUENCE_NUMBER);
+        CircularNumber last = CircularNumber.of(cif.readInt() & 0x7FFF_FFFF, SrtPacket.MAX_SEQUENCE_NUMBER);
+        cif.release();
+
+        if (last.lessThan(first)) {
+            LOG.log(Level.FINE, "Discarding reversed DROPREQ range on socket {0}", metadata.socketId());
+            return;
+        }
+        // A range far from what we are actually waiting for is not a drop we can
+        // make sense of - libsrt bounds this the same way.
+        long distance = first.value() - receiveBuffer.acknowledgedBoundary().value();
+        if (Math.abs(distance) > SrtPacket.MAX_SEQUENCE_NUMBER / 4) {
+            LOG.log(Level.FINE, "Discarding DROPREQ too distant from our receive window on socket {0}",
+                    metadata.socketId());
+            return;
+        }
+
+        if (!receiveBuffer.abandonUpTo(last)) {
+            return; // already past it; nothing to do
+        }
+        lossList.abandon(last);
+        LossRange dropped = new LossRange(first, last);
+        packetsDropped += last.value() - first.value() + 1;
+        onTlpktDrop.accept(dropped);
+        events.fire(listener -> listener.onTlpktDrop(this, dropped));
     }
 
     private void handleNak(ControlPacket control) {

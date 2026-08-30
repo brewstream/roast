@@ -608,6 +608,95 @@ class SrtConnectionTest {
         sent.body().release();
     }
 
+
+    // --- DROPREQ: a peer telling us it has given up on a range of packets
+
+    /**
+     * Without DROPREQ handling the stream stalls behind the gap until TSBPD
+     * gives up on it — the full negotiated latency of pointless waiting. Acting
+     * on it releases the following packets immediately.
+     */
+    @Test
+    void aDropRequestReleasesPacketsStuckBehindTheAbandonedRange() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        CompletableFuture<String> delivered = new CompletableFuture<>();
+        CompletableFuture<LossRange> dropped = new CompletableFuture<>();
+        connection.onTlpktDrop(dropped::complete);
+        connection.onData(payload -> {
+            delivered.complete(payload.toString(StandardCharsets.US_ASCII));
+            payload.release();
+        });
+
+        // seq 1 never arrives; seq 2 is stuck behind it.
+        sendData(connection.metadata().socketId(), 2, 1000, "after-the-gap");
+        sendDropRequest(connection.metadata().socketId(), 1, 1);
+
+        assertThat(dropped.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo(new LossRange(seq(1), seq(1)));
+        assertThat(delivered.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo("after-the-gap");
+        assertThat(connection.stats().packetsDropped()).isPositive();
+    }
+
+    /**
+     * libsrt's own comment calls a reversed range a DoS primitive: its buffer
+     * walk wraps and clears nearly everything held. We discard it instead of
+     * acting on it.
+     */
+    @Test
+    void aReversedDropRequestRangeIsDiscarded() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        connection.onData(ByteBuf::release);
+
+        sendData(connection.metadata().socketId(), 1, 0, "first");
+        sendDropRequest(connection.metadata().socketId(), 500, 5); // last < first
+
+        Thread.sleep(300);
+        assertThat(connection.stats().packetsDropped())
+                .as("a reversed range must not be acted on")
+                .isZero();
+    }
+
+    /** A range nowhere near our receive window is not a drop we can make sense of. */
+    @Test
+    void anAbsurdlyDistantDropRequestIsDiscarded() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        connection.onData(ByteBuf::release);
+
+        sendData(connection.metadata().socketId(), 1, 0, "first");
+        sendDropRequest(connection.metadata().socketId(), 0x4000_0000, 0x4000_0001);
+
+        Thread.sleep(300);
+        assertThat(connection.stats().packetsDropped()).isZero();
+    }
+
+    @Test
+    void anUndersizedDropRequestIsIgnoredWithoutCrashing() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        connection.onData(ByteBuf::release);
+
+        ControlPacket packet = new ControlPacket(ControlType.DROPREQ, 0, 0,
+                connection.metadata().socketId(), Unpooled.buffer().writeInt(1)); // only 4 bytes
+        sendRaw(packet);
+
+        Thread.sleep(200);
+        assertThat(connection.stats().packetsDropped()).isZero();
+        // still alive
+        sendData(connection.metadata().socketId(), 1, 0, "still-here");
+    }
+
+    private void sendDropRequest(SrtSocketId destination, int first, int last) throws IOException {
+        ByteBuf cif = Unpooled.buffer().writeInt(first).writeInt(last);
+        sendRaw(new ControlPacket(ControlType.DROPREQ, 0, 0, destination, cif));
+    }
+
+    private void sendRaw(ControlPacket packet) throws IOException {
+        var out = Unpooled.buffer();
+        packet.encodeTo(out);
+        byte[] bytes = new byte[out.readableBytes()];
+        out.readBytes(bytes);
+        out.release();
+        caller.send(new DatagramPacket(bytes, bytes.length, listener.localAddress()));
+    }
+
     private SrtConnection connectAndAccept() throws Exception {
         return connectAndAccept(DEFAULT_FLOW_WINDOW);
     }
