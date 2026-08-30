@@ -65,9 +65,14 @@ already role-agnostic); one small addition for channel lifecycle only — see
 "What's built". Verified with a real round trip against Roast's own
 `SrtListener` (data flowing both directions), plus rejection and timeout
 paths. **This closes the last structural gap in the connection lifecycle** —
-Roast can now both accept and initiate connections. Real interop confirming
-our caller against libsrt/gosrt acting as *listener* hasn't been done yet —
-see "Next steps."
+Roast can now both accept and initiate connections. **Confirmed against real
+libsrt 1.5.7 as of 2026-08-29**: `LibsrtInteropTest.`
+`realCallerSendsDataToRealLibsrtListener` dials out to a real
+`srt-live-transmit` running `mode=listener` and asserts byte-for-byte on what
+it received. That was the last piece verified only against Roast's own
+`SrtListener` — i.e. two halves of the same codebase agreeing with each other
+— so **both roles are now proven against an independent implementation, in
+both data directions**.
 
 **A real, confirmed correctness bug was found via manual interop testing**
 (ffmpeg pushing a real, continuous MPEG-TS stream through a Roast listener at
@@ -218,7 +223,7 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-181 tests passing (128 default + 2 gated interop + 2 ACKACK/RTT + 5
+181 tests passing (128 default + 3 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
@@ -470,18 +475,30 @@ minimal early prototype of DESIGN.md's eventual Phase 6
 (no design-note javadoc, no tests, by design — see the class's own doc
 comment).
 
-**`interop`** (test-only) — `LibsrtInteropTest`: binds `SrtListener`, launches the
-real `srt-live-transmit` binary as a subprocess against it. Two directions:
-`realLibsrtCallerReachesConnected` — libsrt pushes data to us, asserts on both
-sides independently (our hooks fire with correct fields, *and* the peer's own
-stdout confirms `"SRT target connected"`); `realListenerSendsDataToRealLibsrtCaller`
-— we push data (`SrtConnection.write`) to libsrt, asserting byte-for-byte on
-what it actually received (libsrt's own log/verbose output goes to stderr by
-default, stats-to-stdout is opt-in and left off, so stdout redirected straight
-to a file is guaranteed clean of anything but the raw bytes — confirmed
-directly from libsrt's own source, not assumed). Both skip themselves via
-`Assumptions` (build stays green) if the binary isn't found — checks
-`$SRT_LIVE_TRANSMIT` env var first, falls back to
+**`interop`** (test-only) — `LibsrtInteropTest`: runs the real
+`srt-live-transmit` binary as a subprocess and exercises **all three
+connection directions**, so both Roast roles are covered against an
+independent implementation:
+- `realLibsrtCallerReachesConnected` — libsrt calls *us*, pushes data, and we
+  assert on both sides independently (our hooks fire with correct fields,
+  *and* the peer's own stdout confirms `"SRT target connected"`).
+- `realListenerSendsDataToRealLibsrtCaller` — libsrt calls us and *we* push
+  data (`SrtConnection.write`), asserting byte-for-byte on what it received.
+- `realCallerSendsDataToRealLibsrtListener` — *we* call out (`SrtCaller`) to
+  libsrt running `mode=listener`, and push data. This is the one the other
+  two structurally can't cover: they both run libsrt as the caller, so before
+  this, `CallerHandshake`/`SrtCaller` had only ever been checked against
+  Roast's own `SrtListener`. Connects in a retry loop rather than once, since
+  libsrt needs a moment to bind and `SrtCaller` is deliberately single-shot
+  with no induction retry (see its javadoc) — the retry lives in the test so
+  that limitation stays visible rather than hidden behind a sleep.
+
+Byte-for-byte assertions are safe here because libsrt's own log/verbose
+output goes to stderr by default, and stats-to-stdout is opt-in and left off,
+so stdout redirected straight to a file carries nothing but the raw bytes —
+confirmed directly from libsrt's own source, not assumed. All three skip
+themselves via `Assumptions` (build stays green) if the binary isn't found —
+checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
 `references/srt/build/srt-live-transmit`.
 
 ## Architecture decisions in force
@@ -604,10 +621,12 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   against `dial.go`'s source — same rigor tier as `ListenerHandshake`'s own
   tests (still not itself re-checked against a gosrt test file either, per
   the entry above). `SrtCallerTest`, by contrast, verifies a real round trip
-  against Roast's own `SrtListener` in-process — arguably a stronger
-  integration proof than gosrt's own `dial_test.go` gets, since it exercises
-  two independently-built real Roast components together rather than one
-  real piece plus a fake.
+  against Roast's own `SrtListener` in-process — a good integration proof,
+  but worth being precise about its limit: both ends are *our* code, so any
+  shared misreading of the spec would pass unnoticed. That gap is now closed
+  by `LibsrtInteropTest.realCallerSendsDataToRealLibsrtListener`, which dials
+  a real libsrt listener — the caller side finally has independent
+  confirmation rather than only self-agreement.
 - **A new methodology precedent, 2026-08-29**: the ACK-boundary bug above was
   found and root-caused via manual, sustained-real-throughput interop testing
   (`RelayDemo` + real ffmpeg) — the first time this codebase was exercised
@@ -850,12 +869,12 @@ directly from libsrt's own source, not assumed). Both skip themselves via
 
 ## Next steps, in order
 
-1. Real interop confirming `SrtCaller` against libsrt/gosrt acting as
-   *listener* — needs `srt-live-transmit` launched with `mode=listener` in its
-   URI (the existing interop tests always run it as caller). The connection
-   lifecycle's structural gaps are otherwise closed; this is proof against an
-   independent implementation, matching how every other piece here eventually
-   got that treatment.
+1. ~~Real interop confirming `SrtCaller` against libsrt acting as *listener*~~
+   — **done**, see "Where we are" and `LibsrtInteropTest`. **This is the
+   decision point**: with both roles proven against an independent
+   implementation in both directions, and the ACK CIF now free of
+   placeholders, there's no known correctness gap left blocking a choice
+   between Phase 5 and Phase 6 (below).
 2. With both `SrtListener`/`SrtCaller` and full send/receive paths in place,
    the natural next major milestone is DESIGN.md's Phase 6 (multiplexing &
    polish) or Phase 5 (encryption) — worth a deliberate choice with the user
