@@ -152,7 +152,9 @@ class HandshakeCifTest {
     @Test
     void encodesHsAndSidExtensionsMatchingGosrtGoldenFragments() throws UnknownHostException {
         // Base fields + HSRSP extension + SID extension, in the same byte layout
-        // gosrt produces for these three pieces (KM/Congestion omitted - out of scope).
+        // gosrt produces for these three pieces. KM and Congestion are simply not
+        // present on this narrower case - see decodesGosrtsCompleteV5GoldenVector
+        // for the full-vector version.
         String expected = "00000005000000050000002a000005dc00000064ffffffff00274921001234560100007f0000000000000000"
                 + "0000000000020003000104020000003f006400640005000576696c2f74732f656d6165726f6f662e00726162";
 
