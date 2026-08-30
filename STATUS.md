@@ -223,7 +223,7 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-274 tests passing (128 default + 6 gated interop + 2 ACKACK/RTT + 5
+278 tests passing (128 default + 6 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
@@ -540,8 +540,13 @@ the conclusion reply against the same capability checklist
 has no universal "send a rejection back" move the way a listener does.
 `SrtCaller` is what actually calls it over a live channel.
 
-**`harness`** (test-only) — `UdpLossProxy`: standalone UDP relay that randomly
-drops packets in both directions, for exercising ARQ without OS-level netem.
+**`harness`** (test-only) — `UdpLossProxy`: UDP relay that randomly drops
+packets in both directions, for exercising ARQ without OS-level netem. Written
+in Phase 0 as a `main`-only tool and, for that reason, **never used by a test
+until 2026-08-30** — a test can't drive something that binds a fixed port and
+loops forever. Now embeddable (ephemeral port, daemon thread, closeable), with
+a mid-flight `setDropRate` and a dropped-packet count so a test can assert loss
+actually happened. Drives `ArqUnderLossTest`.
 
 **`cli`** (manual tool, not part of the build's test suite) — `RelayDemo`:
 binds one `SrtListener`, treats any connection whose StreamID starts with
@@ -877,6 +882,16 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `ReceiveRateEstimatorTest`'s consuming half are both self-designed against
   gosrt's source — same rigor tier as this codebase's RTT/drift/wraparound
   pieces, not the stronger ported-scenario tier.
+- **A harness nobody can call is a harness nobody uses, 2026-08-30.**
+  `UdpLossProxy` was built in Phase 0 specifically to satisfy Phases 3 and 4's
+  "recovered via ARQ under induced loss" definition of done, and then sat
+  unused for the entire project — because it was written as a `main` that binds
+  a fixed port and loops forever, which no test can drive. Every loss and
+  retransmit path was therefore only ever exercised by hand-injected gaps in
+  unit tests. Making it embeddable took minutes and immediately paid for
+  itself: the very first run failed in `connect`, surfacing that `SrtCaller`
+  has no handshake retry. When a test helper exists but nothing references it,
+  that's worth treating as a gap rather than as coverage.
 - **Writing the rule down is not implementing it, 2026-08-30.** The
   `buildAcceptResponse` javadoc stated Table 2 correctly — 2 = AES-128, 3 =
   AES-192, 4 = AES-256, i.e. the key length in *eight*-byte units — while the
@@ -932,10 +947,15 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `ListenerHandshake`/`CallerHandshake`/`SrtConnection`. Deliberately stopped
   before the wiring so nothing is half-connected into the data path — see
   "Next steps".
-- ~~Caller-side handshake~~ **Closed** — `SrtCaller`/`CallerHandshake`; see
-  "What's built" and "Testing methodology". No HSv4 fallback and no
-  induction/conclusion retry-with-backoff, both matching gosrt's own
-  `dial.go` (deferred, not gaps introduced beyond the reference).
+- ~~Caller-side handshake~~ **Closed** — `SrtCaller`/`CallerHandshake`,
+  including **encryption** (the caller generates the keys and announces them;
+  see "What's built"). No HSv4 fallback, matching gosrt.
+- **`SrtCaller` does not retry its handshake**, matching gosrt's `dial.go` but
+  unlike real libsrt, which retries with backoff. Usually invisible; on a lossy
+  link it is not — a dropped INDUCTION or CONCLUSION fails the connect
+  outright, which is exactly what happened on the first run of
+  `ArqUnderLossTest` and is why that test enables loss only after connecting.
+  Worth closing before anyone runs Roast over a real lossy network.
 - ~~The ACK boundary stays frozen behind the oldest unresolved gap for the
   full TLPKTDROP window, starving the peer's send buffer~~ **Closed,
   2026-08-29** — `ReceiveBuffer.computeAckBoundary` now ports gosrt's real
