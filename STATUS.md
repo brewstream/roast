@@ -376,9 +376,14 @@ dropped, never thrown.
   for every connection it accepts or on one `SrtConnection`; `ConnectionStats`
   is a pollable immutable snapshot from `connection.stats()`, shaped for a
   periodic sampler (the Micrometer path later, no dependency now).
-  **Events for notable occurrences, counters for volume** — there is no event
-  per ACK or per packet, because at live bitrates that is pure garbage and a
-  throughput hazard.
+  Also `onPacketReceived` (pre-TSBPD arrival), `onAckSent` and `onAckReceived`,
+  completing §4's list. `onPacketReceived` carries the packet's *shape* —
+  sequence number, size, retransmitted flag — and deliberately **not its
+  bytes**: the payload buffer is owned by the receive path and released once
+  handled, so handing it to an asynchronous listener would mean a copy per
+  packet or a use-after-release. It's also the one per-packet event, but
+  nothing is allocated or queued with no listener registered, so a subscriber
+  opts into that rate knowingly. Everything higher-frequency stays a counter.
   **Events never run on the event loop.** A "must not block" javadoc contract
   only asks people not to stall packet processing; a separate single dispatcher
   thread makes it impossible. One thread, not a pool, so a connection's events
@@ -610,9 +615,16 @@ independent implementation:
   with no induction retry (see its javadoc) — the retry lives in the test so
   that limitation stays visible rather than hidden behind a sleep.
 
-`FfmpegInteropTest` (separate class, its own `Assumptions` check) covers the
-one direction `srt-live-transmit` cannot drive: a real libsrt-backed sender
-*encrypting* to us. It asserts MPEG-TS structure rather than exact bytes, since
+`FfmpegInteropTest` (separate class, its own `Assumptions` check) covers what
+`srt-live-transmit` cannot drive. `aFiveMegabitStreamArrivesByteExact` is
+Phase 3's literal definition of done — byte-exact output from a real 5 Mbps
+ffmpeg publisher. Byte-exactness against ffmpeg looks impossible since its
+output isn't reproducible; the **`tee` muxer** resolves it, writing one encode
+simultaneously to a file and to us, so the file is ground truth for that exact
+run. (First attempt appeared to receive *more* than was produced: ffmpeg
+buffers its file writes and a forced kill loses the tail, so it now exits on
+its own timer before the comparison.) The other test covers a real
+libsrt-backed sender *encrypting* to us. It asserts MPEG-TS structure rather than exact bytes, since
 ffmpeg's output isn't reproducible — every payload must be a whole number of
 188-byte packets each starting with `0x47`, which failed decryption would not
 produce (mutation-checked).
@@ -1116,12 +1128,14 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   - **Full send-side stats** (gosrt's `Stats()`: `estimatedInputBW`/
     `estimatedSentBW`/`pktLossRate`) and the 16th/17th-packet bandwidth-probe
     trick — both deliberately not ported, see `SendBuffer`'s javadoc.
-  - ~~Live pollable stats and event hooks~~ **Closed** — see
-    `SrtConnectionListener`/`ConnectionStats` in "What's built". Still missing
-    from DESIGN §4's list: **ACK sent/received** and **pre-TSBPD data
-    received** events (both deliberate — they are per-packet, and §4's own
-    "events for notable occurrences" logic argues for counting rather than
-    announcing them), and **Netty pipeline access** for embedders.
+  - ~~Live pollable stats and event hooks~~ **Closed** — DESIGN §4's list is
+    now complete: `SrtConnectionListener`/`ConnectionStats`, the ACK and
+    pre-TSBPD events, and `SrtListener.pipeline()` for embedders. That last one
+    is exposed **per port, not per connection**: §4 describes a connection's
+    pipeline, but Roast multiplexes every connection onto one
+    `NioDatagramChannel` — which is what makes many-sockets-on-one-port work —
+    so there is exactly one pipeline, and a handler added to it sees all
+    connections. Documented rather than papered over.
   ~~Real interop for the send path~~ **Closed** — see `LibsrtInteropTest`'s
   `realListenerSendsDataToRealLibsrtCaller` above; didn't need the
   caller-side handshake first, since Roast only needed to be the *listener*
@@ -1143,13 +1157,15 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
      Encryption Field are all done, and encryption is proven against a real
      implementation in **both** directions (libsrt decrypts ours;
      `FfmpegInteropTest` shows we decrypt a real sender's).
-   - **The one real gap: rotation has never run against a real peer.** The
-     production schedule is 1<<24 packets, so no test drives it end to end.
-     The inbound half (a peer rotating, us adopting and acknowledging) is
-     covered over real sockets and the schedule itself is unit-tested, but
-     nothing has watched libsrt accept a rotation *we* initiated. Driving that
-     needs the schedule to be configurable per connection — worth doing when
-     there's a reason to expose it, rather than inventing config for a test.
+   - **The one Phase 0-5 item still open: rotation has never run against a
+     real peer.** The production schedule is 1<<24 packets, so no test drives
+     it end to end. The inbound half (a peer rotating, us adopting and
+     acknowledging) is covered over real sockets and the schedule itself is
+     unit-tested, but nothing has watched libsrt accept a rotation *we*
+     initiated. Doing so needs the schedule to be configurable per connection,
+     which is a configuration story rather than a test fixture — deliberately
+     carried into Phase 6's config work rather than bolting another parameter
+     onto `AcceptDecision` purely to make a test possible.
 2. Phase 6 (multiplexing & polish) — the alternative major milestone,
    independent of Phase 5 and not blocked by it. Many connections per port,
    live pollable stats, and the `srt-java-live-transmit` CLI that `RelayDemo`
