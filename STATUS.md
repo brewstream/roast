@@ -223,7 +223,7 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-258 tests passing (128 default + 5 gated interop + 2 ACKACK/RTT + 5
+268 tests passing (128 default + 5 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
@@ -273,6 +273,10 @@ frames the fixed header.
   round-tripped. `KeyEncryption` (the KK field) deliberately has no constant
   for `00`: legal in a DATA header, explicitly invalid in a Key Material
   message, which is this enum's only use.
+
+`ControlPacket` also carries the header's **subtype** (bits 15-0), meaningful
+only for `USER_DEFINED` — which is how SRT carries a mid-stream key update, as
+opposed to the handshake's KM extension. Previously decoded and discarded.
 
 **`codec`** — `SrtFrameDecoder`/`SrtFrameEncoder`, Netty
 `MessageToMessage(De|En)coder`s bridging `DatagramPacket` ↔ `SrtPacket`, preserving
@@ -508,8 +512,16 @@ numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
   *active* key", **not** "both keys": a peer may announce only the key it is
   using, and real libsrt does — requiring both meant we silently sent
   plaintext and libsrt dropped all of it (see "Testing methodology").
-  Rotation *policy* is deliberately absent, since it's driven by packet flow —
-  see "Next steps".
+  **Key rotation** lives here too: `onPacketEncrypted()` advances SRT's
+  schedule one sent packet at a time and reports the key to announce, ported
+  from gosrt's `pop()` (defaults 1<<24 packets between rotations, announced
+  1<<12 ahead; injectable so tests can drive it). Its four conditions are
+  order-sensitive — announce the *opposite* key, re-announce until confirmed,
+  switch and clear confirmation at the refresh point, and regenerate the
+  retired key only `preAnnounce` packets *after* the switch, since packets
+  encrypted with it may still be in flight or awaiting retransmission.
+  `confirmKeyMaterial()` ignores a response arriving outside the pre-announce
+  window, matching gosrt's `handleKMResponse`.
 
 **`handshake`** — `SynCookie`: MD5-based SYN cookie so a listener can verify an
 INDUCTION cookie was echoed back correctly in CONCLUSION without keeping
@@ -858,6 +870,14 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `ReceiveRateEstimatorTest`'s consuming half are both self-designed against
   gosrt's source — same rigor tier as this codebase's RTT/drift/wraparound
   pieces, not the stronger ported-scenario tier.
+- **The weak-assertion trap caught a second time, 2026-08-30.** The key-rotation
+  test for "the retired key is only regenerated well after the switch" passed
+  against a deliberately broken version that regenerated it *at* the switch. It
+  was asserting on the *peer's* copy of the key, which that timing does not
+  affect, instead of the sender's. Rewritten to compare the sender's retired key
+  against a peer holding the original, and re-mutated to confirm it now fails.
+  Worth internalising: a test for *timing* has to observe the thing whose timing
+  changed.
 - **Mutation-checking a test that can't fail is worth the two minutes**, added
   2026-08-29 after the flow-window work: the first regression test for the
   advertised receive window asserted `8192`, which was simultaneously the
@@ -875,12 +895,14 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   skipped in `ListenerHandshake` for lack of a config object; noted inline there.
 - **No `SrtConfig`** — `SrtListener` hardcodes 120ms latency (both directions)
   and SRT version `0x010401` (matching gosrt's own baseline).
-- **Encryption** (Phase 5 in DESIGN.md) — **working, and proven against real
-  libsrt**: it keys with a shared passphrase and decrypts payloads we
-  encrypted (`LibsrtInteropTest.realLibsrtCallerDecryptsWhatWeEncrypt`).
-  Remaining gaps are narrow — see "Next steps": key rotation policy, and the
-  reverse interop direction (libsrt encrypting to us), which needs `ffmpeg`
-  because `srt-live-transmit` won't transmit from a redirected file.
+- **Encryption** (Phase 5 in DESIGN.md) — **feature-complete and proven
+  against real libsrt**, which keys with a shared passphrase and decrypts
+  payloads we encrypted (`LibsrtInteropTest.realLibsrtCallerDecryptsWhatWeEncrypt`).
+  Mid-stream key rotation is implemented and wired. Remaining gaps are narrow
+  — see "Next steps": rotation has not been exercised against a real peer
+  (the schedule is 16.7M packets), the reverse interop direction (libsrt
+  encrypting to us) needs `ffmpeg`, and the handshake's Encryption Field is
+  carried but not acted on.
   `KeyMaterialCif`/`KeyEncryption` parse and build the Key Material message
   the KMREQ/KMRSP extensions carry, verified byte-for-byte against gosrt's
   own `TestKM` golden vector. Everything else is still untouched and is the
@@ -1021,15 +1043,15 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
    deliberately the one that was saved for last, because it's the only one
    that changes live behavior:
    - ~~Key management~~, ~~passphrase delivery~~, ~~KM extension parsing~~,
-     ~~`SrtConnection` encrypt/decrypt~~ and ~~encrypted interop with real
-     libsrt~~ — **all done**. libsrt keys with a shared passphrase and
-     decrypts what we encrypt.
-   - **Rotation policy** is the main piece left. gosrt's
-     `kmPreAnnounce`/`kmRefreshRate` countdowns live in its `pop`, worth
-     reading before designing this; neither reference unit-tests it.
-     `EncryptionContext.switchActiveKey()` is the mechanism it would drive, and
-     `adoptingBothInstallsBothKeysSoEitherCanDecrypt` already covers the
-     receiver side of a switch.
+     ~~`SrtConnection` encrypt/decrypt~~, ~~encrypted interop with real
+     libsrt~~ and ~~key rotation~~ — **all done**. Phase 5 is
+     feature-complete.
+   - **Rotation against a real peer is untested.** The production schedule is
+     1<<24 packets, so no test drives it end to end; the inbound half (a peer
+     rotating, us adopting and acknowledging) is covered over real sockets,
+     and the schedule itself is unit-tested. Driving a real rotation would
+     need the schedule to be configurable per connection — worth doing when
+     there's a reason to expose it rather than inventing config for a test.
    - **Reverse-direction interop** (libsrt encrypts, we decrypt) is still
      unproven. `srt-live-transmit` can't drive it — reading a redirected file
      it connects but never transmits, confirmed from its own empty `pktSent`
