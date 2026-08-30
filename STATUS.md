@@ -90,8 +90,9 @@ fix still shows corruption, essentially unchanged.** A follow-up diagnostic
 only ~4-10ms after our *very first* NAK for a fresh loss — too fast to be
 explained by ACK-boundary lag (we hadn't had time to send a follow-up ACK
 yet). So the ACK-boundary fix was real and correct, but **not the dominant
-cause** of the interop symptom — a second, distinct issue remains. This is
-the actual top priority now, ahead of any Phase 5/6 work.
+cause** of the interop symptom — a second, distinct issue remains, and at
+this point became the top investigative priority (see below for how that
+investigation actually went, and "Next steps" for where it landed).
 
 **2026-08-29, later the same day: a much more thorough elimination pass**,
 prompted by direct challenge ("are you sure about them?") to verify every
@@ -149,21 +150,51 @@ negotiates or reports** — something valid-looking on the wire that still
 causes the peer's own SRT stack (libsrt, via `ffmpeg`'s client, since this
 symptom is specific to *Roast being the sender* and doesn't reproduce with
 gosrt/libsrt as the sender) to reconstruct incorrectly, despite receiving a
-complete, correctly-ordered, byte-perfect stream. **Leading candidate, not
-yet confirmed**: MSS/payload-size negotiation — already a documented known
-gap (`ListenerHandshake` skips it entirely, see "Known gaps") — since a
-peer-vs-Roast MSS mismatch is exactly the kind of thing that would be
-"correct enough to never trip an ARQ/loss counter" while still confusing the
-peer's own reassembly. **Not yet investigated** — this is the next concrete
-step, ahead of any Phase 5/6 work; see "Next steps."
+complete, correctly-ordered, byte-perfect stream.
 
-169 tests passing (128 default + 2 gated interop + 2 ACKACK/RTT + 5
+**Three further candidates were tried, all with real evidence, none of them
+the answer:**
+- **16th/17th-packet bandwidth-probe trick** — `SendBuffer` didn't implement
+  it (a documented gap), and a real libsrt receiver's own bandwidth estimate
+  was observed climbing from ~12 to ~350 Mbps over one run for a fixed
+  low-bitrate source — a real, measured anomaly consistent with the missing
+  probe. **Implemented** (ported directly from gosrt's `Push`, own test —
+  see "What's built"/"Testing methodology"), **and empirically re-tested: no
+  change** to the corruption rate. Kept anyway — it's a real, correctly-
+  grounded fix independent of this bug.
+- **MSS/payload-size negotiation** — on inspection, `ListenerHandshake`
+  already echoes back whatever MSS the caller declares (matching gosrt's own
+  behavior), and every payload actually observed on the wire (≤1316 bytes)
+  is safely under any reasonable bound. **Directly confirmed a non-issue** by
+  decoding real `CONCLUSION` handshake replies from Roast, a locally-built
+  gosrt `contrib/server`, and libsrt's `srt-live-transmit` (via another
+  `tcpdump` capture, decoded with `HandshakeCif.decode`'s own field layout):
+  MSS (1500), flow window (8192), and both latency values (120ms) are
+  **identical** across Roast and gosrt. (libsrt reports different flags and
+  its own real SRT version, as expected for a genuinely different, newer
+  implementation — not the relevant comparison, since gosrt already matches
+  Roast almost exactly here and stays clean.)
+- **Gradle daemon CPU contention** — stopped the daemon and ran `RelayDemo`
+  as a plain `java` process (no daemon competing for CPU during the repro).
+  **No change** to the corruption rate.
+
+**Where this leaves things**: negotiation is now proven identical between
+Roast and its clean-behaving gosrt counterpart, and every layer of Roast's
+own data path (content, order, loss, timing) is independently verified
+correct. Further progress likely needs heavier tooling than targeted
+hypotheses — syscall-level tracing of Roast's actual `send()` timing/spacing
+versus gosrt's, or a proper SRT-aware packet-dissector comparison — rather
+than more guesses. **Deliberately parked here, not swept under the rug**:
+documented in full in "Known gaps," revisit if a new lead surfaces or when
+picking heavier tooling up is worth the cost relative to other work.
+
+170 tests passing (128 default + 2 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
-wraparound + 10 `SendBufferTest` + 5 `SrtConnectionTest` send-side + 11
-`CallerHandshakeTest` + 3 `SrtCallerTest`), all committed to `main` (no
-branches). Every commit so far has been asked-for explicitly by the user, one
-narrowly-scoped piece at a time — see git log for the exact sequence and
-rationale (commit messages are detailed).
+wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
+`SrtConnectionTest` send-side + 11 `CallerHandshakeTest` + 3 `SrtCallerTest`),
+all committed to `main` (no branches). Every commit so far has been
+asked-for explicitly by the user, one narrowly-scoped piece at a time — see
+git log for the exact sequence and rationale (commit messages are detailed).
 
 ## What's built
 
@@ -584,6 +615,27 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   the (sole) cause. Both temporary diagnostic tools built for this
   investigation (`ReceiveDumpDemo`, `PcapAnalyzer`) were thrown away after
   use, per the established "no scope creep beyond what's asked" discipline.
+- **Comparing real negotiated handshake values across implementations,
+  2026-08-29**: to check the MSS-negotiation hypothesis for the still-open
+  corruption issue without guessing, a locally-built gosrt `contrib/server`
+  (a real gosrt-based pub/sub relay, `go build` via a fresh `brew install
+  go`) and libsrt's `srt-live-transmit` were run as listeners on separate
+  ports alongside `RelayDemo`, `ffmpeg` connected briefly to all three, and
+  a `tcpdump` capture of all three ports was decoded by hand-replicating
+  `HandshakeCif`'s exact field layout (base structure + HSREQ/HSRSP
+  extension) in a throwaway script, cross-checking the *actual* MSS/flow
+  window/latency/flags each implementation put on the wire rather than
+  reasoning about what `ListenerHandshake`'s code *should* produce. This is
+  the same "capture on loopback, decode with our own field layout" technique
+  used earlier for the ACK-boundary bug, applied to a different question
+  (comparing implementations, not confirming a bug in isolation) — worth
+  remembering as a general technique whenever "does Roast negotiate the same
+  thing a reference does" needs a real answer instead of a guess.
+- **The 16th/17th-packet bandwidth-probe trick** (`SendBuffer.push`) has, like
+  `SendBuffer` itself, no gosrt test to ground against (`send_test.go` has no
+  probe-related cases, checked directly) — the test for it is self-designed
+  against gosrt's source, same rigor tier as this codebase's RTT/drift/
+  wraparound pieces.
 
 ## Known gaps / deliberately deferred
 
@@ -610,33 +662,50 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   still shows corruption, essentially unchanged** — this fix was real and
   independently verified, but turned out not to be the dominant cause of the
   interop symptom. See the next entry.
-- **NEW, top priority: a second, distinct, not-yet-root-caused source of
-  real data corruption under sustained real throughput — narrowed
-  significantly, 2026-08-29, but not yet closed.** Found while re-verifying
-  the ACK-boundary fix above: pushing a real ffmpeg stream through
-  `RelayDemo` still shows MPEG-TS corruption at a similar rate to before the
-  fix, and control experiments with libsrt's `srt-live-transmit` and a
-  locally-built gosrt `contrib/server` both relaying the *identical* source
-  play back clean — this is real, and specific to Roast.
-  A subsequent thorough elimination pass (prompted by direct pushback on an
-  earlier, unverified "JVM/event-loop jitter" guess) directly measured, and
-  ruled out with hard evidence: OS-level network loss/corruption (full
-  `netstat -s -p udp` counter diff, zero drops or checksum errors), SRT
-  protocol-level loss (zero across both Roast's own counters and an
-  independent libsrt receiver's `pktRcvLoss`/`pktRcvDrop` stats), content
-  corruption or reordering anywhere in the pipeline (CRC32-verified
-  end-to-end — decode → buffer → relay → encode → **actual wire bytes**,
-  the last leg confirmed via a real `tcpdump` capture decoded with our own
-  codec, zero mismatches), and event-loop scheduling lag (tick timing
-  instrumented directly; ticks fire on schedule, no lag found). See "Where
-  we are" for the full list and "Testing methodology" for how each was
-  checked. **Leading candidate, not yet confirmed**: a protocol-level
-  parameter Roast doesn't correctly negotiate — MSS/payload-size is the
-  prime suspect, since it's already a documented gap (`ListenerHandshake`
-  skips it) and is exactly the kind of mismatch that would stay invisible to
-  every loss/drop counter while still confusing the peer's own reassembly.
-  **Not yet root-caused** — needs its own investigation pass before Phase
-  5/6 work; see "Next steps."
+- **PARKED, deeply investigated, still unresolved: a second, distinct source
+  of real data corruption under sustained real throughput.** Found while
+  re-verifying the ACK-boundary fix above: pushing a real ffmpeg stream
+  through `RelayDemo` shows MPEG-TS corruption at a real, measurable rate;
+  control experiments with libsrt's `srt-live-transmit` and a locally-built
+  gosrt `contrib/server` both relaying the *identical* source play back
+  clean — this is real, and specific to Roast, not the test setup or an
+  artifact of ffmpeg's own strictness.
+
+  **Ruled out, each with a real measurement, not an assumption** (see "Where
+  we are" and "Testing methodology" for exactly how each was checked):
+  - OS-level network loss/corruption — full `netstat -s -p udp` counter
+    diff across a repro run: zero drops, zero checksum/length errors.
+  - SRT protocol-level loss — zero across both Roast's own counters and an
+    independent libsrt receiver's `pktRcvLoss`/`pktRcvDrop`/`pktRcvRetrans`
+    stats.
+  - Content corruption or reordering anywhere in the pipeline — CRC32
+    cross-checked end-to-end: decode → buffer → relay → encode → **actual
+    wire bytes**, the last leg confirmed via a real `tcpdump` capture
+    decoded with our own codec. Zero mismatches at every stage.
+  - Event-loop scheduling lag — `tick()` timing instrumented directly; ticks
+    fire on schedule, no lag found.
+  - The 16th/17th-packet bandwidth-probe trick's absence — implemented (see
+    "What's built"), re-tested empirically: no change.
+  - MSS/payload-size negotiation — inspected (`ListenerHandshake` already
+    echoes the caller's declared MSS, matching gosrt; every observed payload
+    is safely under any reasonable bound), then **directly confirmed** via a
+    real handshake-reply diff: Roast and a locally-built gosrt
+    `contrib/server` negotiate MSS (1500), flow window (8192), and both
+    latency values (120ms) **identically** in response to the same `ffmpeg`
+    connection. (libsrt's own reply differs in flags/version, but that's
+    expected for a different, newer implementation — not the relevant
+    comparison, since gosrt already matches Roast closely here and stays
+    clean.)
+  - Gradle daemon CPU contention — ran `RelayDemo` as a plain `java` process
+    with the daemon stopped; no change.
+
+  **Not yet root-caused.** With negotiation proven identical to a
+  clean-behaving reference and every layer of Roast's own data path
+  independently verified correct, further progress needs heavier tooling
+  (syscall-level send timing/spacing comparison, or a proper SRT packet
+  dissector) rather than more targeted hypotheses — a deliberate stopping
+  point, not an abandoned trail. Revisit if a new lead surfaces; see "Next
+  steps" for what to work on meanwhile.
 - ~~No RTT measurement~~ **Closed** — `SrtConnection` now tracks real RTT/RTTVar
   from ACK/ACKACK round trips and feeds them to `AckSender.tick` and the
   periodic NAK interval; see "What's built" and "Testing methodology" (the
@@ -681,33 +750,27 @@ directly from libsrt's own source, not assumed). Both skip themselves via
 
 ## Next steps, in order
 
-1. **Root-cause the second, still-open real-throughput corruption issue**
-   (see "Known gaps" — top priority, ahead of any Phase 5/6 work). Network
-   loss, SRT-protocol-level loss, content/order corruption anywhere in the
-   pipeline (verified all the way to actual wire bytes), and event-loop
-   scheduling lag are all now directly ruled out with real measurements, not
-   assumptions — see "Testing methodology" for exactly how. Next concrete
-   step: investigate MSS/payload-size negotiation specifically (the leading
-   remaining candidate, and an already-documented gap in `ListenerHandshake`)
-   — check what `ffmpeg`'s libsrt client actually negotiates/expects for MSS
-   during the handshake and whether Roast's unconditional "just use gosrt's
-   baseline default" response diverges from it in a way that would stay
-   invisible to loss counters but still confuse the peer's own reassembly.
-2. Real interop confirming `SrtCaller` against libsrt/gosrt acting as
+1. Real interop confirming `SrtCaller` against libsrt/gosrt acting as
    *listener* — needs `srt-live-transmit` launched with `mode=listener` in its
    URI (the existing interop tests always run it as caller). The connection
    lifecycle's structural gaps are otherwise closed; this is proof against an
    independent implementation, matching how every other piece here eventually
    got that treatment.
-3. With both `SrtListener`/`SrtCaller` and full send/receive paths in place,
+2. With both `SrtListener`/`SrtCaller` and full send/receive paths in place,
    the natural next major milestone is DESIGN.md's Phase 6 (multiplexing &
    polish) or Phase 5 (encryption) — worth a deliberate choice with the user
    rather than assumed, since both are substantial and neither is blocking
    the other.
-4. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
+3. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
    against `SrtListener`, for full belt-and-suspenders confidence beyond
    `srt-live-transmit` — not expected to surface anything new, since ffmpeg
    wraps the same libsrt handshake code already exercised.
+4. **Parked**: root-causing the still-open real-throughput corruption issue
+   (see "Known gaps") — every cheap, targeted hypothesis has been eliminated
+   with real measurements; what's left needs heavier tooling (syscall-level
+   send timing/spacing comparison against gosrt, or a proper SRT packet
+   dissector). Worth returning to with fresh eyes or better tooling rather
+   than more guesses, and not blocking the items above.
 
 ## How to pick this back up
 
