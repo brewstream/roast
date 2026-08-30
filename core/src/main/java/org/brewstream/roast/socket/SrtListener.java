@@ -168,12 +168,31 @@ public final class SrtListener {
                         request.srtSocketId(), msg.sender());
                 return;
             }
+            // The Encryption Field names the cipher family and key size (Table 2:
+            // 2 = AES-128, 3 = AES-192, 4 = AES-256, i.e. the key length in
+            // 8-byte units), and the key material states the length again in its
+            // own KLen. When the peer advertises a specific method the two must
+            // agree - disagreement means malformed, not unauthenticated, so it
+            // isn't a BADSECRET case. Zero means "no specific method advertised",
+            // which is what gosrt always sends, so there is nothing to check.
+            int advertisedKeyLength = request.encryptionField() * 8;
+            if (request.encryptionField() != 0 && advertisedKeyLength != request.keyMaterial().keyLength()) {
+                LOG.log(Level.FINE, "Rejecting {0}: Encryption Field says {1} bytes, key material says {2}",
+                        new Object[]{msg.sender(), advertisedKeyLength, request.keyMaterial().keyLength()});
+                send(listenerHandshake.buildRejectResponse(request, RejectionReason.ROGUE),
+                        request.srtSocketId(), msg.sender());
+                return;
+            }
+
             encryptionContext = EncryptionContext.awaitingPeerKeys(accepted.passphrase(), accepted.keyLength());
             if (!encryptionContext.adopt(request.keyMaterial())) {
-                // Wrong passphrase, or key material we can't use - the one case
-                // BADSECRET exists for.
                 encryptionContext.destroy();
-                send(listenerHandshake.buildRejectResponse(request, RejectionReason.BADSECRET),
+                // A key shorter than the application asked for is a downgrade, not
+                // a bad secret - say so, rather than blaming the passphrase.
+                RejectionReason reason = request.keyMaterial().keyLength() < accepted.keyLength()
+                        ? RejectionReason.UNSECURE
+                        : RejectionReason.BADSECRET;
+                send(listenerHandshake.buildRejectResponse(request, reason),
                         request.srtSocketId(), msg.sender());
                 return;
             }

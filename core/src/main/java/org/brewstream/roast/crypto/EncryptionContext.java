@@ -70,7 +70,7 @@ public final class EncryptionContext {
     private static final long DEFAULT_KM_PRE_ANNOUNCE = 1L << 12;
 
     private final char[] passphrase;
-    private final int keyLength;
+    private int keyLength;
     private final long kmRefreshRate;
     private final long kmPreAnnounce;
 
@@ -102,6 +102,15 @@ public final class EncryptionContext {
      * A context that will receive its keys from the peer's Key Material message
      * — the receiving side of a stream. Holds no keys until {@link #adopt}
      * succeeds.
+     *
+     * <p>{@code minimumKeyLength} is a <em>floor</em>, not an exact match. A
+     * receiving side does not choose the key length: the peer generates the keys
+     * and announces their size, and SRT treats that announcement as
+     * authoritative. Demanding an exact match would reject a peer using stronger
+     * keys than we asked for, and — worse — it used to surface as a
+     * {@code BADSECRET} rejection, blaming the passphrase for what is really a
+     * size disagreement. A peer offering keys <em>shorter</em> than asked for is
+     * still refused: that would be a silent downgrade.
      */
     public static EncryptionContext awaitingPeerKeys(char[] passphrase, int keyLength) {
         return new EncryptionContext(passphrase, keyLength, DEFAULT_KM_REFRESH_RATE, DEFAULT_KM_PRE_ANNOUNCE);
@@ -194,8 +203,18 @@ public final class EncryptionContext {
      * nothing here changes.
      */
     public boolean adopt(KeyMaterialCif km) {
-        if (km == null || km.isError() || km.keyEncryption() == null || km.keyLength() != keyLength) {
+        if (km == null || km.isError() || km.keyEncryption() == null) {
             return false;
+        }
+        int announced = km.keyLength();
+        if (announced != 16 && announced != 24 && announced != 32) {
+            return false;
+        }
+        if (announced < keyLength && !hasAnyKey()) {
+            return false; // a shorter key than we asked for is a downgrade
+        }
+        if (hasAnyKey() && announced != keyLength) {
+            return false; // a mid-stream rotation must not change the key length
         }
 
         // The peer's salt takes effect BEFORE the KEK is derived - see the class javadoc.
@@ -204,24 +223,25 @@ public final class EncryptionContext {
             return false; // no salt from the peer and none of our own to fall back on
         }
 
-        byte[] kek = StreamKeyWrapper.deriveKeyEncryptingKey(passphrase, effectiveSalt, keyLength);
+        byte[] kek = StreamKeyWrapper.deriveKeyEncryptingKey(passphrase, effectiveSalt, announced);
         byte[] unwrapped;
         try {
             unwrapped = StreamKeyWrapper.unwrap(kek, km.wrap());
         } finally {
             Arrays.fill(kek, (byte) 0);
         }
-        if (unwrapped == null || unwrapped.length != keyLength * km.keyEncryption().keyCount()) {
+        if (unwrapped == null || unwrapped.length != announced * km.keyEncryption().keyCount()) {
             return false;
         }
 
+        keyLength = announced;
         salt = effectiveSalt;
         switch (km.keyEncryption()) {
             case EVEN -> evenSek = unwrapped;
             case ODD -> oddSek = unwrapped;
             case BOTH -> {
-                evenSek = Arrays.copyOfRange(unwrapped, 0, keyLength);
-                oddSek = Arrays.copyOfRange(unwrapped, keyLength, keyLength * 2);
+                evenSek = Arrays.copyOfRange(unwrapped, 0, announced);
+                oddSek = Arrays.copyOfRange(unwrapped, announced, announced * 2);
             }
         }
         // A peer that sends only one key is telling us that is the one in use.
@@ -381,6 +401,16 @@ public final class EncryptionContext {
      * rather than via {@link #hasKeys()}, since a peer may send using a key we
      * were never given even while our own active key is fine.
      */
+    /** Whether either SEK is held — i.e. whether the key length is settled. */
+    private boolean hasAnyKey() {
+        return evenSek != null || oddSek != null;
+    }
+
+    /** The key length in use, in bytes: what was configured, or what the peer announced. */
+    public int keyLength() {
+        return keyLength;
+    }
+
     private boolean canUse(KeyEncryption key) {
         return salt != null && key != null && key != KeyEncryption.BOTH && keyFor(key) != null;
     }

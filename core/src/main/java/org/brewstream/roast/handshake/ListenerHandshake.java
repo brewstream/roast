@@ -122,10 +122,12 @@ public final class ListenerHandshake {
      * returns the identical message to confirm. Pass {@code null} for an
      * unencrypted connection.
      *
-     * <p>The response's Encryption Field carries the agreed key length in
-     * 4-byte units (draft-sharabayko-srt.md's Table 2: {@code 2} = 16 bytes,
-     * {@code 3} = 24, {@code 4} = 32), which is how a peer learns the size
-     * without parsing the key material itself.
+     * <p>The response's Encryption Field names the cipher family and key size
+     * (draft-sharabayko-srt.md's Table 2: {@code 2} = AES-128 i.e. 16 bytes,
+     * {@code 3} = AES-192 / 24, {@code 4} = AES-256 / 32 — so the field is the
+     * key length in <em>8</em>-byte units, not 4). {@code 0} means "no specific
+     * method advertised", which is what gosrt always sends; a peer must then
+     * take the length from the key material itself.
      */
     public HandshakeCif buildAcceptResponse(HandshakeCif request, SrtSocketId assignedSocketId,
             int ourReceiveTsbpdDelayMillis, int ourSendTsbpdDelayMillis, KeyMaterialCif keyMaterial) {
@@ -138,7 +140,7 @@ public final class ListenerHandshake {
 
         boolean hasStreamId = request.streamId() != null && !request.streamId().isEmpty();
         int extensionField = 1 | (keyMaterial != null ? 2 : 0) | (hasStreamId ? 4 : 0);
-        int encryptionField = keyMaterial != null ? keyMaterial.keyLength() / 4 : 0;
+        int encryptionField = keyMaterial != null ? keyMaterial.keyLength() / 8 : 0;
 
         return new HandshakeCif(
                 false, 5, encryptionField, extensionField,

@@ -101,13 +101,45 @@ class EncryptionContextTest {
         assertThat(receiver.hasKeys()).isFalse();
     }
 
+    /**
+     * A receiving side does not choose the key length - the peer generates the
+     * keys and announces their size. Stronger than asked for is fine.
+     */
     @Test
-    void aKeyLengthMismatchIsRejected() {
+    void aPeerAnnouncingLongerKeysThanAskedForIsAccepted() {
         EncryptionContext sender = EncryptionContext.generating(passphrase(), 32);
         EncryptionContext receiver = EncryptionContext.awaitingPeerKeys(passphrase(), 16);
 
+        assertThat(receiver.adopt(sender.keyMaterial(KeyEncryption.BOTH))).isTrue();
+        assertThat(receiver.keyLength()).isEqualTo(32);
+
+        byte[] original = payload();
+        byte[] wire = original.clone();
+        sender.encrypt(wire, 3);
+        assertThat(receiver.decrypt(wire, 3, sender.activeKey())).isTrue();
+        assertThat(wire).isEqualTo(original);
+    }
+
+    /** Shorter than asked for is a silent downgrade, and must not be accepted. */
+    @Test
+    void aPeerAnnouncingShorterKeysThanAskedForIsRefused() {
+        EncryptionContext sender = EncryptionContext.generating(passphrase(), 16);
+        EncryptionContext receiver = EncryptionContext.awaitingPeerKeys(passphrase(), 32);
+
         assertThat(receiver.adopt(sender.keyMaterial(KeyEncryption.BOTH))).isFalse();
         assertThat(receiver.hasKeys()).isFalse();
+    }
+
+    /** Once keys are held, a rotation may replace them but must not change their size. */
+    @Test
+    void aMidStreamKeyLengthChangeIsRefused() {
+        EncryptionContext sender = EncryptionContext.generating(passphrase(), 16);
+        EncryptionContext receiver = EncryptionContext.awaitingPeerKeys(passphrase(), 16);
+        assertThat(receiver.adopt(sender.keyMaterial(KeyEncryption.BOTH))).isTrue();
+
+        EncryptionContext longerKeys = EncryptionContext.generating(passphrase(), 32);
+        assertThat(receiver.adopt(longerKeys.keyMaterial(KeyEncryption.ODD))).isFalse();
+        assertThat(receiver.keyLength()).isEqualTo(16);
     }
 
     @Test

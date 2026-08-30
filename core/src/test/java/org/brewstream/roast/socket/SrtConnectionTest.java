@@ -338,7 +338,7 @@ class SrtConnectionTest {
         EncryptionContext peer = EncryptionContext.generating(TEST_PASSPHRASE, 16);
         HandshakeCif inductionReply = sendAndReceiveHandshake(inductionRequest());
         HandshakeCif conclusion = new HandshakeCif(
-                true, 5, 4, 7, seq(1), 1500, DEFAULT_FLOW_WINDOW, HandshakeType.CONCLUSION.code(),
+                true, 5, 2, 7, seq(1), 1500, DEFAULT_FLOW_WINDOW, HandshakeType.CONCLUSION.code(),
                 CALLER_SOCKET_ID, inductionReply.synCookie(), LOCALHOST,
                 new HandshakeExtension(0x010401,
                         new HandshakeExtensionFlags(true, true, true, true, true, true, false, false), 120, 120),
@@ -401,7 +401,7 @@ class SrtConnectionTest {
         EncryptionContext peer = EncryptionContext.generating("the-wrong-one".toCharArray(), 16);
         HandshakeCif inductionReply = sendAndReceiveHandshake(inductionRequest());
         HandshakeCif conclusion = new HandshakeCif(
-                true, 5, 4, 7, seq(1), 1500, DEFAULT_FLOW_WINDOW, HandshakeType.CONCLUSION.code(),
+                true, 5, 2, 7, seq(1), 1500, DEFAULT_FLOW_WINDOW, HandshakeType.CONCLUSION.code(),
                 CALLER_SOCKET_ID, inductionReply.synCookie(), LOCALHOST,
                 new HandshakeExtension(0x010401,
                         new HandshakeExtensionFlags(true, true, true, true, true, true, false, false), 120, 120),

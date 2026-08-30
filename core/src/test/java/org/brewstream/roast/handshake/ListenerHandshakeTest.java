@@ -2,6 +2,9 @@ package org.brewstream.roast.handshake;
 
 import org.brewstream.roast.packet.SrtPacket;
 import org.brewstream.roast.packet.SrtSocketId;
+import org.brewstream.roast.packet.cif.KeyMaterialCif;
+import org.brewstream.roast.packet.cif.KeyEncryption;
+import org.brewstream.roast.crypto.EncryptionContext;
 import org.brewstream.roast.packet.cif.HandshakeCif;
 import org.brewstream.roast.packet.cif.HandshakeExtension;
 import org.brewstream.roast.packet.cif.HandshakeExtensionFlags;
@@ -9,6 +12,8 @@ import org.brewstream.roast.packet.cif.HandshakeType;
 import org.brewstream.roast.packet.cif.RejectionReason;
 import org.brewstream.roast.util.CircularNumber;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.ParameterizedTest;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
@@ -31,6 +36,41 @@ class ListenerHandshakeTest {
     private static InetAddress callerAddress() throws UnknownHostException {
         return InetAddress.getByName("203.0.113.5");
     }
+
+
+    /**
+     * The accept response's Encryption Field names the cipher family and key
+     * size per draft-sharabayko-srt.md Table 2 - 2 = AES-128 (16 bytes), 3 =
+     * AES-192 (24), 4 = AES-256 (32), i.e. the key length in EIGHT-byte units.
+     * Dividing by 4 instead still yields a legal-looking value, so nothing local
+     * catches it; real libsrt rejected the handshake outright, which is how the
+     * mistake was found. Pinned down here so it can't come back silently.
+     */
+    @ParameterizedTest
+    @CsvSource({"16, 2", "24, 3", "32, 4"})
+    void theAcceptResponseAdvertisesTheKeySizePerTableTwo(int keyLength, int expectedField)
+            throws UnknownHostException {
+        EncryptionContext context = EncryptionContext.generating("a-test-passphrase".toCharArray(), keyLength);
+        KeyMaterialCif keyMaterial = context.keyMaterial(KeyEncryption.BOTH);
+
+        HandshakeCif response = listener().buildAcceptResponse(
+                validConclusionRequest(), SrtSocketId.of(7), 120, 120, keyMaterial);
+
+        assertThat(response.encryptionField()).isEqualTo(expectedField);
+        assertThat(response.encryptionField() * 8).isEqualTo(keyLength);
+        assertThat(response.keyMaterial()).isNotNull();
+    }
+
+    /** No key material means no advertised method - which is also what gosrt always sends. */
+    @Test
+    void anUnencryptedAcceptResponseAdvertisesNoEncryptionMethod() throws UnknownHostException {
+        HandshakeCif response = listener().buildAcceptResponse(
+                validConclusionRequest(), SrtSocketId.of(7), 120, 120, null);
+
+        assertThat(response.encryptionField()).isZero();
+        assertThat(response.keyMaterial()).isNull();
+    }
+
 
     private static SynCookie deterministicCookie() {
         return new SynCookie(
