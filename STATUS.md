@@ -223,11 +223,12 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-181 tests passing (128 default + 3 gated interop + 2 ACKACK/RTT + 5
+193 tests passing (128 default + 3 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
-`ReceiveRateEstimatorTest` + 11 `CallerHandshakeTest` + 3 `SrtCallerTest`),
+`ReceiveRateEstimatorTest` + 12 `KeyMaterialCifTest` + 11 `CallerHandshakeTest`
++ 3 `SrtCallerTest`),
 all committed to `main` (no branches). Every commit so far has been asked-for
 explicitly by the user, one narrowly-scoped piece at a time — see git log for
 the exact sequence and rationale (commit messages are detailed).
@@ -247,7 +248,10 @@ frames the fixed header.
   `HandshakeExtensionFlags`, `ExtensionType`, `RejectionReason`, `PeerAddressCodec`)
   — the 48-byte handshake base structure, plus HSREQ/HSRSP and SID extension TLVs.
   KMREQ/KMRSP (encryption) and Congestion Control extensions are recognized but
-  skipped by declared length, not parsed. Verified against gosrt's
+  skipped by declared length, not parsed — note that the KM message *body* now
+  has a codec (`KeyMaterialCif`, below); `HandshakeCif` just doesn't invoke it
+  yet, which is the first thing Phase 5's wiring step will change. Verified
+  against gosrt's
   `TestHandshakeV4`/`V5` golden vectors (with the KM/Congestion portions of V5
   stripped out, since those aren't parsed).
   `handshakeTypeCode` is a raw int, not a closed enum — any value outside the 5
@@ -256,6 +260,18 @@ frames the fixed header.
 - `AckCif`/`AckVariant` — the ACK CIF's three wire variants (Lite 4B / Small 16B /
   Full 28B, determined by encoded length, not a marker field), verified against
   gosrt's `TestFullACK`/`TestSmallACK`/`TestLiteACK` golden vectors.
+- `KeyMaterialCif`/`KeyEncryption` — the Key Material message the KMREQ/KMRSP
+  extensions carry (16-byte header, optional 16-byte salt, wrapped SEK(s)),
+  verified byte-for-byte against gosrt's `TestKM` golden vector. **Wire format
+  only** — the wrapped key bytes are opaque here; no PBKDF2, key wrapping, or
+  AES-CTR (see "Known gaps"). Two deliberate departures from gosrt's struct,
+  both in the javadoc: the 4-byte rejection form folds into the same record via
+  `isError()`/`errorCode()` (mirroring `HandshakeCif`'s own rejection handling
+  rather than adding a second type), and the nine fields with exactly one legal
+  value are validated on decode and written as constants on encode rather than
+  round-tripped. `KeyEncryption` (the KK field) deliberately has no constant
+  for `00`: legal in a DATA header, explicitly invalid in a Key Material
+  message, which is this enum's only use.
 
 **`codec`** — `SrtFrameDecoder`/`SrtFrameEncoder`, Netty
 `MessageToMessage(De|En)coder`s bridging `DatagramPacket` ↔ `SrtPacket`, preserving
@@ -750,7 +766,16 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   skipped in `ListenerHandshake` for lack of a config object; noted inline there.
 - **No `SrtConfig`** — `SrtListener` hardcodes 120ms latency (both directions)
   and SRT version `0x010401` (matching gosrt's own baseline).
-- **Encryption** (KMREQ/KMRSP, PBKDF2, AES-CTR) — Phase 5 in DESIGN.md, untouched.
+- **Encryption** (Phase 5 in DESIGN.md) — **started, wire format only**.
+  `KeyMaterialCif`/`KeyEncryption` parse and build the Key Material message
+  the KMREQ/KMRSP extensions carry, verified byte-for-byte against gosrt's
+  own `TestKM` golden vector. Everything else is still untouched and is the
+  bulk of the phase: PBKDF2 key derivation from a passphrase, AES key wrap/
+  unwrap of the SEKs (the `wrap` field is carried as opaque bytes today),
+  AES-CTR payload encryption, even/odd key rotation with pre-announce, and
+  wiring any of it into `ListenerHandshake`/`CallerHandshake`/`SrtConnection`.
+  Deliberately stopped at the codec so nothing is half-wired into the
+  connection path — see "Next steps".
 - ~~Caller-side handshake~~ **Closed** — `SrtCaller`/`CallerHandshake`; see
   "What's built" and "Testing methodology". No HSv4 fallback and no
   induction/conclusion retry-with-backoff, both matching gosrt's own
@@ -869,17 +894,33 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
 
 ## Next steps, in order
 
-1. ~~Real interop confirming `SrtCaller` against libsrt acting as *listener*~~
-   — **done**, see "Where we are" and `LibsrtInteropTest`. **This is the
-   decision point**: with both roles proven against an independent
-   implementation in both directions, and the ACK CIF now free of
-   placeholders, there's no known correctness gap left blocking a choice
-   between Phase 5 and Phase 6 (below).
-2. With both `SrtListener`/`SrtCaller` and full send/receive paths in place,
-   the natural next major milestone is DESIGN.md's Phase 6 (multiplexing &
-   polish) or Phase 5 (encryption) — worth a deliberate choice with the user
-   rather than assumed, since both are substantial and neither is blocking
-   the other.
+1. **Continue Phase 5 (encryption), in this order** — the wire format is done
+   (`KeyMaterialCif`, see "What's built"); everything below is untouched. The
+   split matters: steps a-c are pure, testable functions with real reference
+   tests to port, and none of them touch the connection path, so each is a
+   safe stopping point. Only step d changes live behavior.
+   1. **PBKDF2** — derive the key-encrypting key from the passphrase
+      (SHA-1, 2048 iterations, the KM message's salt). `javax.crypto`'s
+      `PBKDF2WithHmacSHA1` covers this; no third-party dependency needed.
+   2. **AES key wrap/unwrap** (RFC 3394) of the SEKs, filling in
+      `KeyMaterialCif.wrap()`'s currently-opaque bytes. gosrt pulls in an
+      external keywrap package; the JDK exposes this as the `AESWrap` cipher,
+      worth confirming before assuming. **Ground against gosrt's
+      `crypto_test.go` `TestMarshal`/`TestUnmarshal`**, which are exactly
+      these two operations and carry golden vectors for all three key
+      lengths.
+   3. **AES-CTR payload encrypt/decrypt**, keyed by the packet sequence
+      number — port gosrt's `TestEncode`/`TestDecode`, which pin the counter
+      construction down with a golden vector.
+   4. **Wiring**: KM extension parsing in `HandshakeCif`, passphrase config
+      on both handshake sides, encrypt-on-send/decrypt-on-receive in
+      `SrtConnection`, then even/odd key rotation with pre-announce. This is
+      the step that needs real interop testing against libsrt with a
+      passphrase, and the one worth having quota headroom for.
+2. Phase 6 (multiplexing & polish) — the alternative major milestone,
+   independent of Phase 5 and not blocked by it. Many connections per port,
+   live pollable stats, and the `srt-java-live-transmit` CLI that `RelayDemo`
+   is a rough prototype of.
 3. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
    against `SrtListener`, for full belt-and-suspenders confidence beyond
    `srt-live-transmit` — not expected to surface anything new, since ffmpeg
