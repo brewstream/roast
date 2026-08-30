@@ -573,6 +573,41 @@ class SrtConnectionTest {
         caller.send(new DatagramPacket(bytes, bytes.length, listener.localAddress()));
     }
 
+
+    /**
+     * SRT live mode sends exactly one packet per write and does not split
+     * messages, so an oversized payload has nowhere to go. It used to be handed
+     * straight to the encoder, producing a datagram larger than the MTU with no
+     * error at all — the caller had no way to learn its data went nowhere.
+     * libsrt rejects the same case rather than fragmenting.
+     */
+    @Test
+    void writingMoreThanOnePacketWorthIsRejectedRatherThanSilentlyOversized() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        int limit = connection.metadata().maxPayloadSize();
+        assertThat(limit).isEqualTo(1456); // 1500 MTU - 28 (IP+UDP) - 16 (SRT)
+
+        ByteBuf tooBig = Unpooled.wrappedBuffer(new byte[limit + 1]);
+
+        assertThatThrownBy(() -> connection.write(tooBig))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("exceeds")
+                .hasMessageContaining("chunk");
+        assertThat(tooBig.refCnt()).as("the rejected payload must not leak").isZero();
+    }
+
+    @Test
+    void aPayloadExactlyAtTheLimitIsAccepted() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        int limit = connection.metadata().maxPayloadSize();
+
+        connection.write(Unpooled.wrappedBuffer(new byte[limit]));
+
+        DataPacket sent = receiveData();
+        assertThat(sent.body().readableBytes()).isEqualTo(limit);
+        sent.body().release();
+    }
+
     private SrtConnection connectAndAccept() throws Exception {
         return connectAndAccept(DEFAULT_FLOW_WINDOW);
     }

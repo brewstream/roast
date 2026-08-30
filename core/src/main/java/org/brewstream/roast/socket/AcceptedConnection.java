@@ -18,7 +18,24 @@ public record AcceptedConnection(
         int receiveLatencyMillis,
         int sendLatencyMillis,
         int srtVersion,
-        int flowWindowSize) {
+        int flowWindowSize,
+        int maxTransmissionUnitSize) {
+
+    /** Without a negotiated MTU — falls back to SRT's standard 1500. */
+    public AcceptedConnection(SrtSocketId socketId, SrtSocketId peerSocketId, InetSocketAddress peerAddress,
+            String streamId, int receiveLatencyMillis, int sendLatencyMillis, int srtVersion, int flowWindowSize) {
+        this(socketId, peerSocketId, peerAddress, streamId, receiveLatencyMillis, sendLatencyMillis,
+                srtVersion, flowWindowSize, 1500);
+    }
+
+    /**
+     * The largest payload one DATA packet can carry on this connection: the
+     * negotiated MTU less the IP+UDP (28) and SRT (16) headers. libsrt names the
+     * same figure {@code SRT_LIVE_MAX_PLSIZE} (1456 at the standard 1500 MTU).
+     */
+    public int maxPayloadSize() {
+        return maxTransmissionUnitSize - 28 - 16;
+    }
 
     /**
      * The flow window agreed during the handshake, in packets — both sides of

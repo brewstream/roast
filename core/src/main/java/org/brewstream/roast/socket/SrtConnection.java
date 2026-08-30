@@ -255,6 +255,17 @@ public final class SrtConnection {
      * queue). A no-op (payload released) once {@link #close}d.
      */
     public void write(ByteBuf payload) {
+        // Checked here, not inside the event-loop task below: an exception thrown
+        // there would be swallowed by Netty and the caller would never learn its
+        // payload went nowhere.
+        int maxPayloadSize = metadata.maxPayloadSize();
+        if (payload.readableBytes() > maxPayloadSize) {
+            int size = payload.readableBytes();
+            payload.release();
+            throw new IllegalArgumentException("payload of " + size + " bytes exceeds this connection's "
+                    + maxPayloadSize + "-byte limit; live mode sends one packet per write and does not "
+                    + "split messages, so the caller must chunk");
+        }
         channel.eventLoop().execute(() -> {
             if (closed.get()) {
                 payload.release();

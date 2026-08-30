@@ -255,7 +255,7 @@ public final class SrtCaller {
             AcceptedConnection metadata = new AcceptedConnection(
                     ownSocketId, reply.srtSocketId(), remoteAddress, streamId,
                     connected.receiveLatencyMillis(), connected.sendLatencyMillis(), connected.srtVersion(),
-                    reply.maxFlowWindowSize());
+                    reply.maxFlowWindowSize(), reply.maxTransmissionUnitSize());
             SrtConnection connection = new SrtConnection(channel, demultiplexer, metadata, ownInitialSequenceNumber,
                     () -> {
                         channel.close();

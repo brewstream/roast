@@ -208,7 +208,7 @@ public final class SrtListener {
         AcceptedConnection metadata = new AcceptedConnection(
                 assignedSocketId, request.srtSocketId(), msg.sender(), request.streamId(),
                 negotiated.receiveTsbpdDelayMillis(), negotiated.sendTsbpdDelayMillis(), negotiated.srtVersion(),
-                response.maxFlowWindowSize());
+                response.maxFlowWindowSize(), response.maxTransmissionUnitSize());
 
         // Everything that must be ready for inbound DATA happens BEFORE the accept
         // response goes out: constructing the connection registers it with the
