@@ -223,7 +223,7 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-278 tests passing (128 default + 6 gated interop + 2 ACKACK/RTT + 5
+281 tests passing (128 default + 6 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
@@ -882,6 +882,15 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `ReceiveRateEstimatorTest`'s consuming half are both self-designed against
   gosrt's source — same rigor tier as this codebase's RTT/drift/wraparound
   pieces, not the stronger ported-scenario tier.
+- **Loopback hides an entire class of bug, 2026-08-30.** Two defects survived
+  the whole project because every test ran over a perfect local link:
+  `SrtCaller` sent each handshake step exactly once (a single dropped INDUCTION
+  or CONCLUSION killed the connect), and the ACK's available-buffer figure was
+  hardcoded to 0 (see "Known gaps"). Neither is subtle once a lossy path or a
+  real peer is in play; neither was visible without one. Worth remembering that
+  "all tests pass on loopback" says little about a protocol whose entire job is
+  coping with loss — and that the loss harness for exactly this had existed,
+  unused, since Phase 0.
 - **A harness nobody can call is a harness nobody uses, 2026-08-30.**
   `UdpLossProxy` was built in Phase 0 specifically to satisfy Phases 3 and 4's
   "recovered via ARQ under induced loss" definition of done, and then sat
@@ -921,9 +930,11 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
 
 ## Known gaps / deliberately deferred
 
-- **MSS/payload-size negotiation** when a peer advertises a smaller MTU than
-  ours, and **Congestion Control extension** parsing/mismatch rejection — both
-  skipped in `ListenerHandshake` for lack of a config object; noted inline there.
+- **MSS/payload-size negotiation** — the negotiated MTU is now carried on
+  `AcceptedConnection` and bounds `write`, but `ListenerHandshake` still echoes
+  the peer's value rather than negotiating down to our own limit (no config
+  object to hold ours). **Congestion Control extension** parsing/mismatch
+  rejection is still skipped entirely; noted inline there.
 - **No `SrtConfig`** — `SrtListener` hardcodes 120ms latency (both directions)
   and SRT version `0x010401` (matching gosrt's own baseline).
 - **Encryption** (Phase 5 in DESIGN.md) — **feature-complete and proven
@@ -950,12 +961,11 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
 - ~~Caller-side handshake~~ **Closed** — `SrtCaller`/`CallerHandshake`,
   including **encryption** (the caller generates the keys and announces them;
   see "What's built"). No HSv4 fallback, matching gosrt.
-- **`SrtCaller` does not retry its handshake**, matching gosrt's `dial.go` but
-  unlike real libsrt, which retries with backoff. Usually invisible; on a lossy
-  link it is not — a dropped INDUCTION or CONCLUSION fails the connect
-  outright, which is exactly what happened on the first run of
-  `ArqUnderLossTest` and is why that test enables loss only after connecting.
-  Worth closing before anyone runs Roast over a real lossy network.
+- ~~`SrtCaller` does not retry its handshake~~ **Closed, 2026-08-30** — it now
+  repeats whichever step is unanswered every 250ms (libsrt's own rule),
+  bounded by the 5s connect timeout. One of the few places Roast deliberately
+  goes beyond gosrt, which doesn't retry either: loopback-only testing was what
+  made this look unnecessary. Verified by connecting through 20% loss.
 - ~~The ACK boundary stays frozen behind the oldest unresolved gap for the
   full TLPKTDROP window, starving the peer's send buffer~~ **Closed,
   2026-08-29** — `ReceiveBuffer.computeAckBoundary` now ports gosrt's real
@@ -1055,8 +1065,12 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
     is informational only (nothing spaces packets out beyond each one's own
     scheduled send time); actual rate-limited output, if ever needed, isn't
     implemented by gosrt's "live" congestion control either.
-  - **Message chunking/MSS** — `write(ByteBuf)` sends exactly one DATA packet
-    per call, no splitting; matches the existing "no MSS negotiation" gap.
+  - **Message chunking** — `write(ByteBuf)` still sends exactly one DATA packet
+    per call and does not split messages, but it no longer fails silently:
+    anything over the connection's `maxPayloadSize()` is rejected with a clear
+    error, matching libsrt's live-mode behaviour. Actually splitting a message
+    needs receive-side reassembly (the packet-position flags), which is Phase
+    7's "message mode".
   - **Full send-side stats** (gosrt's `Stats()`: `estimatedInputBW`/
     `estimatedSentBW`/`pktLossRate`) and the 16th/17th-packet bandwidth-probe
     trick — both deliberately not ported, see `SendBuffer`'s javadoc.
