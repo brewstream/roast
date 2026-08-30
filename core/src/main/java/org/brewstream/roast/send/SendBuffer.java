@@ -53,9 +53,9 @@ import java.util.function.Consumer;
  *
  * <p>Deliberately deferred, not part of this class: full bandwidth-rate-window
  * statistics ({@code estimatedInputBW}/{@code estimatedSentBW}/{@code
- * pktLossRate} — gosrt's {@code Stats()}) and the 16th/17th-packet
- * same-timestamp bandwidth-probe trick gosrt's {@code Push} does. See
- * STATUS.md's known gaps.
+ * pktLossRate} — gosrt's {@code Stats()}). See STATUS.md's known gaps. The
+ * 16th/17th-packet bandwidth-probe trick <em>is</em> ported — see {@link
+ * #push}'s javadoc.
  *
  * <p><b>ByteBuf ownership</b>: {@code deliver} always receives a {@link
  * #duplicate}, never the entry actually held in {@code packetList}/{@code
@@ -82,6 +82,7 @@ public final class SendBuffer {
 
     private CircularNumber nextSequenceNumber;
     private double avgPayloadSize = 1_456; // gosrt's packet.MAX_PAYLOAD_SIZE, its own seed value
+    private long probeTimeMicros;
 
     public SendBuffer(CircularNumber initialSequenceNumber, SrtSocketId destination,
             long dropThresholdMicros, Consumer<DataPacket> deliver) {
@@ -100,6 +101,25 @@ public final class SendBuffer {
      * Queues a payload for delivery once {@code scheduledSendMicros} is due,
      * assigning it the next sequence number. Ownership of {@code payload}
      * transfers to this buffer.
+     *
+     * <p><b>16th/17th-packet bandwidth probe</b>: every packet whose sequence
+     * number is {@code ≡ 1 (mod 16)} has its <em>delivery scheduling</em> time
+     * overridden to match the packet immediately before it ({@code ≡ 0 (mod
+     * 16)}), so the two get handed to {@code deliver} back-to-back on the same
+     * {@link #tick} instead of waiting for its own real schedule — this is what
+     * lets a peer's receive-side probe window (libsrt: {@code
+     * CRcvBufferNew::probe1Arrival}/{@code probe2Arrival} in {@code window.h},
+     * matched against real wall-clock arrival gaps, not the wire timestamp
+     * field) estimate link capacity independent of application send rate.
+     * Ported from gosrt's {@code Push} (traced directly from its source, not
+     * assumed): only the <em>scheduling</em> time is touched, matching gosrt's
+     * own comment that this is safe specifically because the packet's own
+     * <em>wire</em> timestamp has already been set from its real {@code
+     * scheduledSendMicros} by this point, one line above. No gosrt test
+     * exercises this (checked directly, not assumed — {@code send_test.go} has
+     * no probe-related cases), so the test for this is self-designed against
+     * gosrt's source, same rigor tier as this codebase's RTT/drift/wraparound
+     * pieces.
      */
     public void push(ByteBuf payload, long scheduledSendMicros) {
         CircularNumber seq = nextSequenceNumber;
@@ -108,7 +128,16 @@ public final class SendBuffer {
         DataPacket packet = new DataPacket(
                 (int) seq.value(), 3, false, 0, false, 1,
                 (int) (scheduledSendMicros & SrtPacket.MAX_TIMESTAMP), destination, payload);
-        packetList.addLast(new Entry(seq, scheduledSendMicros, packet));
+
+        long effectiveScheduledSendMicros = scheduledSendMicros;
+        long probe = seq.value() & 0xF;
+        if (probe == 0) {
+            probeTimeMicros = scheduledSendMicros;
+        } else if (probe == 1) {
+            effectiveScheduledSendMicros = probeTimeMicros;
+        }
+
+        packetList.addLast(new Entry(seq, effectiveScheduledSendMicros, packet));
     }
 
     /**

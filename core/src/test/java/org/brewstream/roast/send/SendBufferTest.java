@@ -168,6 +168,38 @@ class SendBufferTest {
         assertThat(buffer.lossListSize()).isZero();
     }
 
+    /**
+     * No gosrt test covers the 16th/17th-packet probe trick (checked directly -
+     * send_test.go has no probe-related cases), so this is self-designed
+     * against gosrt's Push source. A fresh buffer starts at seq(0), and 0 % 16
+     * == 0 / 1 % 16 == 1, so the very first two pushes already form a probe
+     * pair - no need to push 16 packets first.
+     */
+    @Test
+    void seventeenthPacketRidesOutOnSixteenthPacketsSchedule() {
+        List<DataPacket> delivered = new ArrayList<>();
+        SendBuffer buffer = sendBuffer(delivered::add);
+
+        buffer.push(Unpooled.buffer(0), 100); // seq 0, probe0
+        buffer.push(Unpooled.buffer(0), 500); // seq 1, probe1 - naturally not due yet at t=100
+        buffer.push(Unpooled.buffer(0), 200); // seq 2, not a probe packet - unaffected
+
+        buffer.tick(100);
+
+        // Both probe-pair packets are delivered together, even though seq 1's own
+        // schedule (500) hasn't come due - it rode out on seq 0's schedule instead.
+        assertThat(delivered).extracting(DataPacket::sequenceNumber).containsExactly(0, 1);
+        // The wire timestamp is untouched - only the internal delivery scheduling was
+        // overridden, matching gosrt's own comment on why this is safe to do in-place.
+        assertThat(delivered.get(1).timestamp()).isEqualTo(500);
+
+        buffer.tick(200);
+        assertThat(delivered).extracting(DataPacket::sequenceNumber).containsExactly(0, 1, 2);
+
+        delivered.forEach(p -> p.payload().release());
+        buffer.flush();
+    }
+
     // --- ByteBuf-leak checks (no gosrt equivalent needed - Go's GC handles
     // this; Roast needs explicit release(), so it's worth verifying directly).
 
