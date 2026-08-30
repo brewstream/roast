@@ -11,11 +11,12 @@ import java.nio.charset.StandardCharsets;
 /**
  * The handshake control packet's CIF (draft-sharabayko-srt.md handshake section):
  * a fixed 48-byte base structure, followed — for a CONCLUSION message that declares
- * a nonzero extension field — by a run of TLV extension blocks. Only the HSREQ/HSRSP
- * capability extension and the Stream ID extension are parsed; KMREQ/KMRSP
- * (encryption, Phase 5) and Congestion Control blocks are recognized but skipped by
- * their declared length. {@code isRequest} isn't wire data — it's which side is
- * sending, needed to pick the HSREQ vs. HSRSP extension tag on encode.
+ * a nonzero extension field — by a run of TLV extension blocks. The HSREQ/HSRSP
+ * capability extension, the Stream ID, and the KMREQ/KMRSP key material (see
+ * {@link KeyMaterialCif}) are parsed; Congestion Control blocks are recognized but
+ * skipped by their declared length. {@code isRequest} isn't wire data — it's which
+ * side is sending, needed to pick the HSREQ vs. HSRSP and KMREQ vs. KMRSP extension
+ * tags on encode.
  *
  * <p>{@code handshakeTypeCode} is the raw wire value rather than a {@link HandshakeType}
  * because a rejection isn't a separate field — it's signaled by putting a
@@ -36,9 +37,27 @@ public record HandshakeCif(
         int synCookie,
         InetAddress peerAddress,
         HandshakeExtension handshakeExtension,
-        String streamId) {
+        String streamId,
+        KeyMaterialCif keyMaterial) {
 
     public static final int BASE_LENGTH = 48;
+
+    /**
+     * Without key material — the common case, and what every caller predating
+     * encryption support used. {@code keyMaterial} is last rather than in wire
+     * order (it sits between HSREQ/HSRSP and SID on the wire) precisely so this
+     * overload can exist: a record's canonical constructor can't be shortened,
+     * but a prefix of it makes a natural convenience constructor, and that beat
+     * churning two dozen call sites to thread a {@code null} through.
+     */
+    public HandshakeCif(boolean isRequest, int version, int encryptionField, int extensionField,
+            CircularNumber initialPacketSequenceNumber, int maxTransmissionUnitSize, int maxFlowWindowSize,
+            int handshakeTypeCode, SrtSocketId srtSocketId, int synCookie, InetAddress peerAddress,
+            HandshakeExtension handshakeExtension, String streamId) {
+        this(isRequest, version, encryptionField, extensionField, initialPacketSequenceNumber,
+                maxTransmissionUnitSize, maxFlowWindowSize, handshakeTypeCode, srtSocketId, synCookie,
+                peerAddress, handshakeExtension, streamId, null);
+    }
 
     /** Null if {@link #isRejection()} — this field holds a rejection reason instead. */
     public HandshakeType handshakeType() {
@@ -90,6 +109,7 @@ public record HandshakeCif(
 
         HandshakeExtension handshakeExtension = null;
         String streamId = null;
+        KeyMaterialCif keyMaterial = null;
 
         while (in.readableBytes() >= 4) {
             ExtensionType type = ExtensionType.fromCode(in.readUnsignedShort());
@@ -105,6 +125,13 @@ public record HandshakeCif(
                 handshakeExtension = HandshakeExtension.decode(in);
             } else if (type == ExtensionType.SID) {
                 streamId = decodeStreamId(in, extensionLength);
+            } else if (type == ExtensionType.KMREQ || type == ExtensionType.KMRSP) {
+                // Hand the KM codec exactly its own extension and no more, so a
+                // 4-byte rejection is seen as such rather than as a truncated message.
+                keyMaterial = KeyMaterialCif.decode(in.readSlice(extensionLength));
+                if (keyMaterial == null) {
+                    return null;
+                }
             } else {
                 in.skipBytes(extensionLength);
             }
@@ -112,7 +139,7 @@ public record HandshakeCif(
 
         return new HandshakeCif(isRequest, version, encryptionField, extensionField,
                 initialPacketSequenceNumber, maxTransmissionUnitSize, maxFlowWindowSize, handshakeTypeCode,
-                srtSocketId, synCookie, peerAddress, handshakeExtension, streamId);
+                srtSocketId, synCookie, peerAddress, handshakeExtension, streamId, keyMaterial);
     }
 
     public void encodeTo(ByteBuf out) {
@@ -131,6 +158,19 @@ public record HandshakeCif(
             out.writeShort((isRequest ? ExtensionType.HSREQ : ExtensionType.HSRSP).code());
             out.writeShort(HandshakeExtension.LENGTH / 4);
             handshakeExtension.encodeTo(out);
+        }
+
+        if (keyMaterial != null) {
+            // Between the capability extension and the Stream ID, matching the
+            // order a real peer emits (gosrt's Marshal, and its V5 golden vector).
+            out.writeShort((isRequest ? ExtensionType.KMREQ : ExtensionType.KMRSP).code());
+            // The length is in 4-byte words and isn't known until the body is
+            // written, so reserve it and backfill.
+            int lengthIndex = out.writerIndex();
+            out.writeShort(0);
+            int bodyStart = out.writerIndex();
+            keyMaterial.encodeTo(out);
+            out.setShort(lengthIndex, (out.writerIndex() - bodyStart) / 4);
         }
 
         if (streamId != null && !streamId.isEmpty()) {

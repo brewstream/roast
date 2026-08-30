@@ -16,9 +16,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Golden hex fragments here are lifted byte-for-byte from
  * github.com/datarhei/gosrt packet.CIFHandshake's own tests (TestHandshakeV4,
- * TestHandshakeV5) — see references/gosrt/packet/handshake_test.go — with the
- * KMREQ/KMRSP and Congestion Control portions of TestHandshakeV5 dropped, since
- * those extensions are out of scope here.
+ * TestHandshakeV5) — see references/gosrt/packet/handshake_test.go.
+ *
+ * <p>{@link #decodesGosrtsCompleteV5GoldenVector()} uses gosrt's TestHandshakeV5
+ * vector <em>in full</em>, KMREQ/KMRSP and Congestion Control included. Earlier
+ * versions of this class had to strip those two out because neither was parsed;
+ * key material now is, so only Congestion Control is still skipped-by-length —
+ * and the vector exercises that skip against real bytes rather than a
+ * hand-built case.
  */
 class HandshakeCifTest {
 
@@ -67,6 +72,81 @@ class HandshakeCifTest {
 
         assertThat(ByteBufUtil.hexDump(out)).isEqualTo(V4_GOLDEN_HEX);
         out.release();
+    }
+
+    /**
+     * gosrt's TestHandshakeV5 vector in full: base fields, HSRSP, KMRSP, SID and
+     * a Congestion Control block. Proves the KM extension is read out of a real
+     * peer's handshake rather than only out of one we built ourselves.
+     */
+    @Test
+    void decodesGosrtsCompleteV5GoldenVector() {
+        String fullV5 = "00000005000200070000002a000005dc00000064ffffffff00274921001234560100007f"
+                + "00000000000000000000000000020003000104020000003f0064006400040"
+                + "00e122029010000000002000200000004040102030405060708090a0b0c0d0e0f10"
+                + "f0f1f2f3f4f5f6f71112131415161718191a1b1c1d1e1f20"
+                + "0005000576696c2f74732f656d6165726f6f662e0072616200060001626f6f66";
+
+        var buf = Unpooled.wrappedBuffer(ByteBufUtil.decodeHexDump(fullV5));
+        HandshakeCif cif = HandshakeCif.decode(buf, false);
+        buf.release();
+
+        assertThat(cif).isNotNull();
+        assertThat(cif.streamId()).isEqualTo("/live/stream.foobar");
+        assertThat(cif.handshakeExtension().srtVersion()).isEqualTo(0x010402);
+
+        KeyMaterialCif km = cif.keyMaterial();
+        assertThat(km).isNotNull();
+        assertThat(km.isError()).isFalse();
+        assertThat(km.keyEncryption()).isEqualTo(KeyEncryption.EVEN);
+        assertThat(km.cipher()).isEqualTo(KeyMaterialCif.CIPHER_AES_CTR);
+        assertThat(km.keyLength()).isEqualTo(16);
+        assertThat(km.salt()).isEqualTo(ByteBufUtil.decodeHexDump("0102030405060708090a0b0c0d0e0f10"));
+        assertThat(km.wrap()).isEqualTo(ByteBufUtil.decodeHexDump(
+                "f0f1f2f3f4f5f6f71112131415161718191a1b1c1d1e1f20"));
+    }
+
+    /**
+     * The same vector re-encoded. Congestion Control is not modelled, so it is
+     * dropped on the way back out - everything up to it must be byte-identical,
+     * which is what this asserts.
+     */
+    @Test
+    void reEncodesGosrtsV5VectorUpToTheUnmodelledCongestionBlock() {
+        String fullV5 = "00000005000200070000002a000005dc00000064ffffffff00274921001234560100007f"
+                + "00000000000000000000000000020003000104020000003f0064006400040"
+                + "00e122029010000000002000200000004040102030405060708090a0b0c0d0e0f10"
+                + "f0f1f2f3f4f5f6f71112131415161718191a1b1c1d1e1f20"
+                + "0005000576696c2f74732f656d6165726f6f662e00726162";
+        String withCongestion = fullV5 + "00060001626f6f66";
+
+        var buf = Unpooled.wrappedBuffer(ByteBufUtil.decodeHexDump(withCongestion));
+        HandshakeCif cif = HandshakeCif.decode(buf, false);
+        buf.release();
+
+        var out = ByteBufAllocator.DEFAULT.buffer();
+        cif.encodeTo(out);
+
+        assertThat(ByteBufUtil.hexDump(out)).isEqualTo(fullV5);
+        out.release();
+    }
+
+    @Test
+    void aKeyMaterialRejectionSurvivesARoundTrip() throws UnknownHostException {
+        HandshakeCif cif = new HandshakeCif(
+                false, 5, 0, 3, seq(42), 1500, 100, HandshakeType.CONCLUSION.code(),
+                SrtSocketId.of(0x274921), 0x123456, localhost(), null, null,
+                KeyMaterialCif.error(KeyMaterialCif.ERROR_BAD_SECRET));
+
+        var out = ByteBufAllocator.DEFAULT.buffer();
+        cif.encodeTo(out);
+        HandshakeCif decoded = HandshakeCif.decode(out, false);
+        out.release();
+
+        assertThat(decoded).isNotNull();
+        assertThat(decoded.keyMaterial()).isNotNull();
+        assertThat(decoded.keyMaterial().isError()).isTrue();
+        assertThat(decoded.keyMaterial().errorCode()).isEqualTo(KeyMaterialCif.ERROR_BAD_SECRET);
     }
 
     @Test
