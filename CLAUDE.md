@@ -1,8 +1,9 @@
 # Roast
 
-Pure-Java SRT (Secure Reliable Transport) protocol library. See `../DESIGN.md` at
-the workspace root for the full protocol design/phase plan — that doc predates the
-`roast` name (it calls the module `srt-core`) but is otherwise current.
+Pure-Java SRT (Secure Reliable Transport) protocol library. `STATUS.md` records
+what is built, what is known to be missing, and how the testing is grounded.
+`references/draft-sharabayko-srt.md` is the protocol spec; cite it by section
+when a decision follows from the wire format.
 
 ## Build
 
@@ -16,8 +17,8 @@ the workspace root for the full protocol design/phase plan — that doc predates
 - Transport is built on **Netty**, not raw NIO — protocol types (packet header,
   handshake, ARQ) are implemented as Netty codecs/handlers over `DatagramChannel`,
   per engineering direction to lean on Netty's pipeline model rather than
-  reimplementing framing/multiplexing/threading by hand. This supersedes
-  DESIGN.md §4's "Option A vs B" framing — Netty is not optional.
+  reimplementing framing/multiplexing/threading by hand. Netty is not optional
+  and not an implementation detail to be abstracted away.
 - Tests: JUnit 5 (`@Test`/`@ParameterizedTest`), **AssertJ** (`assertThat(...)`) for
   assertions — not JUnit's `Assertions.assertEquals`/etc. **Mockito** for mocking
   collaborators (`@ExtendWith(MockitoExtension.class)`, `mock(...)`), used where a
