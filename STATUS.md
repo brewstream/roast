@@ -178,23 +178,54 @@ the answer:**
   as a plain `java` process (no daemon competing for CPU during the repro).
   **No change** to the corruption rate.
 
-**Where this leaves things**: negotiation is now proven identical between
-Roast and its clean-behaving gosrt counterpart, and every layer of Roast's
-own data path (content, order, loss, timing) is independently verified
-correct. Further progress likely needs heavier tooling than targeted
-hypotheses — syscall-level tracing of Roast's actual `send()` timing/spacing
-versus gosrt's, or a proper SRT-aware packet-dissector comparison — rather
-than more guesses. **Deliberately parked here, not swept under the rug**:
-documented in full in "Known gaps," revisit if a new lead surfaces or when
-picking heavier tooling up is worth the cost relative to other work.
+**ROOT-CAUSED AND FIXED, same day.** The investigation above was briefly
+parked as unsolved; picking it back up, the answer came from asking a
+question none of those passes had: *were the sequence numbers arriving at
+`handleData` contiguous?* They were not — **579 of 1671 missing, ~35% of the
+published stream** — and since `netstat` had already proven zero UDP drops,
+those packets were **never transmitted at all**.
 
-170 tests passing (128 default + 2 gated interop + 2 ACKACK/RTT + 5
+**The bug**: a Full ACK's "available buffer size" is, to the peer's sender,
+this receiver's flow-control window. `SrtConnection.tick` hardcoded it to 0
+(a long-standing, *documented* simplification — "buffer/rate figures are
+still hardcoded to 0" appears in this file's own earlier text, and in the
+class javadoc, without anyone connecting it to the symptom). Advertising 0
+tells the peer "I can accept nothing", so libsrt collapsed its send window
+and dropped whatever it judged undeliverable — announcing exactly the
+`DROPREQ` seen at the very start of this investigation and misattributed to
+ACK-boundary lag. gosrt sets this field to its configured `FC`
+(`connection.go`'s `sendACK`); Roast now reports its advertised window minus
+what is actually buffered.
+
+**Confirmed by controlled A/B against real libsrt's own sender counters**,
+not just by the symptom disappearing:
+
+| | `pktFlowWindow` | `pktSndDrop` |
+|---|---|---|
+| `availableBufferSize = 0` (the bug) | 0–21 (collapsed) | 624 and climbing (~42%) |
+| the fix | 8188 | 0 |
+
+End-to-end, `ffmpeg` → `RelayDemo` → `ffmpeg` went from **53–78 corrupt
+packets per run — every run, for the entire investigation — to 0 across
+three consecutive runs**, with zero decode errors. `SrtConnectionTest.`
+`fullAckAdvertisesRealReceiveWindowNotZero` is the regression test.
+
+**Why every earlier check came back clean** is the real lesson, recorded in
+"Testing methodology": all of them — received-vs-delivered counters, CRCs
+verified through to captured wire bytes, libsrt's *receiver* stats, tick
+timing — verified Roast's **internal consistency**. None could detect
+packets a peer decided never to send. The one check that would have found it
+immediately (are the received sequence numbers contiguous?) was cheap, and
+was not run until last.
+
+171 tests passing (128 default + 2 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
-`SrtConnectionTest` send-side + 11 `CallerHandshakeTest` + 3 `SrtCallerTest`),
-all committed to `main` (no branches). Every commit so far has been
-asked-for explicitly by the user, one narrowly-scoped piece at a time — see
-git log for the exact sequence and rationale (commit messages are detailed).
+`SrtConnectionTest` send-side + 1 `SrtConnectionTest` flow-window regression
++ 11 `CallerHandshakeTest` + 3 `SrtCallerTest`), all committed to `main` (no
+branches). Every commit so far has been asked-for explicitly by the user, one
+narrowly-scoped piece at a time — see git log for the exact sequence and
+rationale (commit messages are detailed).
 
 ## What's built
 
@@ -591,6 +622,27 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   of the test setup or the player. This is the same discipline the earlier
   ACK-boundary bug was root-caused with, just applied one level more
   skeptically after an unverified guess slipped through once.
+- **…but rigor about *how* you measure doesn't help if you keep measuring the
+  wrong side of the boundary — the single most useful lesson from this
+  codebase so far.** Every check in the bullet above was sound, and every one
+  came back clean, because every one of them verified Roast's own *internal*
+  consistency: received-vs-delivered counters, CRCs traced through to the
+  captured wire bytes, tick timing, our own loss lists. All of them are
+  structurally incapable of seeing a packet that a peer *chose never to
+  send*. The actual bug (a Full ACK advertising a 0-byte receive window, so
+  libsrt closed its send window and dropped ~35-42% of the stream) was
+  invisible to all of them, and was found in one step by a check that costs
+  nothing: **are the sequence numbers we received contiguous?** Practical
+  rule going forward: when debugging against a real peer, measure what the
+  *peer* did (its stats, its dropped/never-sent counters, gaps in what
+  reached you) before, or at least alongside, exhaustively re-verifying your
+  own pipeline. A clean internal audit is not evidence that the input was
+  complete. Corollary, equally important: **a hardcoded placeholder in a
+  protocol field is not automatically cosmetic.** This one was documented as
+  a known simplification in three places, including in the javadoc of the
+  method that sent it, and was still read straight past for the entire
+  investigation because "buffer/rate figures are 0" didn't sound like it
+  could cost 42% of a stream.
 - **`ReceiveBuffer.computeAckBoundary`** (the ACK-boundary fix above) is
   grounded at the strongest tier this codebase has used for a piece this
   architecturally significant: `matchesGosrtTestIssue67` in
@@ -662,17 +714,32 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   still shows corruption, essentially unchanged** — this fix was real and
   independently verified, but turned out not to be the dominant cause of the
   interop symptom. See the next entry.
-- **PARKED, deeply investigated, still unresolved: a second, distinct source
-  of real data corruption under sustained real throughput.** Found while
-  re-verifying the ACK-boundary fix above: pushing a real ffmpeg stream
-  through `RelayDemo` shows MPEG-TS corruption at a real, measurable rate;
-  control experiments with libsrt's `srt-live-transmit` and a locally-built
-  gosrt `contrib/server` both relaying the *identical* source play back
-  clean — this is real, and specific to Roast, not the test setup or an
-  artifact of ffmpeg's own strictness.
+- ~~A second, distinct source of real data corruption under sustained real
+  throughput~~ **CLOSED — root-caused and fixed 2026-08-29**: Full ACKs
+  advertised an available buffer size of 0, which a peer's sender reads as a
+  closed flow-control window; real libsrt responded by dropping ~35-42% of
+  the published stream before it ever reached the wire. See "Where we are"
+  for the full story, the controlled A/B against libsrt's own
+  `pktFlowWindow`/`pktSndDrop` counters, and the lesson about why a long
+  chain of internal-consistency checks could not have found it. Regression
+  test: `SrtConnectionTest.fullAckAdvertisesRealReceiveWindowNotZero`.
+  The *rate* figures in the same CIF (`packetsReceivingRate`/
+  `estimatedLinkCapacity`/`receivingRate`) are still hardcoded to 0 — unlike
+  the buffer figure those are genuinely informational for live mode (gosrt
+  reports real ones; libsrt did not appear to act on them here), but they're
+  still a real gap worth closing, and this bug is a strong argument for not
+  assuming a hardcoded protocol field is harmless.
+  Historical note on what it looked like before root-causing: pushing a real
+  ffmpeg stream through `RelayDemo` showed MPEG-TS corruption at a real,
+  measurable rate, while control experiments with libsrt's
+  `srt-live-transmit` and a locally-built gosrt `contrib/server` relaying the
+  *identical* source played back clean — correctly establishing early on that
+  it was real and Roast-specific, not the test setup or ffmpeg's strictness.
 
-  **Ruled out, each with a real measurement, not an assumption** (see "Where
-  we are" and "Testing methodology" for exactly how each was checked):
+  **Ruled out along the way, each with a real measurement** — all correct as
+  far as they went, and all blind to the actual cause for the same reason:
+  every one of them verified Roast's *internal* consistency, and the packets
+  at fault were never sent by the peer at all (see "Where we are"):
   - OS-level network loss/corruption — full `netstat -s -p udp` counter
     diff across a repro run: zero drops, zero checksum/length errors.
   - SRT protocol-level loss — zero across both Roast's own counters and an
@@ -699,13 +766,12 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   - Gradle daemon CPU contention — ran `RelayDemo` as a plain `java` process
     with the daemon stopped; no change.
 
-  **Not yet root-caused.** With negotiation proven identical to a
-  clean-behaving reference and every layer of Roast's own data path
-  independently verified correct, further progress needs heavier tooling
-  (syscall-level send timing/spacing comparison, or a proper SRT packet
-  dissector) rather than more targeted hypotheses — a deliberate stopping
-  point, not an abandoned trail. Revisit if a new lead surfaces; see "Next
-  steps" for what to work on meanwhile.
+  **What actually found it**: checking whether the sequence numbers arriving
+  at `handleData` were contiguous — 579 of 1671 were missing. Combined with
+  the already-established "zero UDP drops", that pinned the loss to packets
+  the peer never transmitted, which points at exactly one thing we tell the
+  peer: the flow-control window. Cheap check, available from the very first
+  hour, run last.
 - ~~No RTT measurement~~ **Closed** — `SrtConnection` now tracks real RTT/RTTVar
   from ACK/ACKACK round trips and feeds them to `AckSender.tick` and the
   periodic NAK interval; see "What's built" and "Testing methodology" (the
@@ -765,12 +831,19 @@ directly from libsrt's own source, not assumed). Both skip themselves via
    against `SrtListener`, for full belt-and-suspenders confidence beyond
    `srt-live-transmit` — not expected to surface anything new, since ffmpeg
    wraps the same libsrt handshake code already exercised.
-4. **Parked**: root-causing the still-open real-throughput corruption issue
-   (see "Known gaps") — every cheap, targeted hypothesis has been eliminated
-   with real measurements; what's left needs heavier tooling (syscall-level
-   send timing/spacing comparison against gosrt, or a proper SRT packet
-   dissector). Worth returning to with fresh eyes or better tooling rather
-   than more guesses, and not blocking the items above.
+4. Report **real rate figures** in Full ACKs (`packetsReceivingRate`/
+   `estimatedLinkCapacity`/`receivingRate`), the last hardcoded-to-0 fields
+   in that CIF — gosrt computes them from its receiver's own packet-rate
+   window (`recv.PacketRate()`). Informational for live mode as far as we can
+   tell, but the flow-window bug (see "Known gaps") is a pointed argument
+   against leaving hardcoded placeholders in wire fields on the assumption
+   they don't matter. Small, well-grounded, and now the only known place
+   Roast tells a peer something untrue.
+5. *(Worth doing at some point)* Thread the **negotiated** flow window
+   through `AcceptedConnection` instead of `SrtConnection`'s fixed
+   `RECEIVE_FLOW_WINDOW_PACKETS = 8192`. The handshake already echoes the
+   peer's advertised value back; we just don't keep it. Correct today only
+   because our constant matches what peers propose in practice.
 
 ## How to pick this back up
 
