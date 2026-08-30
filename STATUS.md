@@ -223,12 +223,13 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-245 tests passing (128 default + 3 gated interop + 2 ACKACK/RTT + 5
+248 tests passing (128 default + 3 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
 `ReceiveRateEstimatorTest` + 12 `KeyMaterialCifTest` + 16 `StreamKeyWrapperTest`
-+ 17 `PayloadCipherTest` + 19 `EncryptionContextTest` + 11 `CallerHandshakeTest`
++ 17 `PayloadCipherTest` + 19 `EncryptionContextTest` + 3 `HandshakeCifTest` KM
++ 11 `CallerHandshakeTest`
 + 3 `SrtCallerTest`),
 all committed to `main` (no branches). Every commit so far has been asked-for
 explicitly by the user, one narrowly-scoped piece at a time — see git log for
@@ -248,13 +249,12 @@ frames the fixed header.
 - `HandshakeCif` (+ `HandshakeType`, `HandshakeExtension`,
   `HandshakeExtensionFlags`, `ExtensionType`, `RejectionReason`, `PeerAddressCodec`)
   — the 48-byte handshake base structure, plus HSREQ/HSRSP and SID extension TLVs.
-  KMREQ/KMRSP (encryption) and Congestion Control extensions are recognized but
-  skipped by declared length, not parsed — note that the KM message *body* now
-  has a codec (`KeyMaterialCif`, below); `HandshakeCif` just doesn't invoke it
-  yet, which is the first thing Phase 5's wiring step will change. Verified
-  against gosrt's
-  `TestHandshakeV4`/`V5` golden vectors (with the KM/Congestion portions of V5
-  stripped out, since those aren't parsed).
+  KMREQ/KMRSP key material is parsed too (into a `KeyMaterialCif`); only
+  Congestion Control is still recognized-but-skipped by declared length.
+  Verified against gosrt's
+  `TestHandshakeV4`/`V5` golden vectors — V5 now used **in full**, KM
+  included, where it previously had to be stripped down; that also exercises
+  the congestion-block skip against real bytes.
   `handshakeTypeCode` is a raw int, not a closed enum — any value outside the 5
   known progression types is a legitimate rejection-reason code, not malformed
   data (see `HandshakeCif.isRejection()`/`rejectionReason()`).
@@ -989,9 +989,10 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
      and could plausibly decide a passphrase per stream — that's an
      extensibility angle DESIGN.md's §4 would like, and worth considering
      before picking.
-   - **KM extension parsing in `HandshakeCif`** — the codec exists; the
-     handshake still skips KMREQ/KMRSP by declared length. Also needs the
-     handshake's Encryption Field (the advertised key length) honoured.
+   - ~~KM extension parsing in `HandshakeCif`~~ **done** — parsed and emitted,
+     verified against gosrt's complete V5 golden vector. Still to do: honour
+     the handshake's Encryption Field (the advertised key length), which is
+     currently carried but not acted on.
    - **`SrtConnection` wiring**: encrypt on send with the active key and set
      the DATA header's KK field; decrypt on receive by that field. Note the
      header already carries `kk` as a raw int, so no packet-layer change is
