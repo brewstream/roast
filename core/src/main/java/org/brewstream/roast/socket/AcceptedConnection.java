@@ -21,6 +21,14 @@ public record AcceptedConnection(
         int flowWindowSize,
         int maxTransmissionUnitSize) {
 
+    public AcceptedConnection {
+        // A peer may send no StreamID at all, and a null here means every
+        // consumer has to null-check or trip over it - which is exactly what the
+        // CLI did the first time it met a peer without one. ConnectionRequest
+        // already normalises the same field; this makes the pair consistent.
+        streamId = streamId == null ? "" : streamId;
+    }
+
     /** Without a negotiated MTU — falls back to SRT's standard 1500. */
     public AcceptedConnection(SrtSocketId socketId, SrtSocketId peerSocketId, InetSocketAddress peerAddress,
             String streamId, int receiveLatencyMillis, int sendLatencyMillis, int srtVersion, int flowWindowSize) {

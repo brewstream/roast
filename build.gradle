@@ -45,6 +45,17 @@ subprojects {
         }
     }
 
+    tasks.register('liveTransmit', JavaExec) {
+        description = 'srt-java-live-transmit: relay a live stream between stdin/stdout and an srt:// endpoint.'
+        group = 'application'
+        classpath = sourceSets.main.runtimeClasspath
+        mainClass = 'org.brewstream.roast.cli.SrtLiveTransmit'
+        standardInput = System.in
+        if (project.hasProperty('args')) {
+            args project.property('args').split(' ')
+        }
+    }
+
     tasks.register('relayDemo', JavaExec) {
         description = 'Manual publish/play relay demo (see RelayDemo.java) - not part of the test suite.'
         group = 'application'
