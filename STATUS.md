@@ -218,14 +218,14 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-171 tests passing (128 default + 2 gated interop + 2 ACKACK/RTT + 5
+181 tests passing (128 default + 2 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
-`SrtConnectionTest` send-side + 1 `SrtConnectionTest` flow-window regression
-+ 11 `CallerHandshakeTest` + 3 `SrtCallerTest`), all committed to `main` (no
-branches). Every commit so far has been asked-for explicitly by the user, one
-narrowly-scoped piece at a time — see git log for the exact sequence and
-rationale (commit messages are detailed).
+`SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
+`ReceiveRateEstimatorTest` + 11 `CallerHandshakeTest` + 3 `SrtCallerTest`),
+all committed to `main` (no branches). Every commit so far has been asked-for
+explicitly by the user, one narrowly-scoped piece at a time — see git log for
+the exact sequence and rationale (commit messages are detailed).
 
 ## What's built
 
@@ -292,9 +292,14 @@ dropped, never thrown.
   `AckSender.tick` (previously hardcoded 0s) and makes the periodic NAK interval
   RTT-adaptive (`(rtt + 4*rttVar)/2`, floored at 20ms — gosrt's `NAKInterval()`),
   replacing the old fixed floor. Unknown/stale ACKACKs are logged and ignored,
-  matching gosrt's tolerant behavior. Buffer/rate figures fed to `AckSender.tick`
-  are still hardcoded to 0 — that needs receive-side stats this codebase doesn't
-  track yet. Now also owns a `SendBuffer` (see `send` below) and exposes
+  matching gosrt's tolerant behavior. Every figure fed to `AckSender.tick` is
+  now real: the available buffer size is the negotiated flow window
+  (`AcceptedConnection.flowWindowSize()`) minus what's currently buffered, and
+  the packet-rate/link-capacity/receiving-rate figures come from
+  `ReceiveRateEstimator` — nothing in the ACK CIF is a placeholder any more,
+  which matters more than it sounds (see "Known gaps": the buffer figure
+  being hardcoded to 0 silently cost ~35-42% of a real stream). Now also owns
+  a `SendBuffer` (see `send` below) and exposes
   `write(ByteBuf)` — the actual data-send API, marshaled onto the connection's
   own event loop since it's the one method meant to be called from an arbitrary
   application thread (every other method here assumes the single event-loop
@@ -357,9 +362,10 @@ numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
   on `LossList` at all — the "last acknowledged" sequence number is now
   supplied by the caller on each `tick` (computed by `ReceiveBuffer.computeAckBoundary`,
   below), so this class is purely the timing/variant decision plus CIF
-  construction. RTT/RTTVar/buffer/rate figures are also caller-supplied —
-  `SrtConnection` currently hardcodes the buffer/rate ones to 0, not measured
-  yet. `nowMicros` must be elapsed time since this receiver's own start,
+  construction. RTT/RTTVar/buffer/rate figures are also caller-supplied, and
+  all of them are now real values rather than placeholders (see
+  `SrtConnection` above and `ReceiveRateEstimator` below).
+  `nowMicros` must be elapsed time since this receiver's own start,
   matching gosrt's `lastPeriodicACK` zero-value-start semantics exactly.
 - `ReceiveBuffer` (+ `DeliveryResult`, `AckBoundaryResult`) — holds accepted
   DATA packets sorted by sequence number. Tracks **two separate boundaries**,
@@ -396,6 +402,22 @@ numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
   only valid if read immediately after `update()` returns true) is collapsed
   into a single `OptionalLong` return from `update()` — same information, a
   deliberate documented API simplification, not a behavior change.
+- `ReceiveRateEstimator` — the three rate figures a Full ACK reports back to
+  the peer, ported from gosrt's `congestion/live` receiver (`receive.go`'s
+  `Push`/`Tick`/`PacketRate`). Packet and byte arrival rates over a ~1s
+  sliding window, recomputed and reset on `tick`; plus an estimated link
+  capacity derived from the **16th/17th-packet probe pair** — the receive-side
+  counterpart to the trick `SendBuffer.push` performs when sending. The
+  arrival gap between a consecutive `≡ 0 (mod 16)` / `≡ 1 (mod 16)` pair is
+  scaled to what a fully-loaded packet would have taken, then folded into an
+  EWMA; a retransmit or a non-consecutive partner disarms the measurement
+  instead of feeding it a bogus sample. Lives in its own class because Roast
+  splits gosrt's single receiver struct across `LossList`/`AckSender`/
+  `ReceiveBuffer` and none of those is a natural home for rate bookkeeping —
+  same reasoning that carved out `DriftTracer`. Takes `nowMicros` explicitly
+  rather than reading a clock (gosrt mixes wall-clock `time.Now()` for the
+  probe with elapsed micros for the rate window; this codebase keeps one
+  elapsed-time source per connection).
 
 **`send`** — Phase 4's sender path, now wired to a live connection via
 `SrtConnection` above:
@@ -410,8 +432,10 @@ numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
   first send or retransmit alike — hands out a `retainedDuplicate()`, never
   the entry actually held in its internal queues, so the original stays valid
   for a possible later retransmit (see "Testing methodology" for the bug this
-  fixes). The 16th/17th-packet bandwidth-probe trick and full bandwidth-rate
-  statistics (gosrt's `Stats()`) are deliberately not ported — see known gaps.
+  fixes). The 16th/17th-packet bandwidth-probe trick *is* ported (see
+  `push`'s javadoc, and `ReceiveRateEstimator` above for the receive-side half
+  that consumes it); full bandwidth-rate statistics (gosrt's `Stats()`) remain
+  deliberately not ported — see known gaps.
 
 **`handshake`** — `SynCookie`: MD5-based SYN cookie so a listener can verify an
 INDUCTION cookie was echoed back correctly in CONCLUSION without keeping
@@ -683,11 +707,22 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   (comparing implementations, not confirming a bug in isolation) — worth
   remembering as a general technique whenever "does Roast negotiate the same
   thing a reference does" needs a real answer instead of a guess.
-- **The 16th/17th-packet bandwidth-probe trick** (`SendBuffer.push`) has, like
-  `SendBuffer` itself, no gosrt test to ground against (`send_test.go` has no
-  probe-related cases, checked directly) — the test for it is self-designed
-  against gosrt's source, same rigor tier as this codebase's RTT/drift/
-  wraparound pieces.
+- **The 16th/17th-packet bandwidth-probe trick** — neither half has a gosrt
+  test to ground against (`send_test.go` has no probe cases and
+  `receive_test.go` has no rate/capacity cases, both checked directly), so
+  the tests for `SendBuffer.push`'s sending half and
+  `ReceiveRateEstimatorTest`'s consuming half are both self-designed against
+  gosrt's source — same rigor tier as this codebase's RTT/drift/wraparound
+  pieces, not the stronger ported-scenario tier.
+- **Mutation-checking a test that can't fail is worth the two minutes**, added
+  2026-08-29 after the flow-window work: the first regression test for the
+  advertised receive window asserted `8192`, which was simultaneously the
+  negotiated value *and* the hardcoded fallback — it would have passed even
+  if the negotiation was ignored entirely. Fixed by parameterizing the test
+  handshake and negotiating a deliberately different `4096`, then **verifying
+  the test actually fails** when the code is mutated to always use the
+  fallback. Any assertion whose expected value coincides with a default is
+  suspect until it's been seen to fail.
 
 ## Known gaps / deliberately deferred
 
@@ -723,12 +758,10 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   `pktFlowWindow`/`pktSndDrop` counters, and the lesson about why a long
   chain of internal-consistency checks could not have found it. Regression
   test: `SrtConnectionTest.fullAckAdvertisesRealReceiveWindowNotZero`.
-  The *rate* figures in the same CIF (`packetsReceivingRate`/
-  `estimatedLinkCapacity`/`receivingRate`) are still hardcoded to 0 — unlike
-  the buffer figure those are genuinely informational for live mode (gosrt
-  reports real ones; libsrt did not appear to act on them here), but they're
-  still a real gap worth closing, and this bug is a strong argument for not
-  assuming a hardcoded protocol field is harmless.
+  **Follow-ons, both since done** (this bug being a pointed argument against
+  leaving any hardcoded placeholder in a wire field): the *rate* figures in
+  the same CIF now come from `ReceiveRateEstimator`, and the window is now
+  the **negotiated** one rather than a fixed constant — see "What's built".
   Historical note on what it looked like before root-causing: pushing a real
   ffmpeg stream through `RelayDemo` showed MPEG-TS corruption at a real,
   measurable rate, while control experiments with libsrt's
@@ -776,7 +809,8 @@ directly from libsrt's own source, not assumed). Both skip themselves via
   from ACK/ACKACK round trips and feeds them to `AckSender.tick` and the
   periodic NAK interval; see "What's built" and "Testing methodology" (the
   latter for the honest caveat that this piece has no gosrt test to ground
-  against). Buffer/rate figures fed to `AckSender.tick` are still hardcoded to 0.
+  against). The buffer and rate figures fed to `AckSender.tick` are now real
+  too — see the flow-window entry below.
 - ~~No drift correction~~ **Closed** — `ReceiveBuffer` now does TSBPD
   clock-drift correction via `DriftTracer`, fed on every ACKACK; see "What's
   built" and "Testing methodology" (the latter for the honest caveat that
@@ -831,19 +865,10 @@ directly from libsrt's own source, not assumed). Both skip themselves via
    against `SrtListener`, for full belt-and-suspenders confidence beyond
    `srt-live-transmit` — not expected to surface anything new, since ffmpeg
    wraps the same libsrt handshake code already exercised.
-4. Report **real rate figures** in Full ACKs (`packetsReceivingRate`/
-   `estimatedLinkCapacity`/`receivingRate`), the last hardcoded-to-0 fields
-   in that CIF — gosrt computes them from its receiver's own packet-rate
-   window (`recv.PacketRate()`). Informational for live mode as far as we can
-   tell, but the flow-window bug (see "Known gaps") is a pointed argument
-   against leaving hardcoded placeholders in wire fields on the assumption
-   they don't matter. Small, well-grounded, and now the only known place
-   Roast tells a peer something untrue.
-5. *(Worth doing at some point)* Thread the **negotiated** flow window
-   through `AcceptedConnection` instead of `SrtConnection`'s fixed
-   `RECEIVE_FLOW_WINDOW_PACKETS = 8192`. The handshake already echoes the
-   peer's advertised value back; we just don't keep it. Correct today only
-   because our constant matches what peers propose in practice.
+4. ~~Report real rate figures in Full ACKs~~ and ~~thread the negotiated flow
+   window through `AcceptedConnection`~~ — **both done**; see
+   `ReceiveRateEstimator` in "What's built" and the flow-window entry in
+   "Known gaps". Nothing in the ACK CIF is a hardcoded placeholder any more.
 
 ## How to pick this back up
 
