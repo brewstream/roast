@@ -19,6 +19,7 @@ import org.brewstream.roast.recv.DeliveryResult;
 import org.brewstream.roast.recv.LossList;
 import org.brewstream.roast.recv.NakGenerator;
 import org.brewstream.roast.recv.ReceiveBuffer;
+import org.brewstream.roast.recv.ReceiveRateEstimator;
 import org.brewstream.roast.send.SendBuffer;
 import org.brewstream.roast.util.CircularNumber;
 
@@ -67,13 +68,12 @@ import java.util.logging.Logger;
  * RTTVar figures {@link AckSender#tick} reports and the periodic NAK
  * re-announcement interval — {@code (rtt + 4*rttVar) / 2}, floored at 20ms,
  * gosrt's own {@code NAKInterval()} formula — replacing the fixed floor this
- * class used before any RTT was known. The available-buffer-size figure is
- * real (see {@link #tick} — it was hardcoded to 0, which cost ~35-42% of a
- * real published stream, since a peer reads it as our flow-control window);
- * the <em>rate</em> figures are still hardcoded to 0, which needs receive-side
- * rate stats this codebase doesn't track yet. gosrt reports a fixed
- * {@code FC} for the buffer figure and real rates; Roast is currently the
- * other way round.
+ * class used before any RTT was known. Every other figure in a Full ACK is now
+ * real too: the available-buffer-size figure (see {@link #tick} — it was
+ * hardcoded to 0, which cost ~35-42% of a real published stream, since a peer
+ * reads it as our flow-control window), and the packet-rate/link-capacity/
+ * receiving-rate figures, from {@link ReceiveRateEstimator}. Nothing in the ACK
+ * CIF is a placeholder any more.
  *
  * <p><b>Sending</b>: {@link #write} queues a payload on {@link SendBuffer},
  * which owns the sending side's loss list and TLPKTDROP the same way {@link
@@ -134,6 +134,7 @@ public final class SrtConnection {
     private final LossList lossList;
     private final AckSender ackSender;
     private final ReceiveBuffer receiveBuffer;
+    private final ReceiveRateEstimator receiveRateEstimator = new ReceiveRateEstimator();
     private final SendBuffer sendBuffer;
     private final ScheduledFuture<?> scheduledTick;
     private final long startNanos = System.nanoTime();
@@ -368,6 +369,10 @@ public final class SrtConnection {
         CircularNumber seq = CircularNumber.of(data.sequenceNumber() & 0x7FFF_FFFF, SrtPacket.MAX_SEQUENCE_NUMBER);
         List<LossRange> immediateLoss = lossList.onPacketReceived(seq);
         ackSender.onPacketReceived();
+        // Read the payload size before handing the packet to the receive buffer, which
+        // takes ownership of the body (and may release it outright as a duplicate).
+        receiveRateEstimator.onPacketReceived(
+                seq, data.body().readableBytes(), data.retransmitted(), elapsedMicros());
 
         for (LossRange range : immediateLoss) {
             sendNak(List.of(range));
@@ -406,9 +411,13 @@ public final class SrtConnection {
             onTlpktDrop.accept(abandoned);
         }
 
+        receiveRateEstimator.tick(now);
         int availableBufferSize = Math.max(0, RECEIVE_FLOW_WINDOW_PACKETS - receiveBuffer.bufferedCount());
         ackSender.tick(now, ackBoundary.lastAckSequenceNumber().inc(),
-                (int) Math.round(rttMicros), (int) Math.round(rttVarMicros), availableBufferSize, 0, 0, 0)
+                (int) Math.round(rttMicros), (int) Math.round(rttVarMicros), availableBufferSize,
+                receiveRateEstimator.packetsPerSecond(),
+                receiveRateEstimator.estimatedLinkCapacityPacketsPerSecond(),
+                receiveRateEstimator.receivingRateBytesPerSecond())
                 .ifPresent(this::sendAck);
 
         if (now - lastPeriodicNakMicros >= nakIntervalMicros()) {
