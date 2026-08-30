@@ -711,8 +711,11 @@ class SrtConnectionTest {
     void dataAlreadyReceivedIsDeliveredWhenThePeerShutsDown() throws Exception {
         SrtConnection connection = connectAndAccept();
         List<String> delivered = new CopyOnWriteArrayList<>();
+        CompletableFuture<String> drained = new CompletableFuture<>();
         connection.onData(payload -> {
-            delivered.add(payload.toString(StandardCharsets.US_ASCII));
+            String text = payload.toString(StandardCharsets.US_ASCII);
+            delivered.add(text);
+            drained.complete(text);
             payload.release();
         });
 
@@ -720,7 +723,10 @@ class SrtConnectionTest {
         sendData(connection.metadata().socketId(), 1, 0, "tail-of-stream");
         sendControl(connection.metadata().socketId(), ControlType.SHUTDOWN);
 
-        receiveControl(ControlType.SHUTDOWN).body().release();
+        // Wait on the delivery itself. Receiving SHUTDOWN is not a valid proxy:
+        // doClose announces the shutdown before draining, so the reply can
+        // legitimately arrive first.
+        assertThat(drained.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo("tail-of-stream");
         assertThat(delivered).containsExactly("tail-of-stream");
     }
 

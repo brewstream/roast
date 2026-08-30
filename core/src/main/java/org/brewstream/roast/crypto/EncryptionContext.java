@@ -113,7 +113,13 @@ public final class EncryptionContext {
      * still refused: that would be a silent downgrade.
      */
     public static EncryptionContext awaitingPeerKeys(char[] passphrase, int keyLength) {
-        return new EncryptionContext(passphrase, keyLength, DEFAULT_KM_REFRESH_RATE, DEFAULT_KM_PRE_ANNOUNCE);
+        return awaitingPeerKeys(passphrase, keyLength, DEFAULT_KM_REFRESH_RATE, DEFAULT_KM_PRE_ANNOUNCE);
+    }
+
+    /** As above, with an explicit rotation schedule (see {@code SrtConfig}). */
+    public static EncryptionContext awaitingPeerKeys(char[] passphrase, int keyLength,
+            long kmRefreshRate, long kmPreAnnounce) {
+        return new EncryptionContext(passphrase, keyLength, kmRefreshRate, kmPreAnnounce);
     }
 
     /**

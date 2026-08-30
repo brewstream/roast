@@ -43,14 +43,13 @@ import java.util.logging.Logger;
 public final class SrtListener {
 
     private static final Logger LOG = Logger.getLogger(SrtListener.class.getName());
-    private static final int DEFAULT_LATENCY_MILLIS = 120;
-    private static final int DEFAULT_SRT_VERSION = 0x010401;
 
     private final Channel channel;
     private final EventLoopGroup eventLoopGroup;
     private final SrtSocketIdDemultiplexer demultiplexer;
     private final ListenerHandshake listenerHandshake;
     private final SrtSocketIdGenerator socketIdGenerator;
+    private final SrtConfig config;
     private final ConcurrentHashMap<SrtSocketId, HandshakeCif> acceptedByPeerSocketId = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<SrtSocketId, SrtConnection> connections = new ConcurrentHashMap<>();
     private final long startNanos = System.nanoTime();
@@ -61,15 +60,21 @@ public final class SrtListener {
     private final java.util.List<SrtConnectionListener> eventListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     private SrtListener(Channel channel, EventLoopGroup eventLoopGroup, SrtSocketIdDemultiplexer demultiplexer,
-            ListenerHandshake listenerHandshake, SrtSocketIdGenerator socketIdGenerator) {
+            ListenerHandshake listenerHandshake, SrtSocketIdGenerator socketIdGenerator, SrtConfig config) {
         this.channel = channel;
         this.eventLoopGroup = eventLoopGroup;
         this.demultiplexer = demultiplexer;
         this.listenerHandshake = listenerHandshake;
         this.socketIdGenerator = socketIdGenerator;
+        this.config = config;
     }
 
+    /** Binds with {@link SrtConfig#defaults()}. */
     public static SrtListener bind(InetSocketAddress localAddress) throws InterruptedException {
+        return bind(localAddress, SrtConfig.defaults());
+    }
+
+    public static SrtListener bind(InetSocketAddress localAddress, SrtConfig config) throws InterruptedException {
         SrtSocketIdDemultiplexer demultiplexer = new SrtSocketIdDemultiplexer();
         EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
         Bootstrap bootstrap = new Bootstrap()
@@ -86,11 +91,11 @@ public final class SrtListener {
         InetSocketAddress boundAddress = (InetSocketAddress) channel.localAddress();
 
         SynCookie cookie = SynCookie.forListener(boundAddress.toString());
-        ListenerHandshake listenerHandshake =
-                new ListenerHandshake(cookie, boundAddress.getAddress(), DEFAULT_SRT_VERSION);
+        ListenerHandshake listenerHandshake = new ListenerHandshake(
+                cookie, boundAddress.getAddress(), config.srtVersion(), config.maxMss());
 
         SrtListener listener = new SrtListener(
-                channel, group, demultiplexer, listenerHandshake, new SrtSocketIdGenerator());
+                channel, group, demultiplexer, listenerHandshake, new SrtSocketIdGenerator(), config);
         demultiplexer.setAcceptor(listener::onHandshakePacket);
         return listener;
     }
@@ -240,7 +245,8 @@ public final class SrtListener {
                 return;
             }
 
-            encryptionContext = EncryptionContext.awaitingPeerKeys(accepted.passphrase(), accepted.keyLength());
+            encryptionContext = EncryptionContext.awaitingPeerKeys(accepted.passphrase(), accepted.keyLength(),
+                    config.keyRefreshPackets(), config.keyPreAnnouncePackets());
             if (!encryptionContext.adopt(request.keyMaterial())) {
                 encryptionContext.destroy();
                 // A key shorter than the application asked for is a downgrade, not
@@ -256,7 +262,7 @@ public final class SrtListener {
 
         SrtSocketId assignedSocketId = socketIdGenerator.generate();
         HandshakeCif response = listenerHandshake.buildAcceptResponse(
-                request, assignedSocketId, DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS,
+                request, assignedSocketId, config.latencyMillis(), config.latencyMillis(),
                 encryptionContext != null ? request.keyMaterial() : null);
         acceptedByPeerSocketId.put(request.srtSocketId(), response);
 

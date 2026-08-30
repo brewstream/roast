@@ -130,7 +130,8 @@ public final class SrtConnection {
      * advertise-a-zero-window bug that cost ~35-42% of a real stream (see
      * {@link #tick}). gosrt sidesteps the question by always reporting its own
      * configured {@code FC} ({@code connection.go}'s {@code sendACK}, default
-     * 25600) rather than anything negotiated.
+     * 25600) rather than anything negotiated. Matches {@code SrtConfig}'s own
+     * default; the negotiated value normally wins.
      */
     private static final int FALLBACK_RECEIVE_FLOW_WINDOW_PACKETS = 8192;
 

@@ -63,9 +63,7 @@ public final class SrtCaller {
 
     private static final Logger LOG = Logger.getLogger(SrtCaller.class.getName());
     private static final SecureRandom RANDOM = new SecureRandom();
-    private static final int DEFAULT_LATENCY_MILLIS = 120;
-    private static final int DEFAULT_SRT_VERSION = 0x010401;
-    private static final long CONNECT_TIMEOUT_SECONDS = 5;
+
     /**
      * How often an unanswered handshake request is repeated. libsrt's own rule
      * ({@code core.cpp}: "avoid sending too many requests, at most 1 request per
@@ -77,13 +75,14 @@ public final class SrtCaller {
     private final Channel channel;
     private final EventLoopGroup eventLoopGroup;
     private final SrtSocketIdDemultiplexer demultiplexer;
-    private final CallerHandshake callerHandshake = new CallerHandshake();
+    private final CallerHandshake callerHandshake;
     private final InetSocketAddress remoteAddress;
     private final InetAddress localAddress;
     private final SrtSocketId ownSocketId;
     private final CircularNumber ownInitialSequenceNumber;
     private final String streamId;
     private final EncryptionContext encryptionContext;
+    private final SrtConfig config;
     private final CompletableFuture<SrtConnection> result;
     private final long startNanos = System.nanoTime();
 
@@ -95,7 +94,7 @@ public final class SrtCaller {
     private SrtCaller(Channel channel, EventLoopGroup eventLoopGroup, SrtSocketIdDemultiplexer demultiplexer,
             InetSocketAddress remoteAddress, InetAddress localAddress, SrtSocketId ownSocketId,
             CircularNumber ownInitialSequenceNumber, String streamId, EncryptionContext encryptionContext,
-            CompletableFuture<SrtConnection> result) {
+            SrtConfig config, CompletableFuture<SrtConnection> result) {
         this.channel = channel;
         this.eventLoopGroup = eventLoopGroup;
         this.demultiplexer = demultiplexer;
@@ -105,12 +104,20 @@ public final class SrtCaller {
         this.ownInitialSequenceNumber = ownInitialSequenceNumber;
         this.streamId = streamId;
         this.encryptionContext = encryptionContext;
+        this.config = config;
+        this.callerHandshake = new CallerHandshake(config.flowWindowPackets());
         this.result = result;
     }
 
     /** Connects to {@code remoteAddress}, completing once the handshake finishes (or failing on rejection/timeout). */
     public static CompletableFuture<SrtConnection> connect(InetSocketAddress remoteAddress, String streamId) {
-        return connect(remoteAddress, streamId, null, 0);
+        return connect(remoteAddress, streamId, null, 0, SrtConfig.defaults());
+    }
+
+    /** Connects with explicit settings; see {@link SrtConfig}. */
+    public static CompletableFuture<SrtConnection> connect(InetSocketAddress remoteAddress, String streamId,
+            SrtConfig config) {
+        return connect(remoteAddress, streamId, null, 0, config);
     }
 
     /**
@@ -127,10 +134,17 @@ public final class SrtCaller {
      */
     public static CompletableFuture<SrtConnection> connect(InetSocketAddress remoteAddress, String streamId,
             char[] passphrase, int keyLength) {
+        return connect(remoteAddress, streamId, passphrase, keyLength, SrtConfig.defaults());
+    }
+
+    /** Connects with encryption and explicit settings. */
+    public static CompletableFuture<SrtConnection> connect(InetSocketAddress remoteAddress, String streamId,
+            char[] passphrase, int keyLength, SrtConfig config) {
         CompletableFuture<SrtConnection> result = new CompletableFuture<>();
         EncryptionContext encryptionContext = passphrase == null
                 ? null
-                : EncryptionContext.generating(passphrase, keyLength);
+                : EncryptionContext.generating(passphrase, keyLength,
+                        config.keyRefreshPackets(), config.keyPreAnnouncePackets());
         SrtSocketIdDemultiplexer demultiplexer = new SrtSocketIdDemultiplexer();
         EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
         Bootstrap bootstrap = new Bootstrap()
@@ -156,7 +170,7 @@ public final class SrtCaller {
             CircularNumber ownInitialSequenceNumber = randomInitialSequenceNumber();
 
             new SrtCaller(channel, group, demultiplexer, remoteAddress, localAddress, ownSocketId,
-                    ownInitialSequenceNumber, streamId, encryptionContext, result)
+                    ownInitialSequenceNumber, streamId, encryptionContext, config, result)
                     .start();
         });
 
@@ -165,7 +179,8 @@ public final class SrtCaller {
 
     private void start() {
         demultiplexer.register(ownSocketId, this::onHandshakeReply);
-        timeoutTask = channel.eventLoop().schedule(this::onTimeout, CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        timeoutTask = channel.eventLoop().schedule(this::onTimeout,
+                config.connectTimeout().toMillis(), TimeUnit.MILLISECONDS);
         pendingRequest = callerHandshake.buildInductionRequest(ownSocketId, localAddress);
         send(pendingRequest);
         // Repeat whichever step is still unanswered. Without this a single lost
@@ -226,8 +241,8 @@ public final class SrtCaller {
         }
         // The caller generates the keys, so the conclusion is where we announce them.
         HandshakeCif conclusionRequest = callerHandshake.buildConclusionRequest(
-                reply, ownSocketId, localAddress, ownInitialSequenceNumber, DEFAULT_SRT_VERSION,
-                DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS, streamId,
+                reply, ownSocketId, localAddress, ownInitialSequenceNumber, config.srtVersion(),
+                config.latencyMillis(), config.latencyMillis(), streamId,
                 encryptionContext == null ? null : encryptionContext.keyMaterial(KeyEncryption.BOTH));
         conclusionSent = true;
         pendingRequest = conclusionRequest;
@@ -236,7 +251,7 @@ public final class SrtCaller {
 
     private void handleConclusionReply(HandshakeCif reply) {
         ConclusionReplyOutcome outcome = callerHandshake.validateConclusionReply(
-                reply, DEFAULT_SRT_VERSION, DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS);
+                reply, config.srtVersion(), config.latencyMillis(), config.latencyMillis());
 
         if (outcome instanceof ConclusionReplyOutcome.Connected connected) {
             // A listener that could unwrap our key material echoes it back as

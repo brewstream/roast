@@ -5,6 +5,7 @@ import org.brewstream.roast.socket.AcceptDecision;
 import org.brewstream.roast.socket.AcceptedConnection;
 import org.brewstream.roast.socket.ConnectionRequest;
 import org.brewstream.roast.socket.SrtCaller;
+import org.brewstream.roast.socket.SrtConfig;
 import org.brewstream.roast.socket.SrtConnection;
 import org.brewstream.roast.socket.SrtListener;
 import org.junit.jupiter.api.AfterEach;
@@ -278,6 +279,71 @@ class LibsrtInteropTest {
         // AES-CTR output matches what its own implementation expects. It drops
         // anything it considers unencrypted, so cleartext would fail here too.
         assertThat(Files.readAllBytes(outputFile)).isEqualTo(expected);
+    }
+
+
+    /**
+     * The last Phase 0-5 straggler: a key rotation <em>we</em> initiate, accepted
+     * by real libsrt. Everything else about rotation was verified against gosrt
+     * vectors or between two of our own contexts; nothing had watched an
+     * independent implementation keep decrypting across a key change.
+     *
+     * <p>This was blocked until {@link SrtConfig} existed. The production
+     * schedule is 2^24 packets — roughly 22 GB at full payload — so it cannot be
+     * driven by a test; the schedule had to become configurable for its own
+     * sake before this was possible, rather than a parameter added to make one
+     * test work.
+     *
+     * <p>libsrt writing plaintext out after the rotation point is the assertion:
+     * it only does that if it accepted our mid-stream KMREQ and switched to the
+     * announced key. Encrypting with a key it had not adopted would produce
+     * garbage, not a short file.
+     */
+    @Test
+    void realLibsrtFollowsAKeyRotationWeInitiate() throws Exception {
+        // Rotate every 40 packets, announcing 10 ahead - several rotations
+        // within a few hundred packets.
+        SrtConfig rotating = SrtConfig.defaults().withKeyRotation(40, 10);
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0), rotating);
+        listener.setAcceptHandler(request -> AcceptDecision.accept(PASSPHRASE.toCharArray(), 16));
+
+        // Count rotations we actually performed. Without this the test passes
+        // whether or not anything rotated - libsrt decrypts happily with the
+        // original key - which would assert nothing about rotation at all.
+        java.util.concurrent.atomic.AtomicInteger rotations = new java.util.concurrent.atomic.AtomicInteger();
+        listener.addEventListener(new org.brewstream.roast.socket.SrtConnectionListener() {
+            @Override
+            public void onKeyRotated(org.brewstream.roast.socket.SrtConnection connection) {
+                rotations.incrementAndGet();
+            }
+        });
+
+        byte[] chunk = "roast-rotation-interop\n".getBytes(StandardCharsets.US_ASCII);
+        int writes = 200; // comfortably past several rotation boundaries
+        listener.onConnection(connection -> {
+            for (int i = 0; i < writes; i++) {
+                connection.write(Unpooled.wrappedBuffer(chunk));
+            }
+        });
+
+        Path outputFile = Files.createTempFile("roast-interop-rotation-", ".bin");
+        outputFile.toFile().deleteOnExit();
+        srtLiveTransmit = launchSrtLiveTransmitSending(listener.localAddress().getPort(), outputFile,
+                "&passphrase=" + PASSPHRASE + "&pbkeylen=16");
+
+        boolean exited = srtLiveTransmit.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        assertThat(exited).as("srt-live-transmit should exit on its own -t timeout").isTrue();
+
+        byte[] expected = new byte[chunk.length * writes];
+        for (int i = 0; i < writes; i++) {
+            System.arraycopy(chunk, 0, expected, i * chunk.length, chunk.length);
+        }
+        assertThat(Files.readAllBytes(outputFile))
+                .as("libsrt must keep decrypting across every rotation")
+                .isEqualTo(expected);
+        assertThat(rotations.get())
+                .as("rotations must actually have happened, or this asserts nothing")
+                .isPositive();
     }
 
     /** A mismatched passphrase must be refused outright, not silently produce garbage. */

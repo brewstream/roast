@@ -36,11 +36,22 @@ public final class CallerHandshake {
     private static final int MAX_MSS_SIZE = 1500;
     private static final int DEFAULT_FLOW_WINDOW_SIZE = 8192;
 
+    private final int flowWindowSize;
+
+    public CallerHandshake() {
+        this(DEFAULT_FLOW_WINDOW_SIZE);
+    }
+
+    /** @param flowWindowSize the receive window advertised in the induction request (see {@code SrtConfig}) */
+    public CallerHandshake(int flowWindowSize) {
+        this.flowWindowSize = flowWindowSize;
+    }
+
     /** The fixed induction request: version 4, zero ISN/cookie, no extensions — matches gosrt's {@code sendInduction} exactly. */
     public HandshakeCif buildInductionRequest(SrtSocketId ownSocketId, InetAddress ownAddress) {
         return new HandshakeCif(
                 true, 4, 0, 2,
-                CircularNumber.of(0, SrtPacket.MAX_SEQUENCE_NUMBER), MAX_MSS_SIZE, DEFAULT_FLOW_WINDOW_SIZE,
+                CircularNumber.of(0, SrtPacket.MAX_SEQUENCE_NUMBER), MAX_MSS_SIZE, flowWindowSize,
                 HandshakeType.INDUCTION.code(),
                 ownSocketId, 0, ownAddress, null, null);
     }

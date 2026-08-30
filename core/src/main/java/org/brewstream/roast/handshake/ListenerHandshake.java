@@ -27,11 +27,11 @@ public final class ListenerHandshake {
 
     /** The magic value SRT uses in an induction reply's Extension Field to advertise SRT support (vs. plain UDT). */
     private static final int SRT_MAGIC_CODE = 0x4A17;
-    private static final int MAX_MSS_SIZE = 1500;
 
     private final SynCookie cookie;
     private final InetAddress ownAddress;
     private final int srtVersion;
+    private final int maxMssSize;
 
     /**
      * @param srtVersion this listener's own SRT version — advertised in accept
@@ -39,9 +39,15 @@ public final class ListenerHandshake {
      *                   report to avoid a {@link RejectionReason#VERSION} rejection.
      */
     public ListenerHandshake(SynCookie cookie, InetAddress ownAddress, int srtVersion) {
+        this(cookie, ownAddress, srtVersion, 1500);
+    }
+
+    /** @param maxMssSize the largest MTU this listener will accept from a peer */
+    public ListenerHandshake(SynCookie cookie, InetAddress ownAddress, int srtVersion, int maxMssSize) {
         this.cookie = cookie;
         this.ownAddress = ownAddress;
         this.srtVersion = srtVersion;
+        this.maxMssSize = maxMssSize;
     }
 
     /** An INDUCTION request always gets a reply — there's nothing to reject yet, just a cookie to hand out. */
@@ -64,7 +70,7 @@ public final class ListenerHandshake {
         if (!cookie.verify(request.synCookie(), senderAddress)) {
             return new ConclusionOutcome.Rejected(buildRejectResponse(request, RejectionReason.ROGUE));
         }
-        if (request.maxTransmissionUnitSize() > MAX_MSS_SIZE) {
+        if (request.maxTransmissionUnitSize() > maxMssSize) {
             return new ConclusionOutcome.Rejected(buildRejectResponse(request, RejectionReason.ROGUE));
         }
         if (request.version() != 5) {
