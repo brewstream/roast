@@ -223,12 +223,13 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-226 tests passing (128 default + 3 gated interop + 2 ACKACK/RTT + 5
+245 tests passing (128 default + 3 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
 `ReceiveRateEstimatorTest` + 12 `KeyMaterialCifTest` + 16 `StreamKeyWrapperTest`
-+ 17 `PayloadCipherTest` + 11 `CallerHandshakeTest` + 3 `SrtCallerTest`),
++ 17 `PayloadCipherTest` + 19 `EncryptionContextTest` + 11 `CallerHandshakeTest`
++ 3 `SrtCallerTest`),
 all committed to `main` (no branches). Every commit so far has been asked-for
 explicitly by the user, one narrowly-scoped piece at a time — see git log for
 the exact sequence and rationale (commit messages are detailed).
@@ -486,8 +487,25 @@ numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
   all three key lengths, both keys, both directions); mutation-checked by
   widening the nonce to all 16 salt bytes, which fails 10 tests. Deliberately
   stateless about keys — the caller passes the SEK, since choosing between
-  even/odd and rotating them is connection-level key management that doesn't
-  exist yet.
+  even/odd and rotating them is connection-level key management that lives in
+  `EncryptionContext` instead.
+- `EncryptionContext` — one connection's live encryption state: the salt, both
+  SEKs, and which is active. Builds the KM message announcing our keys,
+  adopts a peer's, and encrypts/decrypts payloads with the key a DATA header's
+  KK field names. **This is a context, not configuration** — a distinction
+  raised in review and worth keeping: the passphrase and key length are static
+  inputs, but everything here is derived from them and then changes over the
+  connection's life. Both references split it the same way (gosrt:
+  `Passphrase`/`PBKeyLen` in `Config`, the `crypto` object and
+  `keyBaseEncryption` on `srtConn`; libsrt: socket options vs
+  `CCryptoControl`). Deliberately **no `SrtConfig`** was invented for the
+  passphrase — a secret has no business in a general-purpose settings bag, and
+  a record's generated `toString` would leak it. It's held as a `char[]` that
+  `destroy()` zeroes, and `toString()` reveals only whether keys exist.
+  Adopting a peer's KM takes **their salt before deriving the KEK** (ported
+  from gosrt's `UnmarshalKM`; the wrong order derives from the wrong bytes and
+  every unwrap fails — mutation-checked). Rotation *policy* is deliberately
+  absent, since it's driven by packet flow — see "Next steps".
 
 **`handshake`** — `SynCookie`: MD5-based SYN cookie so a listener can verify an
 INDUCTION cookie was echoed back correctly in CONCLUSION without keeping
@@ -952,26 +970,38 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
 ## Next steps, in order
 
 1. **Finish Phase 5 (encryption) — only the wiring is left.** Every piece of
-   the cryptography now exists and is verified against gosrt golden vectors,
-   and *none of it is connected to anything*: `KeyMaterialCif` (the KM wire
-   format), `StreamKeyWrapper` (KEK derivation + SEK wrapping), and
-   `PayloadCipher` (AES-CTR). See "What's built". The remaining step is
+   the cryptography now exists, and *none of it is connected to anything*:
+   `KeyMaterialCif` (the KM wire format), `StreamKeyWrapper` (KEK derivation +
+   SEK wrapping), `PayloadCipher` (AES-CTR) — all three verified against gosrt
+   golden vectors — and `EncryptionContext`, the per-connection state that
+   composes them. See "What's built". The remaining step is
    deliberately the one that was saved for last, because it's the only one
    that changes live behavior:
-   - **`SrtConfig`** first, or at least a passphrase-carrying equivalent — an
-     already-documented gap, and a passphrase has nowhere to live without it.
-     This also touches `SrtListener`/`SrtCaller`'s currently-hardcoded
-     latency/version defaults, so it's worth a deliberate design pass rather
-     than bolting a passphrase parameter onto both.
+   - ~~Key management on the connection~~ **done** — `EncryptionContext`
+     holds the salt and both SEKs, produces and adopts KM messages, and
+     encrypts/decrypts with the right key. Still not referenced by any
+     connection code.
+   - **How the passphrase reaches a connection.** Explicitly *not* by
+     inventing an `SrtConfig` to put a secret in (see `EncryptionContext`
+     above). Options worth weighing: a narrow purpose-named holder passed to
+     `SrtListener.bind`/`SrtCaller.connect`, or supplying the context itself
+     per connection. Note `AcceptHandler` already sees `ConnectionRequest`
+     and could plausibly decide a passphrase per stream — that's an
+     extensibility angle DESIGN.md's §4 would like, and worth considering
+     before picking.
    - **KM extension parsing in `HandshakeCif`** — the codec exists; the
-     handshake still skips KMREQ/KMRSP by declared length.
-   - **Key management on the connection**: hold the even/odd SEKs, pick one
-     per packet, decrypt inbound by the DATA header's KK field, and honour
-     rotation with pre-announce (gosrt's `kmPreAnnounce`/`kmRefreshRate`
-     countdown lives in its `pop`, worth reading before designing this).
+     handshake still skips KMREQ/KMRSP by declared length. Also needs the
+     handshake's Encryption Field (the advertised key length) honoured.
+   - **`SrtConnection` wiring**: encrypt on send with the active key and set
+     the DATA header's KK field; decrypt on receive by that field. Note the
+     header already carries `kk` as a raw int, so no packet-layer change is
+     needed.
+   - **Rotation policy**: gosrt's `kmPreAnnounce`/`kmRefreshRate` countdowns
+     live in its `pop`, worth reading before designing this. Neither
+     reference unit-tests it.
    - **Interop**: a real `srt-live-transmit` run with `passphrase=` on both
      sides is the actual definition of done here, exactly as it was for the
-     handshake and send path. Expect this step to want real quota headroom.
+     handshake and send path.
 2. Phase 6 (multiplexing & polish) — the alternative major milestone,
    independent of Phase 5 and not blocked by it. Many connections per port,
    live pollable stats, and the `srt-java-live-transmit` CLI that `RelayDemo`
