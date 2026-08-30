@@ -95,6 +95,78 @@ class SrtCallerTest {
         assertThat(thrown.getCause()).hasMessageContaining("FORBIDDEN");
     }
 
+
+    private static final char[] PASSPHRASE = "roast-caller-secret".toCharArray();
+
+    /**
+     * The caller side of encryption, which until now did not exist: Roast could
+     * be an encrypted listener but never an encrypted caller. Unlike the
+     * listener, the caller *generates* the keys and announces them in its
+     * CONCLUSION, so this exercises the opposite half of the key exchange.
+     */
+    @Test
+    void anEncryptedCallerAndListenerExchangeDataBothWays() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
+        listener.setAcceptHandler(request -> AcceptDecision.accept(PASSPHRASE.clone(), 16));
+        CompletableFuture<SrtConnection> listenerSide = new CompletableFuture<>();
+        listener.onConnection(listenerSide::complete);
+
+        callerSideConnection = SrtCaller.connect(
+                        new InetSocketAddress("127.0.0.1", listener.localAddress().getPort()),
+                        STREAM_ID, PASSPHRASE.clone(), 16)
+                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        listenerSideConnection = listenerSide.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        CompletableFuture<String> receivedByListener = new CompletableFuture<>();
+        listenerSideConnection.onData(payload -> {
+            receivedByListener.complete(payload.toString(StandardCharsets.US_ASCII));
+            payload.release();
+        });
+        CompletableFuture<String> receivedByCaller = new CompletableFuture<>();
+        callerSideConnection.onData(payload -> {
+            receivedByCaller.complete(payload.toString(StandardCharsets.US_ASCII));
+            payload.release();
+        });
+
+        callerSideConnection.write(Unpooled.wrappedBuffer("caller-to-listener".getBytes(StandardCharsets.US_ASCII)));
+        listenerSideConnection.write(Unpooled.wrappedBuffer("listener-to-caller".getBytes(StandardCharsets.US_ASCII)));
+
+        assertThat(receivedByListener.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo("caller-to-listener");
+        assertThat(receivedByCaller.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isEqualTo("listener-to-caller");
+    }
+
+    /** A listener with a different passphrase can't unwrap our keys, so the connect must fail. */
+    @Test
+    void anEncryptedCallerFailsAgainstAListenerWithADifferentPassphrase() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
+        listener.setAcceptHandler(request -> AcceptDecision.accept("a-different-secret".toCharArray(), 16));
+
+        CompletableFuture<SrtConnection> connecting = SrtCaller.connect(
+                new InetSocketAddress("127.0.0.1", listener.localAddress().getPort()),
+                STREAM_ID, PASSPHRASE.clone(), 16);
+
+        Throwable thrown = catchThrowable(() -> connecting.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+
+        assertThat(thrown).isInstanceOf(ExecutionException.class);
+        assertThat(thrown.getCause()).hasMessageContaining("BADSECRET");
+    }
+
+    /** An encrypted caller against a listener expecting cleartext must not silently connect. */
+    @Test
+    void anEncryptedCallerFailsAgainstAnUnencryptedListener() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
+        listener.setAcceptHandler(request -> AcceptDecision.accept());
+
+        CompletableFuture<SrtConnection> connecting = SrtCaller.connect(
+                new InetSocketAddress("127.0.0.1", listener.localAddress().getPort()),
+                STREAM_ID, PASSPHRASE.clone(), 16);
+
+        Throwable thrown = catchThrowable(() -> connecting.get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
+
+        assertThat(thrown).isInstanceOf(ExecutionException.class);
+        assertThat(thrown.getCause()).hasMessageContaining("key material");
+    }
+
     @Test
     void connectTimesOutWhenNothingIsListening() throws Exception {
         int unusedPort;

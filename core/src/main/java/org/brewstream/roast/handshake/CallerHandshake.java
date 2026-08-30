@@ -6,6 +6,7 @@ import org.brewstream.roast.packet.cif.HandshakeCif;
 import org.brewstream.roast.packet.cif.HandshakeExtension;
 import org.brewstream.roast.packet.cif.HandshakeExtensionFlags;
 import org.brewstream.roast.packet.cif.HandshakeType;
+import org.brewstream.roast.packet.cif.KeyMaterialCif;
 import org.brewstream.roast.util.CircularNumber;
 
 import java.net.InetAddress;
@@ -59,17 +60,36 @@ public final class CallerHandshake {
     public HandshakeCif buildConclusionRequest(HandshakeCif inductionReply, SrtSocketId ownSocketId,
             InetAddress ownAddress, CircularNumber ownInitialSequenceNumber, int srtVersion,
             int receiveLatencyMillis, int sendLatencyMillis, String streamId) {
+        return buildConclusionRequest(inductionReply, ownSocketId, ownAddress, ownInitialSequenceNumber,
+                srtVersion, receiveLatencyMillis, sendLatencyMillis, streamId, null);
+    }
+
+    /**
+     * As above, additionally offering {@code keyMaterial} as a KMREQ extension.
+     * The <em>caller</em> is the side that generates the keys: it announces them
+     * here, and a listener that can unwrap them with the same passphrase echoes
+     * the identical message back as KMRSP. Pass {@code null} for an unencrypted
+     * connection.
+     *
+     * <p>The Encryption Field advertises the cipher family and key size
+     * (draft-sharabayko-srt.md Table 2: {@code 2} = AES-128 / 16 bytes,
+     * {@code 3} = 24, {@code 4} = 32 — the key length in eight-byte units).
+     */
+    public HandshakeCif buildConclusionRequest(HandshakeCif inductionReply, SrtSocketId ownSocketId,
+            InetAddress ownAddress, CircularNumber ownInitialSequenceNumber, int srtVersion,
+            int receiveLatencyMillis, int sendLatencyMillis, String streamId, KeyMaterialCif keyMaterial) {
         boolean hasStreamId = streamId != null && !streamId.isEmpty();
-        int extensionField = 1 | (hasStreamId ? 4 : 0);
+        int extensionField = 1 | (keyMaterial != null ? 2 : 0) | (hasStreamId ? 4 : 0);
+        int encryptionField = keyMaterial != null ? keyMaterial.keyLength() / 8 : 0;
 
         HandshakeExtensionFlags flags = new HandshakeExtensionFlags(true, true, true, true, true, true, false, false);
         HandshakeExtension extension = new HandshakeExtension(srtVersion, flags, receiveLatencyMillis, sendLatencyMillis);
 
         return new HandshakeCif(
-                true, 5, 0, extensionField,
+                true, 5, encryptionField, extensionField,
                 ownInitialSequenceNumber, inductionReply.maxTransmissionUnitSize(), inductionReply.maxFlowWindowSize(),
                 HandshakeType.CONCLUSION.code(),
-                ownSocketId, inductionReply.synCookie(), ownAddress, extension, streamId);
+                ownSocketId, inductionReply.synCookie(), ownAddress, extension, streamId, keyMaterial);
     }
 
     /**

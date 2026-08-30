@@ -15,6 +15,7 @@ import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.util.concurrent.ScheduledFuture;
 import org.brewstream.roast.codec.SrtFrameDecoder;
 import org.brewstream.roast.codec.SrtFrameEncoder;
+import org.brewstream.roast.crypto.EncryptionContext;
 import org.brewstream.roast.handshake.CallerHandshake;
 import org.brewstream.roast.handshake.ConclusionReplyOutcome;
 import org.brewstream.roast.packet.ControlPacket;
@@ -22,6 +23,7 @@ import org.brewstream.roast.packet.ControlType;
 import org.brewstream.roast.packet.SrtPacket;
 import org.brewstream.roast.packet.SrtSocketId;
 import org.brewstream.roast.packet.cif.HandshakeCif;
+import org.brewstream.roast.packet.cif.KeyEncryption;
 import org.brewstream.roast.packet.cif.HandshakeType;
 import org.brewstream.roast.util.CircularNumber;
 
@@ -74,6 +76,7 @@ public final class SrtCaller {
     private final SrtSocketId ownSocketId;
     private final CircularNumber ownInitialSequenceNumber;
     private final String streamId;
+    private final EncryptionContext encryptionContext;
     private final CompletableFuture<SrtConnection> result;
     private final long startNanos = System.nanoTime();
 
@@ -81,7 +84,8 @@ public final class SrtCaller {
 
     private SrtCaller(Channel channel, EventLoopGroup eventLoopGroup, SrtSocketIdDemultiplexer demultiplexer,
             InetSocketAddress remoteAddress, InetAddress localAddress, SrtSocketId ownSocketId,
-            CircularNumber ownInitialSequenceNumber, String streamId, CompletableFuture<SrtConnection> result) {
+            CircularNumber ownInitialSequenceNumber, String streamId, EncryptionContext encryptionContext,
+            CompletableFuture<SrtConnection> result) {
         this.channel = channel;
         this.eventLoopGroup = eventLoopGroup;
         this.demultiplexer = demultiplexer;
@@ -90,12 +94,33 @@ public final class SrtCaller {
         this.ownSocketId = ownSocketId;
         this.ownInitialSequenceNumber = ownInitialSequenceNumber;
         this.streamId = streamId;
+        this.encryptionContext = encryptionContext;
         this.result = result;
     }
 
     /** Connects to {@code remoteAddress}, completing once the handshake finishes (or failing on rejection/timeout). */
     public static CompletableFuture<SrtConnection> connect(InetSocketAddress remoteAddress, String streamId) {
+        return connect(remoteAddress, streamId, null, 0);
+    }
+
+    /**
+     * Connects with encryption. Unlike the listener — which adopts whatever the
+     * peer announces — the <em>caller</em> generates the salt and both Stream
+     * Encrypting Keys and offers them in its CONCLUSION, so {@code keyLength}
+     * really is this side's choice here (16, 24, or 32 bytes). The connection
+     * fails if the peer doesn't echo the key material back, which is what it
+     * does when it can't unwrap it with the same passphrase.
+     *
+     * <p>{@code passphrase} is copied, so the caller may zero its own; the
+     * connection zeroes the copy when it closes. Pass {@code null} for an
+     * unencrypted connection.
+     */
+    public static CompletableFuture<SrtConnection> connect(InetSocketAddress remoteAddress, String streamId,
+            char[] passphrase, int keyLength) {
         CompletableFuture<SrtConnection> result = new CompletableFuture<>();
+        EncryptionContext encryptionContext = passphrase == null
+                ? null
+                : EncryptionContext.generating(passphrase, keyLength);
         SrtSocketIdDemultiplexer demultiplexer = new SrtSocketIdDemultiplexer();
         EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
         Bootstrap bootstrap = new Bootstrap()
@@ -121,7 +146,7 @@ public final class SrtCaller {
             CircularNumber ownInitialSequenceNumber = randomInitialSequenceNumber();
 
             new SrtCaller(channel, group, demultiplexer, remoteAddress, localAddress, ownSocketId,
-                    ownInitialSequenceNumber, streamId, result)
+                    ownInitialSequenceNumber, streamId, encryptionContext, result)
                     .start();
         });
 
@@ -165,9 +190,11 @@ public final class SrtCaller {
             fail(new IOException("peer doesn't support SRT handshake v5"));
             return;
         }
+        // The caller generates the keys, so the conclusion is where we announce them.
         HandshakeCif conclusionRequest = callerHandshake.buildConclusionRequest(
                 reply, ownSocketId, localAddress, ownInitialSequenceNumber, DEFAULT_SRT_VERSION,
-                DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS, streamId);
+                DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS, streamId,
+                encryptionContext == null ? null : encryptionContext.keyMaterial(KeyEncryption.BOTH));
         send(conclusionRequest);
     }
 
@@ -176,6 +203,15 @@ public final class SrtCaller {
                 reply, DEFAULT_SRT_VERSION, DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS);
 
         if (outcome instanceof ConclusionReplyOutcome.Connected connected) {
+            // A listener that could unwrap our key material echoes it back as
+            // KMRSP. No echo means it could not - it either has a different
+            // passphrase or none at all - and continuing would send it payloads
+            // it can never read.
+            if (encryptionContext != null && reply.keyMaterial() == null) {
+                fail(new IOException("peer did not accept our key material - passphrase mismatch?"));
+                return;
+            }
+
             timeoutTask.cancel(false);
             demultiplexer.unregister(ownSocketId);
 
@@ -187,7 +223,8 @@ public final class SrtCaller {
                     () -> {
                         channel.close();
                         eventLoopGroup.shutdownGracefully();
-                    });
+                    },
+                    encryptionContext);
 
             if (!result.complete(connection)) {
                 // A racing timeout already failed this connect - don't leak the connection we just built.
