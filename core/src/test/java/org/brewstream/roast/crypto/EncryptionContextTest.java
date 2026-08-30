@@ -52,6 +52,45 @@ class EncryptionContextTest {
         assertThat(wire).isEqualTo(original);
     }
 
+
+    /**
+     * A peer may announce only the key it is currently using rather than both,
+     * and real libsrt does exactly that. This is the case that must work
+     * end-to-end: adopting a single key has to leave the context able to
+     * encrypt, or nothing gets encrypted at all and the peer drops every packet
+     * as unexpectedly-cleartext. Found against real libsrt, which reported
+     * "Packet not encrypted ... dropped" while we happily sent plaintext.
+     */
+    @ParameterizedTest
+    @ValueSource(ints = {16, 24, 32})
+    void adoptingOnlyOneAnnouncedKeyStillAllowsEncryption(int keyLength) {
+        EncryptionContext sender = EncryptionContext.generating(passphrase(), keyLength);
+        EncryptionContext receiver = EncryptionContext.awaitingPeerKeys(passphrase(), keyLength);
+
+        // Only the even key is announced - the odd one is never sent.
+        assertThat(receiver.adopt(sender.keyMaterial(KeyEncryption.EVEN))).isTrue();
+        assertThat(receiver.hasKeys()).isTrue();
+
+        byte[] original = payload();
+        byte[] wire = original.clone();
+        receiver.encrypt(wire, 77);
+        assertThat(wire).isNotEqualTo(original);
+
+        assertThat(sender.decrypt(wire, 77, receiver.activeKey())).isTrue();
+        assertThat(wire).isEqualTo(original);
+    }
+
+    /** A key we were never given can't decrypt, even though the other one is usable. */
+    @Test
+    void aPacketNamingAKeyWeWereNeverGivenIsRejected() {
+        EncryptionContext sender = EncryptionContext.generating(passphrase(), 16);
+        EncryptionContext receiver = EncryptionContext.awaitingPeerKeys(passphrase(), 16);
+        receiver.adopt(sender.keyMaterial(KeyEncryption.EVEN)); // even only
+
+        assertThat(receiver.decrypt(payload(), 1, KeyEncryption.EVEN)).isTrue();
+        assertThat(receiver.decrypt(payload(), 1, KeyEncryption.ODD)).isFalse();
+    }
+
     @Test
     void aReceiverWithTheWrongPassphraseRejectsTheKeyMaterialAndKeepsNoKeys() {
         EncryptionContext sender = EncryptionContext.generating(passphrase(), 16);

@@ -100,9 +100,17 @@ public final class EncryptionContext {
         oddSek = randomBytes(keyLength);
     }
 
-    /** True once this context has usable keys — either generated or adopted from a peer. */
+    /**
+     * True once this context can encrypt: it has a salt and the
+     * {@linkplain #activeKey() active} key. Deliberately <em>not</em> "has both
+     * keys" — a peer is free to announce only the one it is currently using,
+     * and real libsrt does exactly that. Requiring both meant a context keyed
+     * from such a peer reported no keys, so nothing was ever encrypted and the
+     * peer dropped every packet as unexpectedly-cleartext (found against real
+     * libsrt, which logs it as "Packet not encrypted ... dropped").
+     */
     public boolean hasKeys() {
-        return salt != null && evenSek != null && oddSek != null;
+        return salt != null && keyFor(activeKey) != null;
     }
 
     /** Which key {@link #encrypt} currently uses, and which a peer should expect in a DATA header's KK field. */
@@ -211,7 +219,7 @@ public final class EncryptionContext {
      * with a key we were never told about — droppable, not fatal).
      */
     public boolean decrypt(byte[] payload, int packetSequenceNumber, KeyEncryption key) {
-        if (!hasKeys() || key == null || key == KeyEncryption.BOTH) {
+        if (!canUse(key)) {
             return false;
         }
         PayloadCipher.encryptOrDecrypt(payload, keyFor(key), salt, packetSequenceNumber);
@@ -220,7 +228,7 @@ public final class EncryptionContext {
 
     /** As {@link #decrypt(byte[], int, KeyEncryption)}, for a packet payload held in a {@link ByteBuf}. */
     public boolean decrypt(ByteBuf payload, int packetSequenceNumber, KeyEncryption key) {
-        if (!hasKeys() || key == null || key == KeyEncryption.BOTH) {
+        if (!canUse(key)) {
             return false;
         }
         PayloadCipher.encryptOrDecrypt(payload, keyFor(key), salt, packetSequenceNumber);
@@ -246,6 +254,16 @@ public final class EncryptionContext {
     public String toString() {
         return "EncryptionContext[keyLength=" + keyLength + ", hasKeys=" + hasKeys()
                 + ", activeKey=" + activeKey + "]";
+    }
+
+    /**
+     * Whether a specific key is usable for decryption: it must name one real key
+     * (not {@link KeyEncryption#BOTH}) that we actually hold. Checked per packet
+     * rather than via {@link #hasKeys()}, since a peer may send using a key we
+     * were never given even while our own active key is fine.
+     */
+    private boolean canUse(KeyEncryption key) {
+        return salt != null && key != null && key != KeyEncryption.BOTH && keyFor(key) != null;
     }
 
     private byte[] keyFor(KeyEncryption key) {

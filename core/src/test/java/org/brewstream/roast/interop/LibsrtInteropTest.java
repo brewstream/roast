@@ -227,44 +227,57 @@ class LibsrtInteropTest {
 
 
     /**
-     * Real libsrt completes an <em>encrypted</em> handshake with us: it sends
-     * KMREQ keyed with the shared passphrase, we unwrap it and echo KMRSP, and
-     * it accepts the result and connects. libsrt's own log calls this
-     * {@code KmState: SND=SECURED RCV=SECURED}.
+     * The definition of done for Phase 5: a real libsrt peer keys with a shared
+     * passphrase and <em>decrypts payloads we encrypted</em>. Everything else
+     * about encryption is verified against gosrt's golden vectors, or against
+     * two of our own contexts agreeing with each other; this is the only test
+     * where an independent implementation consumes our key exchange and our
+     * AES-CTR output for real.
      *
-     * <p><b>What this does not yet cover: encrypted DATA.</b> Sending encrypted
-     * payloads to libsrt was tried and it received nothing, while the identical
-     * unencrypted test ({@link #realListenerSendsDataToRealLibsrtCaller})
-     * passes - so our key exchange is right but something about the encrypted
-     * data path is not yet agreed with libsrt. The other direction can't be
-     * driven with this tool at all: {@code srt-live-transmit} reading a
-     * redirected file connects but never transmits, which its own empty
-     * {@code pktSent} stats confirm. Both gaps are recorded in STATUS.md rather
-     * than papered over - the encryption primitives themselves are verified
-     * against gosrt's golden vectors, and Roast-to-Roast encryption is verified
-     * in {@code SrtConnectionTest}, but interop of encrypted payloads is
-     * genuinely unproven.
+     * <p>libsrt requires a passphrase of at least 10 characters, and
+     * {@code pbkeylen} is passed explicitly so both sides agree on a 16-byte key
+     * rather than relying on either default.
+     *
+     * <p>The reverse direction (libsrt encrypts, we decrypt) is not covered
+     * here: {@code srt-live-transmit} reading a redirected file connects but
+     * never transmits, which its own empty {@code pktSent} stats confirm. Doing
+     * that needs {@code ffmpeg}'s muxer instead - see STATUS.md.
      */
     @Test
-    void realLibsrtCallerCompletesAnEncryptedHandshake() throws Exception {
+    void realLibsrtCallerDecryptsWhatWeEncrypt() throws Exception {
         listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
         CompletableFuture<ConnectionRequest> seenRequest = new CompletableFuture<>();
-        CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
         listener.setAcceptHandler(request -> {
             seenRequest.complete(request);
             return AcceptDecision.accept(PASSPHRASE.toCharArray(), 16);
         });
-        listener.onConnection(connected::complete);
+
+        byte[] chunk = "roast-encrypted-interop\n".getBytes(StandardCharsets.US_ASCII);
+        int writes = 5;
+        listener.onConnection(connection -> {
+            for (int i = 0; i < writes; i++) {
+                connection.write(Unpooled.wrappedBuffer(chunk));
+            }
+        });
 
         Path outputFile = Files.createTempFile("roast-interop-enc-", ".bin");
         outputFile.toFile().deleteOnExit();
         srtLiveTransmit = launchSrtLiveTransmitSending(listener.localAddress().getPort(), outputFile,
                 "&passphrase=" + PASSPHRASE + "&pbkeylen=16");
 
-        // The peer asked for encryption, and we got far enough to accept it -
-        // which only happens if its key material unwrapped with our passphrase.
+        boolean exited = srtLiveTransmit.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        assertThat(exited).as("srt-live-transmit should exit on its own -t timeout").isTrue();
+
         assertThat(seenRequest.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).encryptionRequested()).isTrue();
-        assertThat(connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).metadata().streamId()).isEqualTo(STREAM_ID);
+
+        byte[] expected = new byte[chunk.length * writes];
+        for (int i = 0; i < writes; i++) {
+            System.arraycopy(chunk, 0, expected, i * chunk.length, chunk.length);
+        }
+        // libsrt writes plaintext out only if it agreed keys with us AND our
+        // AES-CTR output matches what its own implementation expects. It drops
+        // anything it considers unencrypted, so cleartext would fail here too.
+        assertThat(Files.readAllBytes(outputFile)).isEqualTo(expected);
     }
 
     /** A mismatched passphrase must be refused outright, not silently produce garbage. */
