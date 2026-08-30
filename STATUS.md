@@ -223,7 +223,7 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-268 tests passing (128 default + 5 gated interop + 2 ACKACK/RTT + 5
+274 tests passing (128 default + 6 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
@@ -574,6 +574,13 @@ independent implementation:
   with no induction retry (see its javadoc) — the retry lives in the test so
   that limitation stays visible rather than hidden behind a sleep.
 
+`FfmpegInteropTest` (separate class, its own `Assumptions` check) covers the
+one direction `srt-live-transmit` cannot drive: a real libsrt-backed sender
+*encrypting* to us. It asserts MPEG-TS structure rather than exact bytes, since
+ffmpeg's output isn't reproducible — every payload must be a whole number of
+188-byte packets each starting with `0x47`, which failed decryption would not
+produce (mutation-checked).
+
 Byte-for-byte assertions are safe here because libsrt's own log/verbose
 output goes to stderr by default, and stats-to-stdout is opt-in and left off,
 so stdout redirected straight to a file carries nothing but the raw bytes —
@@ -870,6 +877,15 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `ReceiveRateEstimatorTest`'s consuming half are both self-designed against
   gosrt's source — same rigor tier as this codebase's RTT/drift/wraparound
   pieces, not the stronger ported-scenario tier.
+- **Writing the rule down is not implementing it, 2026-08-30.** The
+  `buildAcceptResponse` javadoc stated Table 2 correctly — 2 = AES-128, 3 =
+  AES-192, 4 = AES-256, i.e. the key length in *eight*-byte units — while the
+  code beside it divided by four, advertising a 16-byte key as AES-256. The
+  wrong value is still a legal one, so no local test could tell; real libsrt
+  rejected the handshake, which is the only reason it surfaced. Two takeaways:
+  a constant derived by arithmetic from a spec table deserves a test that
+  names the expected values, and an interop suite earns its cost precisely on
+  changes that look locally correct.
 - **The weak-assertion trap caught a second time, 2026-08-30.** The key-rotation
   test for "the retired key is only regenerated well after the switch" passed
   against a deliberately broken version that regenerated it *at* the switch. It
@@ -1042,24 +1058,19 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
    composes them. See "What's built". The remaining step is
    deliberately the one that was saved for last, because it's the only one
    that changes live behavior:
-   - ~~Key management~~, ~~passphrase delivery~~, ~~KM extension parsing~~,
-     ~~`SrtConnection` encrypt/decrypt~~, ~~encrypted interop with real
-     libsrt~~ and ~~key rotation~~ — **all done**. Phase 5 is
-     feature-complete.
-   - **Rotation against a real peer is untested.** The production schedule is
-     1<<24 packets, so no test drives it end to end; the inbound half (a peer
-     rotating, us adopting and acknowledging) is covered over real sockets,
-     and the schedule itself is unit-tested. Driving a real rotation would
-     need the schedule to be configurable per connection — worth doing when
-     there's a reason to expose it rather than inventing config for a test.
-   - **Reverse-direction interop** (libsrt encrypts, we decrypt) is still
-     unproven. `srt-live-transmit` can't drive it — reading a redirected file
-     it connects but never transmits, confirmed from its own empty `pktSent`
-     stats. Use `ffmpeg`'s `srt://` muxer with `passphrase=`, which is known to
-     actually send since it drove the whole `RelayDemo` investigation.
-   - **Honouring the handshake's Encryption Field** (the peer's advertised key
-     length) rather than trusting the application's configured value — today a
-     mismatch is caught only because the unwrap fails.
+   - **Phase 5 is complete.** Key material codec, KEK derivation and key
+     wrapping, AES-CTR, the per-connection `EncryptionContext`, handshake
+     integration, connection wiring, mid-stream key rotation, and the
+     Encryption Field are all done, and encryption is proven against a real
+     implementation in **both** directions (libsrt decrypts ours;
+     `FfmpegInteropTest` shows we decrypt a real sender's).
+   - **The one real gap: rotation has never run against a real peer.** The
+     production schedule is 1<<24 packets, so no test drives it end to end.
+     The inbound half (a peer rotating, us adopting and acknowledging) is
+     covered over real sockets and the schedule itself is unit-tested, but
+     nothing has watched libsrt accept a rotation *we* initiated. Driving that
+     needs the schedule to be configurable per connection — worth doing when
+     there's a reason to expose it, rather than inventing config for a test.
 2. Phase 6 (multiplexing & polish) — the alternative major milestone,
    independent of Phase 5 and not blocked by it. Many connections per port,
    live pollable stats, and the `srt-java-live-transmit` CLI that `RelayDemo`
