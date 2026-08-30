@@ -230,7 +230,7 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-305 tests passing (128 default + 7 gated interop + 2 ACKACK/RTT + 5
+313 tests passing (128 default + 8 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
@@ -925,6 +925,15 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `ReceiveRateEstimatorTest`'s consuming half are both self-designed against
   gosrt's source — same rigor tier as this codebase's RTT/drift/wraparound
   pieces, not the stronger ported-scenario tier.
+- **The weak-assertion trap, third time, 2026-08-30.** The libsrt key-rotation
+  test passed on its first run — and would have passed identically if nothing
+  had rotated at all, since libsrt decrypts happily with the original key. It
+  now counts the rotations actually performed, and is mutation-checked by
+  restoring the production schedule (no rotation in range), which fails it.
+  The recurring shape is worth naming: **a test that asserts an outcome which
+  also holds when the feature is absent asserts nothing.** Byte-exactness,
+  timing, and now rotation have each hit this — the reliable check is to ask
+  "what would make this fail?" and then actually make it fail.
 - **A silent-failure guard is worth a test even when it looks like boilerplate,
   2026-08-30.** `StatsSampler` wraps its sink calls in try/catch, which reads
   as defensive noise until you notice `scheduleAtFixedRate` cancels a task
@@ -1185,12 +1194,18 @@ was Phase 3-5 work and is done.
   cross-talk, distinct socket IDs, closing one connection leaving its
   neighbours working, and per-connection stats. Writing it found a real leak
   (below).
-- **Configuration** — the remaining blocker for the last phase 0-5 item
-  (exercising key rotation against a real peer needs a configurable schedule),
-  and what would retire `SrtListener`/`SrtCaller`'s hardcoded latency, version
-  and timeout defaults. Note the earlier review point: a passphrase does not
-  belong in a general settings bag, so whatever shape this takes should not
-  absorb `AcceptDecision`'s.
+- ~~**Configuration**~~ **Done.** `SrtConfig` — an immutable record with
+  `with*` copies and validation in the compact constructor, so a bad value
+  fails where it's written rather than mid-handshake. **Six knobs of sixteen
+  constants**: latency, connect timeout, flow window, key-rotation schedule,
+  advertised SRT version, max MSS. The other ten stay internal (tick interval,
+  NAK floor, handshake retry, close-drain timeout, SYN-cookie window) because
+  they're fixed by the protocol, derived from RTT, or copied from libsrt's
+  rules — exposing them lets an embedder break interop or security while
+  appearing to tune something. A public knob is permanent API; adding a
+  seventh later is easy, removing one never is. The **passphrase deliberately
+  stays out**, on `AcceptDecision`/`connect()`, per the review point that a
+  secret doesn't belong in a settings object.
 - ~~**Metrics-sink adapter**~~ **Done.** `ConnectionStatsSink` (a one-method
   interface, so it can be a lambda and Roast still depends on no metrics
   library) plus `StatsSampler`, which owns the scheduling loop everyone would
@@ -1219,15 +1234,13 @@ was Phase 3-5 work and is done.
      Encryption Field are all done, and encryption is proven against a real
      implementation in **both** directions (libsrt decrypts ours;
      `FfmpegInteropTest` shows we decrypt a real sender's).
-   - **The one Phase 0-5 item still open: rotation has never run against a
-     real peer.** The production schedule is 1<<24 packets, so no test drives
-     it end to end. The inbound half (a peer rotating, us adopting and
-     acknowledging) is covered over real sockets and the schedule itself is
-     unit-tested, but nothing has watched libsrt accept a rotation *we*
-     initiated. Doing so needs the schedule to be configurable per connection,
-     which is a configuration story rather than a test fixture — deliberately
-     carried into Phase 6's config work rather than bolting another parameter
-     onto `AcceptDecision` purely to make a test possible.
+   - ~~Rotation against a real peer~~ **Closed** —
+     `LibsrtInteropTest.realLibsrtFollowsAKeyRotationWeInitiate` watches real
+     libsrt keep decrypting across several mid-stream key changes, made
+     possible by `SrtConfig`'s rotation schedule. **Phases 0-5 are now
+     complete.** The test counts the rotations it performed: without that it
+     would pass whether or not anything rotated, since libsrt decrypts happily
+     with the original key.
 2. Phase 6 (multiplexing & polish) — the alternative major milestone,
    independent of Phase 5 and not blocked by it. Many connections per port,
    live pollable stats, and the `srt-java-live-transmit` CLI that `RelayDemo`
