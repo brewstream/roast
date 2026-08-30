@@ -275,9 +275,20 @@ public final class SrtListener {
         // yet) or hit a no-op onData (no handler yet) and were dropped. A steady
         // stream hides this - only the first packets are lost - but a peer that
         // sends one small burst and stops loses all of it.
+        // Forget the connection once it closes. Uses the internal
+        // channel-owner-close slot rather than the app-facing onClose hook,
+        // which is a single overridable slot an application would clobber.
+        // Without this both maps grow for the life of the listener: a relay
+        // with churning connections leaks every one it ever accepted, and
+        // connections() reports long-dead ones.
+        SrtSocketId peerSocketId = request.srtSocketId();
         SrtConnection connection = new SrtConnection(
                 channel, demultiplexer, metadata, request.initialPacketSequenceNumber(),
-                () -> { }, encryptionContext);
+                () -> {
+                    connections.remove(assignedSocketId);
+                    acceptedByPeerSocketId.remove(peerSocketId);
+                },
+                encryptionContext);
         eventListeners.forEach(connection::addEventListener);
         connections.put(assignedSocketId, connection);
         connectionHandler.accept(connection);
