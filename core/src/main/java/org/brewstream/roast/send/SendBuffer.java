@@ -223,6 +223,16 @@ public final class SendBuffer {
         return lossList.size();
     }
 
+    /** Packets queued but not yet due to send — surfaced through {@code ConnectionStats}. */
+    public int queuedCount() {
+        return packetList.size();
+    }
+
+    /** Packets sent and retained for possible retransmission — surfaced through {@code ConnectionStats}. */
+    public int inFlightCount() {
+        return lossList.size();
+    }
+
     /** Releases every queued/unacknowledged payload. */
     public void flush() {
         packetList.forEach(entry -> entry.packet().payload().release());

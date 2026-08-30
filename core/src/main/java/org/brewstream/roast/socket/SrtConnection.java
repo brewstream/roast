@@ -148,6 +148,16 @@ public final class SrtConnection {
     private final Runnable onChannelOwnerClose;
     private final EncryptionContext encryptionContext;
 
+    private final EventDispatcher events;
+
+    private long packetsSent;
+    private long packetsRetransmitted;
+    private long packetsReceived;
+    private long bytesSent;
+    private long bytesReceived;
+    private long packetsLost;
+    private long packetsDropped;
+
     private long lastPeriodicNakMicros;
     private int fullAckCounter;
     private double rttMicros = INITIAL_RTT_MICROS;
@@ -192,6 +202,7 @@ public final class SrtConnection {
             CircularNumber initialSequenceNumber, Runnable onChannelOwnerClose,
             EncryptionContext encryptionContext) {
         this.encryptionContext = encryptionContext;
+        this.events = new EventDispatcher(metadata.socketId().toString());
         this.channel = channel;
         this.demultiplexer = demultiplexer;
         this.metadata = metadata;
@@ -212,6 +223,37 @@ public final class SrtConnection {
 
     public AcceptedConnection metadata() {
         return metadata;
+    }
+
+    /**
+     * Registers an observability listener for this connection. Events are
+     * delivered off the event loop — see {@link SrtConnectionListener} for the
+     * threading contract and why it differs from {@link #onData}.
+     */
+    public void addEventListener(SrtConnectionListener listener) {
+        events.add(listener);
+    }
+
+    /**
+     * Announces this connection to its listeners. Called by whoever created the
+     * connection once it is fully wired, rather than from the constructor — a
+     * listener must not observe a half-built object.
+     */
+    void fireConnected() {
+        events.fire(listener -> listener.onConnected(this));
+    }
+
+    /** A point-in-time snapshot of this connection's counters and gauges. */
+    public ConnectionStats stats() {
+        return new ConnectionStats(
+                packetsSent, packetsRetransmitted, packetsReceived, bytesSent, bytesReceived,
+                packetsLost, packetsDropped, events.droppedEvents(),
+                Math.round(rttMicros), Math.round(rttVarMicros),
+                receiveRateEstimator.packetsPerSecond(),
+                receiveRateEstimator.receivingRateBytesPerSecond(),
+                receiveRateEstimator.estimatedLinkCapacityPacketsPerSecond(),
+                receiveBuffer.bufferedCount(), sendBuffer.queuedCount(), sendBuffer.inFlightCount(),
+                receiveFlowWindowPackets);
     }
 
     /** Fires once per delivered packet, in sequence order, post-TSBPD. The handler owns releasing the {@link ByteBuf}. */
@@ -301,6 +343,8 @@ public final class SrtConnection {
         }
         onChannelOwnerClose.run();
         onClose.run();
+        events.fire(listener -> listener.onDisconnected(this));
+        events.close();
     }
 
     private void onPacket(AddressedEnvelope<SrtPacket, InetSocketAddress> msg) {
@@ -414,6 +458,9 @@ public final class SrtConnection {
             return;
         }
 
+        packetsReceived++;
+        bytesReceived += data.body().readableBytes();
+
         CircularNumber seq = CircularNumber.of(data.sequenceNumber() & 0x7FFF_FFFF, SrtPacket.MAX_SEQUENCE_NUMBER);
         List<LossRange> immediateLoss = lossList.onPacketReceived(seq);
         ackSender.onPacketReceived();
@@ -423,8 +470,10 @@ public final class SrtConnection {
                 seq, data.body().readableBytes(), data.retransmitted(), elapsedMicros());
 
         for (LossRange range : immediateLoss) {
+            packetsLost += range.end().value() - range.start().value() + 1;
             sendNak(List.of(range));
             onLoss.accept(range);
+            events.fire(listener -> listener.onLoss(this, range));
         }
 
         receiveBuffer.add(data, elapsedMicros());
@@ -481,8 +530,10 @@ public final class SrtConnection {
 
         AckBoundaryResult ackBoundary = receiveBuffer.computeAckBoundary(now);
         for (LossRange abandoned : ackBoundary.abandoned()) {
+            packetsDropped += abandoned.end().value() - abandoned.start().value() + 1;
             lossList.abandon(abandoned.end());
             onTlpktDrop.accept(abandoned);
+            events.fire(listener -> listener.onTlpktDrop(this, abandoned));
         }
 
         receiveRateEstimator.tick(now);
@@ -512,8 +563,13 @@ public final class SrtConnection {
 
     /** {@link SendBuffer}'s deliver callback: fires {@link #onRetransmit} for a resend, then sends it. */
     private void sendData(DataPacket packet) {
+        packetsSent++;
+        bytesSent += packet.body().readableBytes();
         if (packet.retransmitted()) {
+            packetsRetransmitted++;
             onRetransmit.accept(packet);
+            int sequenceNumber = packet.sequenceNumber();
+            events.fire(listener -> listener.onRetransmit(this, sequenceNumber));
         }
         send(encryptIfConfigured(packet));
     }
@@ -565,8 +621,10 @@ public final class SrtConnection {
         // when the schedule says to. Deliberately after building the packet, so
         // the KM update goes out behind the DATA it relates to rather than ahead
         // of it, and so a switch never applies to the packet being built.
-        encryptionContext.onPacketEncrypted()
-                .ifPresent(next -> sendKeyMaterial(next, ExtensionType.KMREQ.code()));
+        encryptionContext.onPacketEncrypted().ifPresent(next -> {
+            sendKeyMaterial(next, ExtensionType.KMREQ.code());
+            events.fire(listener -> listener.onKeyRotated(this));
+        });
         return encrypted;
     }
 

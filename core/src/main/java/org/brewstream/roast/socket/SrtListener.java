@@ -58,6 +58,7 @@ public final class SrtListener {
     private volatile AcceptHandler acceptHandler = request -> AcceptDecision.reject(RejectionReason.PEER);
     private volatile Consumer<SrtConnection> connectionHandler = connection -> {
     };
+    private final java.util.List<SrtConnectionListener> eventListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     private SrtListener(Channel channel, EventLoopGroup eventLoopGroup, SrtSocketIdDemultiplexer demultiplexer,
             ListenerHandshake listenerHandshake, SrtSocketIdGenerator socketIdGenerator) {
@@ -99,9 +100,37 @@ public final class SrtListener {
         this.acceptHandler = handler;
     }
 
-    /** Fired once a connection's handshake completes and its accept response has been sent. */
+    /**
+     * Wiring hook: attach your {@code onData} (and anything else the connection
+     * needs before traffic arrives) here. Runs <b>synchronously on the event
+     * loop, before the accept response is sent</b>, so a peer's first packets
+     * cannot arrive before your handler exists.
+     *
+     * <p>For observing a connection rather than wiring it — metrics, logging —
+     * use {@link #addEventListener}, which is dispatched off the event loop and
+     * carries no such ordering guarantee.
+     */
     public void onConnection(Consumer<SrtConnection> handler) {
         this.connectionHandler = handler;
+    }
+
+    /**
+     * Registers an observability listener for <em>every</em> connection this
+     * listener accepts, present and future — so a component managing the
+     * listener attaches once rather than wiring each connection by hand, and
+     * still sees {@link SrtConnectionListener#onConnected}, which a
+     * per-connection registration is too late to catch.
+     *
+     * <p>Events are delivered off the event loop; see
+     * {@link SrtConnectionListener} for the full threading contract.
+     */
+    public void addEventListener(SrtConnectionListener listener) {
+        eventListeners.add(listener);
+    }
+
+    /** The connections currently accepted and live — for polling {@link SrtConnection#stats()}. */
+    public java.util.Collection<SrtConnection> connections() {
+        return java.util.Collections.unmodifiableCollection(connections.values());
     }
 
     public InetSocketAddress localAddress() {
@@ -222,8 +251,10 @@ public final class SrtListener {
         SrtConnection connection = new SrtConnection(
                 channel, demultiplexer, metadata, request.initialPacketSequenceNumber(),
                 () -> { }, encryptionContext);
+        eventListeners.forEach(connection::addEventListener);
         connections.put(assignedSocketId, connection);
         connectionHandler.accept(connection);
+        connection.fireConnected();
 
         send(response, request.srtSocketId(), msg.sender());
     }
