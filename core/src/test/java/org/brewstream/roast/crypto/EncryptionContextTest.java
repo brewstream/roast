@@ -7,6 +7,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -295,6 +296,159 @@ class EncryptionContextTest {
         assertThat(km.salt()).hasSize(16);
         assertThat(km.keyLength()).isEqualTo(24);
         assertThat(km.wrap()).hasSize(24 * 2 + StreamKeyWrapper.WRAP_OVERHEAD);
+    }
+
+
+    // --- key rotation schedule (gosrt's pop(); no reference test exists)
+
+    private static final long REFRESH = 100;
+    private static final long PRE_ANNOUNCE = 30;
+
+    private static EncryptionContext rotating() {
+        return EncryptionContext.generating(passphrase(), 16, REFRESH, PRE_ANNOUNCE);
+    }
+
+    /** Nothing is announced until the schedule says so. */
+    @Test
+    void noKeyIsAnnouncedEarlyInTheCycle() {
+        EncryptionContext context = rotating();
+
+        for (int i = 0; i < REFRESH - PRE_ANNOUNCE - 1; i++) {
+            assertThat(context.onPacketEncrypted()).isEmpty();
+        }
+    }
+
+    /** The announcement names the key about to become active, not the one in use. */
+    @Test
+    void theOppositeKeyIsAnnouncedAtThePreAnnouncePoint() {
+        EncryptionContext context = rotating();
+        assertThat(context.activeKey()).isEqualTo(KeyEncryption.EVEN);
+
+        Optional<KeyEncryption> announced = Optional.empty();
+        for (int i = 0; i < REFRESH - PRE_ANNOUNCE; i++) {
+            Optional<KeyEncryption> a = context.onPacketEncrypted();
+            if (a.isPresent()) {
+                announced = a;
+            }
+        }
+
+        assertThat(announced).contains(KeyEncryption.ODD);
+        assertThat(context.activeKey()).isEqualTo(KeyEncryption.EVEN); // not switched yet
+    }
+
+    /** Until the peer confirms, the announcement repeats rather than being sent once and forgotten. */
+    @Test
+    void theAnnouncementRepeatsUntilConfirmed() {
+        EncryptionContext context = rotating();
+        int announcements = 0;
+        for (int i = 0; i < REFRESH - PRE_ANNOUNCE + 20; i++) {
+            if (context.onPacketEncrypted().isPresent()) {
+                announcements++;
+            }
+        }
+
+        assertThat(announcements).isGreaterThan(1);
+    }
+
+    @Test
+    void confirmingStopsTheReAnnouncements() {
+        EncryptionContext context = rotating();
+        for (int i = 0; i < REFRESH - PRE_ANNOUNCE; i++) {
+            context.onPacketEncrypted();
+        }
+        context.confirmKeyMaterial();
+        assertThat(context.isKeyMaterialConfirmed()).isTrue();
+
+        int announcements = 0;
+        for (int i = 0; i < 20; i++) {
+            if (context.onPacketEncrypted().isPresent()) {
+                announcements++;
+            }
+        }
+
+        assertThat(announcements).isZero();
+    }
+
+    @Test
+    void theActiveKeySwitchesAtTheRefreshPoint() {
+        EncryptionContext context = rotating();
+
+        for (int i = 0; i < REFRESH - 1; i++) {
+            context.onPacketEncrypted();
+        }
+        assertThat(context.activeKey()).isEqualTo(KeyEncryption.EVEN);
+
+        context.onPacketEncrypted(); // the refresh packet
+        assertThat(context.activeKey()).isEqualTo(KeyEncryption.ODD);
+        assertThat(context.isKeyMaterialConfirmed()).isFalse(); // cleared for the next cycle
+    }
+
+    @Test
+    void keysAlternateAcrossSuccessiveCycles() {
+        EncryptionContext context = rotating();
+
+        for (int i = 0; i < REFRESH; i++) {
+            context.onPacketEncrypted();
+        }
+        assertThat(context.activeKey()).isEqualTo(KeyEncryption.ODD);
+
+        for (int i = 0; i < REFRESH; i++) {
+            context.onPacketEncrypted();
+        }
+        assertThat(context.activeKey()).isEqualTo(KeyEncryption.EVEN);
+    }
+
+    /**
+     * The key just rotated away from must stay intact for a while - packets
+     * encrypted with it may still be in flight or awaiting retransmission - and
+     * is only replaced preAnnounce packets after the switch. Asserted by
+     * checking the *sender's* retired key against a peer holding the original,
+     * which is the only thing the timing actually changes.
+     */
+    @Test
+    void theRetiredKeyIsRegeneratedOnlyWellAfterTheSwitch() {
+        EncryptionContext sender = rotating();
+        EncryptionContext peer = EncryptionContext.awaitingPeerKeys(passphrase(), 16);
+        peer.adopt(sender.keyMaterial(KeyEncryption.BOTH));
+
+        for (int i = 0; i < REFRESH; i++) {
+            sender.onPacketEncrypted();
+        }
+        assertThat(sender.activeKey()).isEqualTo(KeyEncryption.ODD);
+
+        // Immediately after the switch the retired EVEN key is untouched.
+        assertThat(peerCanStillReadWhatSenderEncryptsWith(sender, peer, KeyEncryption.EVEN)).isTrue();
+
+        // preAnnounce packets later it has been replaced, so the peer's copy is stale.
+        for (int i = 0; i < PRE_ANNOUNCE; i++) {
+            sender.onPacketEncrypted();
+        }
+        assertThat(peerCanStillReadWhatSenderEncryptsWith(sender, peer, KeyEncryption.EVEN)).isFalse();
+    }
+
+    /** Encrypts with a specific key without disturbing the rotation schedule's view of "active". */
+    private static boolean peerCanStillReadWhatSenderEncryptsWith(EncryptionContext sender,
+            EncryptionContext peer, KeyEncryption key) {
+        KeyEncryption restore = sender.activeKey();
+        if (restore != key) {
+            sender.switchActiveKey();
+        }
+        byte[] original = payload();
+        byte[] wire = original.clone();
+        sender.encrypt(wire, 5);
+        if (sender.activeKey() != restore) {
+            sender.switchActiveKey();
+        }
+
+        peer.decrypt(wire, 5, key);
+        return java.util.Arrays.equals(wire, original);
+    }
+
+    @Test
+    void aPreAnnounceThatIsNotBeforeTheRefreshIsRejected() {
+        assertThatThrownBy(() -> EncryptionContext.generating(passphrase(), 16, 100, 100))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("pre-announce");
     }
 
     @Test

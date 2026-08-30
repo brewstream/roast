@@ -57,7 +57,9 @@ public sealed interface SrtPacket permits DataPacket, ControlPacket {
                 body.release();
                 return null;
             }
-            return new ControlPacket(type, word1, timestamp, destination, body);
+            // Bits 15-0 are the Subtype, meaningful only for USER_DEFINED (where
+            // SRT carries its own message type, e.g. a mid-stream KM update).
+            return new ControlPacket(type, word1, timestamp, destination, body, word0 & 0xFFFF);
         }
 
         int sequenceNumber = word0 & 0x7FFF_FFFF;

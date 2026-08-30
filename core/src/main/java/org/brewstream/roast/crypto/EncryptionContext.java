@@ -6,6 +6,7 @@ import org.brewstream.roast.packet.cif.KeyMaterialCif;
 
 import java.security.SecureRandom;
 import java.util.Arrays;
+import java.util.Optional;
 
 /**
  * One connection's live encryption state: the salt, the even and odd Stream
@@ -58,20 +59,43 @@ public final class EncryptionContext {
 
     private static final SecureRandom RANDOM = new SecureRandom();
 
+    /**
+     * How many packets a key is used for before rotating, and how far ahead of
+     * that the replacement is announced — gosrt's {@code KMRefreshRate} and
+     * {@code KMPreAnnounce} defaults ({@code 1<<24} and {@code 1<<12}). Counted
+     * in packets sent, not time, so a fast stream rotates sooner in wall-clock
+     * terms; that is the SRT model, not a simplification.
+     */
+    private static final long DEFAULT_KM_REFRESH_RATE = 1L << 24;
+    private static final long DEFAULT_KM_PRE_ANNOUNCE = 1L << 12;
+
     private final char[] passphrase;
     private final int keyLength;
+    private final long kmRefreshRate;
+    private final long kmPreAnnounce;
+
+    private long preAnnounceCountdown;
+    private long refreshCountdown;
+    private boolean keyMaterialConfirmed;
 
     private byte[] salt;
     private byte[] evenSek;
     private byte[] oddSek;
     private KeyEncryption activeKey = KeyEncryption.EVEN;
 
-    private EncryptionContext(char[] passphrase, int keyLength) {
+    private EncryptionContext(char[] passphrase, int keyLength, long kmRefreshRate, long kmPreAnnounce) {
         if (keyLength != 16 && keyLength != 24 && keyLength != 32) {
             throw new IllegalArgumentException("key length must be 16, 24, or 32 bytes, got " + keyLength);
         }
+        if (kmPreAnnounce >= kmRefreshRate) {
+            throw new IllegalArgumentException("pre-announce must come before the refresh it announces");
+        }
         this.passphrase = passphrase.clone();
         this.keyLength = keyLength;
+        this.kmRefreshRate = kmRefreshRate;
+        this.kmPreAnnounce = kmPreAnnounce;
+        this.preAnnounceCountdown = kmRefreshRate - kmPreAnnounce;
+        this.refreshCountdown = kmRefreshRate;
     }
 
     /**
@@ -80,7 +104,7 @@ public final class EncryptionContext {
      * succeeds.
      */
     public static EncryptionContext awaitingPeerKeys(char[] passphrase, int keyLength) {
-        return new EncryptionContext(passphrase, keyLength);
+        return new EncryptionContext(passphrase, keyLength, DEFAULT_KM_REFRESH_RATE, DEFAULT_KM_PRE_ANNOUNCE);
     }
 
     /**
@@ -88,7 +112,17 @@ public final class EncryptionContext {
      * which announces them to the peer via {@link #keyMaterial}.
      */
     public static EncryptionContext generating(char[] passphrase, int keyLength) {
-        EncryptionContext context = new EncryptionContext(passphrase, keyLength);
+        return generating(passphrase, keyLength, DEFAULT_KM_REFRESH_RATE, DEFAULT_KM_PRE_ANNOUNCE);
+    }
+
+    /**
+     * With an explicit rotation schedule, both counted in packets sent. The
+     * defaults are ~16.7M packets between rotations, which no test can drive, so
+     * this exists to make the schedule observable.
+     */
+    public static EncryptionContext generating(char[] passphrase, int keyLength,
+            long kmRefreshRate, long kmPreAnnounce) {
+        EncryptionContext context = new EncryptionContext(passphrase, keyLength, kmRefreshRate, kmPreAnnounce);
         context.generateKeys();
         return context;
     }
@@ -124,7 +158,7 @@ public final class EncryptionContext {
      * the class javadoc.
      */
     public void switchActiveKey() {
-        activeKey = activeKey == KeyEncryption.EVEN ? KeyEncryption.ODD : KeyEncryption.EVEN;
+        activeKey = opposite(activeKey);
     }
 
     /**
@@ -233,6 +267,81 @@ public final class EncryptionContext {
         }
         PayloadCipher.encryptOrDecrypt(payload, keyFor(key), salt, packetSequenceNumber);
         return true;
+    }
+
+    /**
+     * Advances the key-rotation schedule by one sent packet, and reports the key
+     * that must now be announced to the peer, if any. Call once per DATA packet
+     * encrypted — retransmissions included, which is what gosrt counts too.
+     *
+     * <p>Ported from gosrt's {@code pop} ({@code connection.go}), whose three
+     * conditions run in this order and are easy to get subtly wrong:
+     * <ol>
+     *   <li>Both countdowns decrement.</li>
+     *   <li>When the pre-announce countdown reaches zero and the peer has not
+     *       yet confirmed, announce the <em>opposite</em> key — the one about to
+     *       become active — and re-arm at {@code preAnnounce/10 + 1} so the
+     *       announcement repeats until {@link #confirmKeyMaterial()} arrives.
+     *       Announcing the key already in use would tell the peer nothing.</li>
+     *   <li>When the refresh countdown reaches zero, switch keys, reset both
+     *       countdowns, and clear the confirmation for the next cycle.</li>
+     *   <li>{@code preAnnounce} packets <em>after</em> a switch, regenerate the
+     *       now-idle key so a fresh one is ready for the cycle after this. This
+     *       is why the check compares against {@code refreshRate - preAnnounce}
+     *       rather than firing at the switch itself: the old key must stay
+     *       intact for a while, since packets encrypted with it may still be in
+     *       flight or awaiting retransmission.</li>
+     * </ol>
+     *
+     * <p>No reference unit-tests this (gosrt's lives in {@code connection.go},
+     * which has none), so the tests here are self-designed against that source.
+     */
+    public Optional<KeyEncryption> onPacketEncrypted() {
+        preAnnounceCountdown--;
+        refreshCountdown--;
+
+        KeyEncryption toAnnounce = null;
+        if (preAnnounceCountdown == 0 && !keyMaterialConfirmed) {
+            toAnnounce = opposite(activeKey);
+            preAnnounceCountdown = kmPreAnnounce / 10 + 1; // retry until confirmed
+        }
+
+        if (refreshCountdown == 0) {
+            preAnnounceCountdown = kmRefreshRate - kmPreAnnounce;
+            refreshCountdown = kmRefreshRate;
+            activeKey = opposite(activeKey);
+            keyMaterialConfirmed = false;
+        }
+
+        if (refreshCountdown == kmRefreshRate - kmPreAnnounce) {
+            // The key we just rotated away from is now safely idle - replace it.
+            generateSek(opposite(activeKey));
+        }
+
+        return Optional.ofNullable(toAnnounce);
+    }
+
+    /** Records that the peer acknowledged our announced key material, stopping the re-announcements. */
+    public void confirmKeyMaterial() {
+        keyMaterialConfirmed = true;
+    }
+
+    /** Whether the peer has confirmed the most recently announced key material. */
+    public boolean isKeyMaterialConfirmed() {
+        return keyMaterialConfirmed;
+    }
+
+    /** Replaces one of the two SEKs, leaving the other and the salt alone (gosrt's {@code GenerateSEK}). */
+    public void generateSek(KeyEncryption key) {
+        if (key == KeyEncryption.EVEN) {
+            evenSek = randomBytes(keyLength);
+        } else if (key == KeyEncryption.ODD) {
+            oddSek = randomBytes(keyLength);
+        }
+    }
+
+    private static KeyEncryption opposite(KeyEncryption key) {
+        return key == KeyEncryption.EVEN ? KeyEncryption.ODD : KeyEncryption.EVEN;
     }
 
     /** Zeroes the passphrase and both keys. Call on connection teardown. */
