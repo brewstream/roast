@@ -230,7 +230,7 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-300 tests passing (128 default + 7 gated interop + 2 ACKACK/RTT + 5
+305 tests passing (128 default + 7 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
@@ -925,6 +925,12 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `ReceiveRateEstimatorTest`'s consuming half are both self-designed against
   gosrt's source — same rigor tier as this codebase's RTT/drift/wraparound
   pieces, not the stronger ported-scenario tier.
+- **A silent-failure guard is worth a test even when it looks like boilerplate,
+  2026-08-30.** `StatsSampler` wraps its sink calls in try/catch, which reads
+  as defensive noise until you notice `scheduleAtFixedRate` cancels a task
+  *permanently* the first time it throws. Without the guard, one bad sink
+  stops every metric for the process's life, with no error anywhere and
+  nothing to notice but an absence. Mutation-checked by removing it.
 - **Two ordering bugs from one small change, both caught by tests rather than
   by reading, 2026-08-30.** Making `close()` drain instead of discard looked
   trivial. First, teardown ran on the *calling* thread, so a `write()` already
@@ -1185,8 +1191,15 @@ was Phase 3-5 work and is done.
   and timeout defaults. Note the earlier review point: a passphrase does not
   belong in a general settings bag, so whatever shape this takes should not
   absorb `AcceptDecision`'s.
-- **Metrics-sink adapter** over `ConnectionStats` (Micrometer or similar),
-  living outside this module or added without changing that type.
+- ~~**Metrics-sink adapter**~~ **Done.** `ConnectionStatsSink` (a one-method
+  interface, so it can be a lambda and Roast still depends on no metrics
+  library) plus `StatsSampler`, which owns the scheduling loop everyone would
+  otherwise write. Runs on its own thread — a sink blocking on an HTTP push
+  can't slow packet processing, same reasoning as the event dispatcher — and
+  emits a **final snapshot on disconnect**, since polling alone loses the last
+  partial interval, which for a short-lived connection can be most of it. The
+  connection is passed alongside the snapshot so a sink can tag by StreamID or
+  peer address. A Micrometer binding is a few lines in the embedder's code.
 - **README, Javadoc pass, and `srt-java-live-transmit`** — `RelayDemo` is the
   rough prototype, explicitly not held to this codebase's standards.
 
