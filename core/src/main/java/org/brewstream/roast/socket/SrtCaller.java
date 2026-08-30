@@ -66,6 +66,13 @@ public final class SrtCaller {
     private static final int DEFAULT_LATENCY_MILLIS = 120;
     private static final int DEFAULT_SRT_VERSION = 0x010401;
     private static final long CONNECT_TIMEOUT_SECONDS = 5;
+    /**
+     * How often an unanswered handshake request is repeated. libsrt's own rule
+     * ({@code core.cpp}: "avoid sending too many requests, at most 1 request per
+     * 250ms"); the overall {@link #CONNECT_TIMEOUT_SECONDS} still bounds the
+     * attempt.
+     */
+    private static final long HANDSHAKE_RETRY_MILLIS = 250;
 
     private final Channel channel;
     private final EventLoopGroup eventLoopGroup;
@@ -81,6 +88,9 @@ public final class SrtCaller {
     private final long startNanos = System.nanoTime();
 
     private ScheduledFuture<?> timeoutTask;
+    private ScheduledFuture<?> retryTask;
+    private HandshakeCif pendingRequest;
+    private boolean conclusionSent;
 
     private SrtCaller(Channel channel, EventLoopGroup eventLoopGroup, SrtSocketIdDemultiplexer demultiplexer,
             InetSocketAddress remoteAddress, InetAddress localAddress, SrtSocketId ownSocketId,
@@ -156,7 +166,25 @@ public final class SrtCaller {
     private void start() {
         demultiplexer.register(ownSocketId, this::onHandshakeReply);
         timeoutTask = channel.eventLoop().schedule(this::onTimeout, CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        send(callerHandshake.buildInductionRequest(ownSocketId, localAddress));
+        pendingRequest = callerHandshake.buildInductionRequest(ownSocketId, localAddress);
+        send(pendingRequest);
+        // Repeat whichever step is still unanswered. Without this a single lost
+        // INDUCTION or CONCLUSION fails the whole connect - invisible on
+        // loopback, routine on a real network. Resending is safe on both sides:
+        // the cookie is derived, not stored, so INDUCTION is stateless, and
+        // SrtListener already dedupes a retried CONCLUSION by replaying its
+        // cached response rather than re-running accept.
+        retryTask = channel.eventLoop().scheduleAtFixedRate(
+                this::resendPendingRequest, HANDSHAKE_RETRY_MILLIS, HANDSHAKE_RETRY_MILLIS,
+                TimeUnit.MILLISECONDS);
+    }
+
+    private void resendPendingRequest() {
+        if (result.isDone() || pendingRequest == null) {
+            return;
+        }
+        LOG.log(Level.FINE, "Repeating unanswered handshake request to {0}", remoteAddress);
+        send(pendingRequest);
     }
 
     private void onHandshakeReply(AddressedEnvelope<SrtPacket, InetSocketAddress> msg) {
@@ -190,11 +218,19 @@ public final class SrtCaller {
             fail(new IOException("peer doesn't support SRT handshake v5"));
             return;
         }
+        if (conclusionSent) {
+            // A duplicate induction reply, because our own conclusion hasn't been
+            // answered yet. The retry task is already repeating it; rebuilding
+            // here would only churn the key material.
+            return;
+        }
         // The caller generates the keys, so the conclusion is where we announce them.
         HandshakeCif conclusionRequest = callerHandshake.buildConclusionRequest(
                 reply, ownSocketId, localAddress, ownInitialSequenceNumber, DEFAULT_SRT_VERSION,
                 DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS, streamId,
                 encryptionContext == null ? null : encryptionContext.keyMaterial(KeyEncryption.BOTH));
+        conclusionSent = true;
+        pendingRequest = conclusionRequest;
         send(conclusionRequest);
     }
 
@@ -213,6 +249,7 @@ public final class SrtCaller {
             }
 
             timeoutTask.cancel(false);
+            stopRetrying();
             demultiplexer.unregister(ownSocketId);
 
             AcceptedConnection metadata = new AcceptedConnection(
@@ -243,6 +280,13 @@ public final class SrtCaller {
         fail(new IOException(violation.reason()));
     }
 
+    private void stopRetrying() {
+        pendingRequest = null;
+        if (retryTask != null) {
+            retryTask.cancel(false);
+        }
+    }
+
     private void onTimeout() {
         fail(new TimeoutException("connection timeout: peer didn't respond"));
     }
@@ -252,6 +296,7 @@ public final class SrtCaller {
             return;
         }
         timeoutTask.cancel(false);
+        stopRetrying();
         demultiplexer.unregister(ownSocketId);
         channel.close();
         eventLoopGroup.shutdownGracefully();

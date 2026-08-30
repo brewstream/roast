@@ -1,6 +1,7 @@
 package org.brewstream.roast.socket;
 
 import io.netty.buffer.Unpooled;
+import org.brewstream.roast.harness.UdpLossProxy;
 import org.brewstream.roast.packet.cif.RejectionReason;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -165,6 +166,36 @@ class SrtCallerTest {
 
         assertThat(thrown).isInstanceOf(ExecutionException.class);
         assertThat(thrown.getCause()).hasMessageContaining("key material");
+    }
+
+
+    /**
+     * Connecting over a lossy link. Before handshake retry existed this failed
+     * outright: a single dropped INDUCTION or CONCLUSION ended the attempt, since
+     * SrtCaller sent each step exactly once. Loopback hid it completely — it took
+     * putting a loss proxy in the path to see it at all.
+     *
+     * <p>Repeated, because one run at 20% loss can still get through first try;
+     * across several, an unretried handshake is overwhelmingly unlikely to.
+     */
+    @Test
+    void connectSucceedsThroughALossyLinkByRepeatingTheHandshake() throws Exception {
+        for (int attempt = 0; attempt < 5; attempt++) {
+            SrtListener lossyListener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
+            lossyListener.setAcceptHandler(request -> AcceptDecision.accept());
+            try (UdpLossProxy lossy = UdpLossProxy.start(
+                    new InetSocketAddress("127.0.0.1", lossyListener.localAddress().getPort()), 0.20)) {
+
+                SrtConnection connection = SrtCaller.connect(
+                                new InetSocketAddress("127.0.0.1", lossy.localPort()), STREAM_ID)
+                        .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+                assertThat(connection.metadata().streamId()).isEqualTo(STREAM_ID);
+                connection.close();
+            } finally {
+                lossyListener.close();
+            }
+        }
     }
 
     @Test
