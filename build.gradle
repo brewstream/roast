@@ -1,5 +1,10 @@
 subprojects {
     apply plugin: 'java-library'
+    // For the srt-java-live-transmit CLI: produces a real launcher via
+    // installDist. Piping `gradlew <task>` is not a substitute - Gradle writes
+    // its own progress to stdout, which would corrupt a media stream being
+    // relayed through it.
+    apply plugin: 'application'
 
     group = 'org.brewstream'
     version = '0.1.0-SNAPSHOT'
@@ -12,6 +17,11 @@ subprojects {
 
     repositories {
         mavenCentral()
+    }
+
+    application {
+        mainClass = 'org.brewstream.roast.cli.SrtLiveTransmit'
+        applicationName = 'srt-java-live-transmit'
     }
 
     dependencies {
