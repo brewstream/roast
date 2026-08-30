@@ -8,8 +8,13 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -101,6 +106,84 @@ class FfmpegInteropTest {
         assertThat(firstProblem).as("decrypted payloads should be valid MPEG-TS").isNotDone();
         assertThat(payloads.get()).isGreaterThanOrEqualTo(50);
         assertThat(bytes.get()).isGreaterThan(50 * 188);
+    }
+
+
+    /**
+     * DESIGN.md's Phase 3 definition of done, in its own words: "publish a 5
+     * Mbps MPEG-TS from ffmpeg → Java listener → byte-exact TS output with 0%
+     * loss".
+     *
+     * <p>Byte-exactness against ffmpeg looks impossible at first, since its
+     * output isn't reproducible run to run. The {@code tee} muxer resolves it:
+     * one encode, written simultaneously to a file and to us, so the file is
+     * ground truth for that exact run. Without it the best available assertion
+     * is structural (see {@link #weDecryptWhatARealFfmpegSenderEncrypts}), which
+     * would not have caught a payload subtly reordered or truncated.
+     *
+     * <p>The received stream is compared as a prefix of the file rather than in
+     * full: ffmpeg keeps writing until its own timer stops it, and we stop
+     * reading when the connection goes away, so the tail is legitimately ragged.
+     * Everything we did receive must match byte for byte from the first byte on.
+     */
+    @Test
+    void aFiveMegabitStreamArrivesByteExact() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
+        listener.setAcceptHandler(request -> AcceptDecision.accept());
+
+        ByteArrayOutputStream received = new ByteArrayOutputStream();
+        CountDownLatch enough = new CountDownLatch(1);
+        listener.onConnection(connection -> connection.onData(payload -> {
+            byte[] bytes = new byte[payload.readableBytes()];
+            payload.getBytes(payload.readerIndex(), bytes);
+            synchronized (received) {
+                received.writeBytes(bytes);
+                if (received.size() > 1_000_000) { // ~1.5s of 5 Mbps
+                    enough.countDown();
+                }
+            }
+            payload.release();
+        }));
+
+        Path groundTruth = Files.createTempFile("roast-5mbps-", ".ts");
+        groundTruth.toFile().deleteOnExit();
+        ffmpeg = launchFiveMegabitTee(listener.localAddress().getPort(), groundTruth);
+
+        assertThat(enough.await(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .as("should have received a couple of seconds of 5 Mbps video").isTrue();
+
+        // Let ffmpeg finish on its own -t timer rather than killing it: it buffers
+        // its file writes, so a forced kill loses the tail of the ground truth and
+        // we would appear to have received more than was ever produced.
+        assertThat(ffmpeg.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS))
+                .as("ffmpeg should exit on its own so the ground-truth file is flushed").isTrue();
+
+        byte[] got;
+        synchronized (received) {
+            got = received.toByteArray();
+        }
+        byte[] expected = Files.readAllBytes(groundTruth);
+        assertThat(expected.length).isGreaterThanOrEqualTo(got.length);
+        assertThat(Arrays.copyOf(expected, got.length))
+                .as("every byte received must match what ffmpeg actually produced")
+                .isEqualTo(got);
+    }
+
+    /** One encode, written to both a file (ground truth) and to us over SRT. */
+    private Process launchFiveMegabitTee(int listenerPort, Path groundTruth) throws IOException {
+        return new ProcessBuilder(
+                ffmpegPath(),
+                "-loglevel", "error",
+                "-re",
+                "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=30",
+                "-c:v", "mpeg2video", "-b:v", "5M", "-minrate", "5M", "-maxrate", "5M", "-bufsize", "1M",
+                "-t", "6",
+                "-f", "tee", "-map", "0:v",
+                "[f=mpegts]" + groundTruth.toAbsolutePath()
+                        + "|[f=mpegts]srt://127.0.0.1:" + listenerPort + "?streamid=" + STREAM_ID)
+                .redirectErrorStream(true)
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .start();
     }
 
     private Process launchEncryptedPublisher(int listenerPort) throws IOException {

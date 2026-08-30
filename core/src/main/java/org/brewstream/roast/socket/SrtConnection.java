@@ -430,6 +430,9 @@ public final class SrtConnection {
             return;
         }
         sendBuffer.ack(cif.lastAckPacketSequenceNumber());
+        int acknowledged = (int) cif.lastAckPacketSequenceNumber().value();
+        int peerRtt = cif.rtt();
+        events.fire(listener -> listener.onAckReceived(this, acknowledged, peerRtt));
         if (cif.variant() == AckVariant.FULL) {
             recalculateRtt(cif.rtt());
             sendAckAck(control.typeSpecificInfo());
@@ -512,7 +515,12 @@ public final class SrtConnection {
         }
 
         packetsReceived++;
-        bytesReceived += data.body().readableBytes();
+        int payloadBytes = data.body().readableBytes();
+        bytesReceived += payloadBytes;
+        int arrivedSequenceNumber = data.sequenceNumber();
+        boolean wasRetransmitted = data.retransmitted();
+        events.fire(listener ->
+                listener.onPacketReceived(this, arrivedSequenceNumber, payloadBytes, wasRetransmitted));
 
         CircularNumber seq = CircularNumber.of(data.sequenceNumber() & 0x7FFF_FFFF, SrtPacket.MAX_SEQUENCE_NUMBER);
         List<LossRange> immediateLoss = lossList.onPacketReceived(seq);
@@ -763,6 +771,9 @@ public final class SrtConnection {
             ackNumber = ++fullAckCounter;
             pendingAcks.put(ackNumber, elapsedMicros());
         }
+        int acknowledged = (int) ackCif.lastAckPacketSequenceNumber().value();
+        events.fire(listener -> listener.onAckSent(this, acknowledged));
+
         ByteBuf cifBuf = channel.alloc().buffer();
         ackCif.encodeTo(cifBuf);
         send(new ControlPacket(ControlType.ACK, ackNumber, (int) elapsedMicros(), metadata.peerSocketId(), cifBuf));

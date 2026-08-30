@@ -50,6 +50,36 @@ public interface SrtConnectionListener {
     default void onDisconnected(SrtConnection connection) {
     }
 
+    /**
+     * A DATA packet arrived, <em>before</em> TSBPD buffering — so this fires in
+     * arrival order, including for retransmissions and out-of-order packets that
+     * {@link SrtConnection#onData} will later hand over in sequence order (or
+     * not at all, if they were too late). Useful for observing jitter and
+     * arrival patterns, which post-TSBPD delivery deliberately smooths away.
+     *
+     * <p><b>Carries the packet's shape, not its bytes.</b> The payload's buffer
+     * is owned by the receive path and released once handled; handing it to an
+     * asynchronous listener would mean either a copy per packet or a
+     * use-after-release. Data belongs to {@code onData}, which owns its
+     * lifetime; this is for observation.
+     *
+     * <p>This is the one event that fires per packet — a few hundred a second at
+     * live bitrates. Nothing is allocated or queued when no listener is
+     * registered, so it costs nothing unless someone asks for it; a subscriber
+     * is opting into that rate knowingly.
+     */
+    default void onPacketReceived(SrtConnection connection, int sequenceNumber, int payloadBytes,
+            boolean retransmitted) {
+    }
+
+    /** An acknowledgement was sent to the peer — roughly every 10ms, plus light ACKs under load. */
+    default void onAckSent(SrtConnection connection, int lastAcknowledgedSequenceNumber) {
+    }
+
+    /** A peer acknowledged our data, reporting its own round-trip estimate in microseconds. */
+    default void onAckReceived(SrtConnection connection, int lastAcknowledgedSequenceNumber, int peerRttMicros) {
+    }
+
     /** A gap was detected in the received sequence and NAKed. */
     default void onLoss(SrtConnection connection, LossRange range) {
     }

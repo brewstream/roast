@@ -128,6 +128,33 @@ public final class SrtListener {
         eventListeners.add(listener);
     }
 
+    /**
+     * This listener's Netty pipeline, so an embedder can insert its own
+     * {@code ChannelHandler}s — custom telemetry, traffic interception or
+     * mutation — rather than being limited to the hooks above. DESIGN.md §4
+     * asks for this on the grounds that hiding Netty behind a closed API would
+     * waste the fact that the transport *is* Netty.
+     *
+     * <p><b>The granularity is per port, not per connection</b>, which is worth
+     * knowing before reaching for it. §4 describes adding handlers to "a
+     * connection's pipeline", but Roast multiplexes every connection for a
+     * listener onto one {@code NioDatagramChannel} — that is what makes
+     * many-sockets-on-one-port work — so there is exactly one pipeline here and
+     * a handler added to it sees traffic for <em>all</em> connections,
+     * demultiplexed only further along by {@link SrtSocketIdDemultiplexer}. A
+     * handler wanting one connection must filter on the destination socket ID
+     * itself.
+     *
+     * <p>Handlers run on the event loop, so the usual rule applies: blocking
+     * here stalls packet processing for every connection on this port. The
+     * observability hooks ({@link #addEventListener}) are dispatched off it
+     * precisely so they cannot; this deliberately is not, because a pipeline
+     * handler is part of the data path by definition.
+     */
+    public io.netty.channel.ChannelPipeline pipeline() {
+        return channel.pipeline();
+    }
+
     /** The connections currently accepted and live — for polling {@link SrtConnection#stats()}. */
     public java.util.Collection<SrtConnection> connections() {
         return java.util.Collections.unmodifiableCollection(connections.values());
