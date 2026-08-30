@@ -25,6 +25,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Interop test against the real SRT reference implementation (libsrt's
@@ -44,6 +45,8 @@ class LibsrtInteropTest {
 
     private static final int TIMEOUT_SECONDS = 10;
     private static final String STREAM_ID = "live/test";
+    /** libsrt requires at least 10 characters. */
+    private static final String PASSPHRASE = "roast-interop-secret";
 
     private SrtListener listener;
     private Process srtLiveTransmit;
@@ -222,12 +225,77 @@ class LibsrtInteropTest {
         return builder.start();
     }
 
+
+    /**
+     * Real libsrt completes an <em>encrypted</em> handshake with us: it sends
+     * KMREQ keyed with the shared passphrase, we unwrap it and echo KMRSP, and
+     * it accepts the result and connects. libsrt's own log calls this
+     * {@code KmState: SND=SECURED RCV=SECURED}.
+     *
+     * <p><b>What this does not yet cover: encrypted DATA.</b> Sending encrypted
+     * payloads to libsrt was tried and it received nothing, while the identical
+     * unencrypted test ({@link #realListenerSendsDataToRealLibsrtCaller})
+     * passes - so our key exchange is right but something about the encrypted
+     * data path is not yet agreed with libsrt. The other direction can't be
+     * driven with this tool at all: {@code srt-live-transmit} reading a
+     * redirected file connects but never transmits, which its own empty
+     * {@code pktSent} stats confirm. Both gaps are recorded in STATUS.md rather
+     * than papered over - the encryption primitives themselves are verified
+     * against gosrt's golden vectors, and Roast-to-Roast encryption is verified
+     * in {@code SrtConnectionTest}, but interop of encrypted payloads is
+     * genuinely unproven.
+     */
+    @Test
+    void realLibsrtCallerCompletesAnEncryptedHandshake() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
+        CompletableFuture<ConnectionRequest> seenRequest = new CompletableFuture<>();
+        CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
+        listener.setAcceptHandler(request -> {
+            seenRequest.complete(request);
+            return AcceptDecision.accept(PASSPHRASE.toCharArray(), 16);
+        });
+        listener.onConnection(connected::complete);
+
+        Path outputFile = Files.createTempFile("roast-interop-enc-", ".bin");
+        outputFile.toFile().deleteOnExit();
+        srtLiveTransmit = launchSrtLiveTransmitSending(listener.localAddress().getPort(), outputFile,
+                "&passphrase=" + PASSPHRASE + "&pbkeylen=16");
+
+        // The peer asked for encryption, and we got far enough to accept it -
+        // which only happens if its key material unwrapped with our passphrase.
+        assertThat(seenRequest.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).encryptionRequested()).isTrue();
+        assertThat(connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).metadata().streamId()).isEqualTo(STREAM_ID);
+    }
+
+    /** A mismatched passphrase must be refused outright, not silently produce garbage. */
+    @Test
+    void realLibsrtCallerWithAMismatchedPassphraseNeverConnects() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
+        listener.setAcceptHandler(request -> AcceptDecision.accept("a-different-secret".toCharArray(), 16));
+
+        CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
+        listener.onConnection(connected::complete);
+
+        Path outputFile = Files.createTempFile("roast-interop-badsecret-", ".bin");
+        outputFile.toFile().deleteOnExit();
+        srtLiveTransmit = launchSrtLiveTransmitSending(listener.localAddress().getPort(), outputFile,
+                "&passphrase=" + PASSPHRASE + "&pbkeylen=16");
+
+        assertThatThrownBy(() -> connected.get(3, TimeUnit.SECONDS))
+                .isInstanceOf(java.util.concurrent.TimeoutException.class);
+    }
+
     /** {@code srt://} as input (libsrt calls and reads), {@code file://con} as output (raw bytes to stdout). */
     private Process launchSrtLiveTransmitSending(int listenerPort, Path outputFile) throws IOException {
+        return launchSrtLiveTransmitSending(listenerPort, outputFile, "");
+    }
+
+    private Process launchSrtLiveTransmitSending(int listenerPort, Path outputFile, String extraUriParams)
+            throws IOException {
         ProcessBuilder builder = new ProcessBuilder(
                 srtLiveTransmitPath().toString(),
                 "-t", "5",
-                "srt://127.0.0.1:" + listenerPort + "?streamid=" + STREAM_ID,
+                "srt://127.0.0.1:" + listenerPort + "?streamid=" + STREAM_ID + extraUriParams,
                 "file://con")
                 .redirectOutput(ProcessBuilder.Redirect.to(outputFile.toFile()))
                 .redirectError(ProcessBuilder.Redirect.DISCARD);

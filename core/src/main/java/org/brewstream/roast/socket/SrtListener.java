@@ -184,18 +184,29 @@ public final class SrtListener {
                 request, assignedSocketId, DEFAULT_LATENCY_MILLIS, DEFAULT_LATENCY_MILLIS,
                 encryptionContext != null ? request.keyMaterial() : null);
         acceptedByPeerSocketId.put(request.srtSocketId(), response);
-        send(response, request.srtSocketId(), msg.sender());
 
         HandshakeExtension negotiated = response.handshakeExtension();
         AcceptedConnection metadata = new AcceptedConnection(
                 assignedSocketId, request.srtSocketId(), msg.sender(), request.streamId(),
                 negotiated.receiveTsbpdDelayMillis(), negotiated.sendTsbpdDelayMillis(), negotiated.srtVersion(),
                 response.maxFlowWindowSize());
+
+        // Everything that must be ready for inbound DATA happens BEFORE the accept
+        // response goes out: constructing the connection registers it with the
+        // demultiplexer, and the application attaches its onData in
+        // connectionHandler. A peer may legitimately send its first DATA packet
+        // the instant it sees the response, so sending first left a real window
+        // in which those packets routed to the acceptor sink (no registration
+        // yet) or hit a no-op onData (no handler yet) and were dropped. A steady
+        // stream hides this - only the first packets are lost - but a peer that
+        // sends one small burst and stops loses all of it.
         SrtConnection connection = new SrtConnection(
                 channel, demultiplexer, metadata, request.initialPacketSequenceNumber(),
                 () -> { }, encryptionContext);
         connections.put(assignedSocketId, connection);
         connectionHandler.accept(connection);
+
+        send(response, request.srtSocketId(), msg.sender());
     }
 
     private static ConnectionRequest toConnectionRequest(HandshakeCif request, InetSocketAddress peerAddress) {
