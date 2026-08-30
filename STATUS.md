@@ -223,7 +223,7 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-281 tests passing (128 default + 6 gated interop + 2 ACKACK/RTT + 5
+287 tests passing (128 default + 6 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
@@ -360,6 +360,30 @@ dropped, never thrown.
   retry with backoff per spec). No HSv4 fallback (DESIGN.md defers that to
   Phase 7) and no `SrtConfig` yet, matching `SrtListener`'s existing
   hardcoded-defaults precedent.
+- `SrtConnectionListener` / `EventDispatcher` / `ConnectionStats` — the
+  observability surface DESIGN.md §4 calls Roast's real value over a libsrt
+  binding. **Three mechanisms for three different consumers**, deliberately not
+  merged: `onData` stays a single-owner data handler; `SrtConnectionListener`
+  is multicast *events* (`onConnected`/`onDisconnected`/`onLoss`/
+  `onTlpktDrop`/`onRetransmit`/`onKeyRotated`), registerable on `SrtListener`
+  for every connection it accepts or on one `SrtConnection`; `ConnectionStats`
+  is a pollable immutable snapshot from `connection.stats()`, shaped for a
+  periodic sampler (the Micrometer path later, no dependency now).
+  **Events for notable occurrences, counters for volume** — there is no event
+  per ACK or per packet, because at live bitrates that is pure garbage and a
+  throughput hazard.
+  **Events never run on the event loop.** A "must not block" javadoc contract
+  only asks people not to stall packet processing; a separate single dispatcher
+  thread makes it impossible. One thread, not a pool, so a connection's events
+  stay ordered; a bounded queue that drops on overflow, because unbounded would
+  turn a stall into an OOM; and the drops are counted in
+  `ConnectionStats.droppedEvents()`, since losing observability silently is its
+  own bug. Two ordering facts are documented rather than left to be
+  discovered: `onConnection` stays **synchronous** (it runs before the accept
+  response and is where `onData` is attached — making it async would
+  reintroduce the race fixed 2026-08-30), and events are therefore *not*
+  ordered against `onData`. `SrtListener.connections()` enumerates live
+  connections for polling.
 - `ConnectionRequest` / `AcceptDecision` / `AcceptHandler` / `AcceptedConnection`
   — the extensibility surface added per DESIGN.md's "Extensibility &
   observability" section: rich accept/reject (peer address, StreamID, SRT
@@ -882,6 +906,17 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `ReceiveRateEstimatorTest`'s consuming half are both self-designed against
   gosrt's source — same rigor tier as this codebase's RTT/drift/wraparound
   pieces, not the stronger ported-scenario tier.
+- **Make the failure mode impossible rather than documented, 2026-08-30.** The
+  observability listeners were first designed to run on the connection's event
+  loop with a javadoc contract saying they must not block — which is only a
+  request, and this project had already been burned once by exactly that
+  (blocking I/O in a diagnostic `onData`, caught by the user asking "did you
+  write bad netty code?"). Review pushed it to *always* dispatch on a separate
+  thread, and `ObservabilityTest.aBlockingSubscriberDoesNotStallTheDataPath`
+  now asserts the property instead of the docs asking for it — mutation-checked
+  by dispatching inline, which fails it. Worth generalising: when a contract
+  exists because violating it breaks something badly, prefer a design where it
+  cannot be violated.
 - **Loopback hides an entire class of bug, 2026-08-30.** Two defects survived
   the whole project because every test ran over a perfect local link:
   `SrtCaller` sent each handshake step exactly once (a single dropped INDUCTION
@@ -1074,9 +1109,12 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   - **Full send-side stats** (gosrt's `Stats()`: `estimatedInputBW`/
     `estimatedSentBW`/`pktLossRate`) and the 16th/17th-packet bandwidth-probe
     trick — both deliberately not ported, see `SendBuffer`'s javadoc.
-  - **ACK-sent/received hooks and live pollable stats** generally — still
-    just `onRetransmit` added this pass, matching how `onData`/`onLoss`/
-    `onTlpktDrop` were rolled out incrementally too.
+  - ~~Live pollable stats and event hooks~~ **Closed** — see
+    `SrtConnectionListener`/`ConnectionStats` in "What's built". Still missing
+    from DESIGN §4's list: **ACK sent/received** and **pre-TSBPD data
+    received** events (both deliberate — they are per-packet, and §4's own
+    "events for notable occurrences" logic argues for counting rather than
+    announcing them), and **Netty pipeline access** for embedders.
   ~~Real interop for the send path~~ **Closed** — see `LibsrtInteropTest`'s
   `realListenerSendsDataToRealLibsrtCaller` above; didn't need the
   caller-side handshake first, since Roast only needed to be the *listener*
