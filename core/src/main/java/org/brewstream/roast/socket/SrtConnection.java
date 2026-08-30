@@ -106,10 +106,8 @@ import java.util.logging.Logger;
  * {@code !IsLite && !IsSmall}, i.e. {@link AckVariant#FULL} only — pruning
  * {@code SendBuffer}'s loss list via an inbound ACK happens for every
  * variant, unconditionally). {@link #onRetransmit} fires per retransmitted
- * packet — DESIGN.md's "Extensibility & observability" section names this as
- * a hook to add once the producing mechanism exists; ACK-sent/received hooks
- * and live pollable stats stay deferred, matching how {@code onData}/{@code
- * onLoss}/{@code onTlpktDrop} were rolled out incrementally too.
+ * packet. See {@link SrtConnectionListener} for the full set of observability
+ * events, and {@link #stats()} for the counters that back them.
  */
 public final class SrtConnection {
 
@@ -232,6 +230,7 @@ public final class SrtConnection {
                 this::tick, TICK_INTERVAL_MILLIS, TICK_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
     }
 
+    /** Peer address, StreamID, and the values negotiated during the handshake. */
     public AcceptedConnection metadata() {
         return metadata;
     }

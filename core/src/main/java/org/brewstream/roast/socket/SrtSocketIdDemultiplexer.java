@@ -32,10 +32,12 @@ public final class SrtSocketIdDemultiplexer
         this.acceptor = acceptor;
     }
 
+    /** Routes packets addressed to {@code id} to {@code sink}. Replaces any existing registration. */
     public void register(SrtSocketId id, SrtPacketSink sink) {
         connections.put(id, sink);
     }
 
+    /** Stops routing to {@code id}; anything still arriving for it is dropped. */
     public void unregister(SrtSocketId id) {
         connections.remove(id);
     }

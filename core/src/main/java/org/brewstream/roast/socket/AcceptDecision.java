@@ -24,6 +24,11 @@ public sealed interface AcceptDecision {
      */
     record Accept(char[] passphrase, int keyLength) implements AcceptDecision {
 
+        /**
+         * Whether this connection will be encrypted.
+         *
+         * @return true if a passphrase was supplied
+         */
         public boolean isEncrypted() {
             return passphrase != null;
         }
@@ -35,10 +40,19 @@ public sealed interface AcceptDecision {
         }
     }
 
+    /**
+     * Refusal, carrying the code sent back to the peer.
+     *
+     * @param reason why the connection was refused
+     */
     record Reject(RejectionReason reason) implements AcceptDecision {
     }
 
-    /** Accept without encryption. */
+    /**
+     * Accept without encryption.
+     *
+     * @return a decision the listener acts on to complete the handshake
+     */
     static AcceptDecision accept() {
         return new Accept(null, 0);
     }
@@ -49,11 +63,17 @@ public sealed interface AcceptDecision {
      * when it closes.
      *
      * @param keyLength the Stream Encrypting Key length in bytes — 16, 24, or 32
+     * @return a decision the listener acts on to complete the handshake
      */
     static AcceptDecision accept(char[] passphrase, int keyLength) {
         return new Accept(passphrase.clone(), keyLength);
     }
 
+    /**
+     * Refuse the connection, telling the peer why.
+     *
+     * @return a decision the listener acts on to refuse the handshake
+     */
     static AcceptDecision reject(RejectionReason reason) {
         return new Reject(reason);
     }

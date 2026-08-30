@@ -33,6 +33,15 @@ subprojects {
         testImplementation 'org.mockito:mockito-junit-jupiter:5.23.0'
     }
 
+    javadoc {
+        options.addStringOption('Xdoclint:all,-missing', '-quiet')
+        // Keep the checks that catch real mistakes - broken {@link} references,
+        // malformed HTML - and drop the missing-tag nag. The packet types are
+        // records whose class documentation already describes the wire format
+        // field by field; a hundred @param tags restating component names would
+        // bury a genuine warning rather than surface one.
+    }
+
     test {
         useJUnitPlatform {
             excludeTags 'interop'

@@ -17,9 +17,9 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The observability surface DESIGN.md §4 calls Roast's actual value over a
- * libsrt binding: events something can subscribe to, and stats something can
- * poll. Exercised over real sockets, since the threading contract is most of the
+ * The observability surface that is Roast's actual value over a libsrt
+ * binding: events something can subscribe to, and stats something can poll.
+ * Exercised over real sockets, since the threading contract is most of the
  * design.
  */
 class ObservabilityTest {
@@ -222,13 +222,9 @@ class ObservabilityTest {
         });
 
         int messages = 200;
-        CountDownLatch allArrived = new CountDownLatch(messages);
         listener.onConnection(connection -> {
             listenerSide.complete(connection);
-            connection.onData(payload -> {
-                allArrived.countDown();
-                payload.release();
-            });
+            connection.onData(payload -> payload.release());
         });
 
         proxy = UdpLossProxy.start(
@@ -237,17 +233,26 @@ class ObservabilityTest {
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         proxy.setDropRate(0.05);
 
+        // What this test is about is that loss and retransmission are *reported* -
+        // that every packet ultimately arrives is ArqUnderLossTest's job. Waiting
+        // on full delivery here made this fail under parallel-suite load while
+        // passing alone, which is the worst kind of test: it trains people to
+        // rerun rather than to look.
+        SrtConnection listenerConnection = listenerSide.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
         for (int i = 0; i < messages; i++) {
             caller.write(Unpooled.wrappedBuffer(("m" + i).getBytes(StandardCharsets.US_ASCII)));
             Thread.sleep(2);
         }
-        assertThat(allArrived.await(TIMEOUT_SECONDS, TimeUnit.SECONDS)).isTrue();
-
-        // Events are dispatched asynchronously, so give the queue a moment to drain.
-        Thread.sleep(200);
+        while (System.nanoTime() < deadline
+                && (lossEvents.isEmpty()
+                        || listenerConnection.stats().packetsLost() == 0
+                        || caller.stats().packetsRetransmitted() == 0)) {
+            Thread.sleep(20);
+        }
 
         assertThat(lossEvents).as("5%% loss should have produced loss events").isNotEmpty();
-        assertThat(listenerSide.get().stats().packetsLost()).isPositive();
+        assertThat(listenerConnection.stats().packetsLost()).isPositive();
         assertThat(caller.stats().packetsRetransmitted()).isPositive();
         assertThat(caller.stats().retransmitRate()).isPositive();
     }

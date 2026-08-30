@@ -32,8 +32,8 @@ import org.brewstream.roast.util.CircularNumber;
  * <p>Unlike gosrt, every method takes {@code nowMicros} explicitly rather than
  * reading a clock: gosrt mixes wall-clock {@code time.Now()} for the probe pair
  * with its tick's own elapsed-microsecond value for the rate window, and this
- * codebase keeps a single elapsed-time source per connection (DESIGN.md's "never
- * wall clock on the wire"). Callers pass {@code SrtConnection.elapsedMicros()}.
+ * codebase keeps a single elapsed-time source per connection, never wall
+ * clock. Callers pass {@code SrtConnection.elapsedMicros()}.
  *
  * <p><b>No reference test exists to ground this against</b> — checked directly:
  * gosrt's {@code receive_test.go} has no rate- or capacity-related cases, so

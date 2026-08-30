@@ -31,7 +31,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /**
  * Interop test against the real SRT reference implementation (libsrt's
  * {@code srt-live-transmit}), not just our own codec — the actual definition of
- * done for DESIGN.md's Phase 2 ("ffmpeg/libsrt reaches connected"). Everything
+ * done for the handshake work — ffmpeg/libsrt reaches connected. Everything
  * else in this test suite only verifies against golden vectors and our own code.
  *
  * <p>Requires a local libsrt build (MPL-2.0, not shipped or committed — see
@@ -110,7 +110,7 @@ class LibsrtInteropTest {
     /**
      * The reverse direction of {@link #realLibsrtCallerReachesConnected}: once a
      * real libsrt caller connects, <em>we</em> write data and libsrt reads it —
-     * the actual definition of done for DESIGN.md's Phase 4 interop story
+     * the actual definition of done for the sender path's interop story
      * (everything else in this class only confirms the handshake, not that
      * Roast's send path produces correct bytes on the wire against a real peer).
      *

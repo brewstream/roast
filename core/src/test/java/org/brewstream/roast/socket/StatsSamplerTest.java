@@ -18,9 +18,9 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * The metrics seam DESIGN.md §4 asks for: stats pushable to an external sink
- * rather than only readable from a bespoke object. Roast depends on no metrics
- * library, so what is verified here is the plumbing — that samples arrive, that
+ * The metrics seam: stats pushable to an external sink rather than only
+ * readable from a bespoke object. Roast depends on no metrics library, so what
+ * is verified here is the plumbing — that samples arrive, that
  * they are attributed to the right connection, that a connection's final numbers
  * are not lost, and that a badly behaved sink cannot damage the transport.
  */

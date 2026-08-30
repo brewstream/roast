@@ -27,7 +27,7 @@ import java.net.InetAddress;
  * the conclusion request unchanged (gosrt never overwrites them — it reuses the same
  * in-memory packet for both messages); the SYN cookie the listener hands out at
  * induction is echoed back unchanged in the conclusion request. Only HSv5 is
- * supported — no HSv4 fallback (DESIGN.md defers that to Phase 7).
+ * supported — no HSv4 fallback.
  */
 public final class CallerHandshake {
 

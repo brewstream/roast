@@ -15,8 +15,8 @@ import java.util.concurrent.TimeUnit;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * DESIGN.md names this as the definition of done for <em>both</em> Phase 3 and
- * Phase 4: "2% induced loss → output still intact (recovered via ARQ)". Until
+ * The definition of done for <em>both</em> the receiver and sender paths:
+ * under 2% induced loss the output must still be intact, recovered via ARQ. Until
  * now nothing exercised it — {@link UdpLossProxy} was written for exactly this
  * in Phase 0 and then never referenced by a test, so every loss/retransmit path
  * was only ever driven by hand-injected gaps in unit tests, never by packets
@@ -35,7 +35,7 @@ class ArqUnderLossTest {
     private static final int TIMEOUT_SECONDS = 30;
     private static final String STREAM_ID = "live/lossy";
     private static final int MESSAGES = 300;
-    /** DESIGN.md asks for 2%; 5% is the top of the range it suggests, so this is the harder end. */
+    /** 2% is the target; 5% is the top of the useful range, so this is the harder end. */
     private static final double DROP_RATE = 0.05;
 
     private SrtListener listener;

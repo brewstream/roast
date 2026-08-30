@@ -10,8 +10,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Single-client UDP relay that randomly drops packets in both directions, for
- * exercising SRT's ARQ path without OS-level netem/pfctl rules — DESIGN.md's
- * Phase 0 loss-injection harness.
+ * exercising SRT's ARQ path without OS-level netem/pfctl rules.
  *
  * <p>Written as a {@code main}-only tool originally, which is why nothing ever
  * used it: a test can't drive a process that binds a fixed port and loops

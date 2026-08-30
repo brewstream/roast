@@ -11,7 +11,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Manual, hands-on smoke test for the publish/play relay pattern DESIGN.md
+ * Manual, hands-on smoke test for the publish/play relay pattern this library
  * describes as BrewStream's actual value proposition — not part of the test
  * suite and not held to this codebase's usual rigor (no design-note javadoc,
  * no tests): a throwaway tool to point real tools at and watch it work.

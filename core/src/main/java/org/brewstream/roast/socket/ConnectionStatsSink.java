@@ -4,10 +4,10 @@ package org.brewstream.roast.socket;
  * Receives periodic {@link ConnectionStats} samples — the seam between Roast and
  * whatever a deployment actually uses for metrics.
  *
- * <p>DESIGN.md §4 asks for stats "ideally pushable to an external metrics sink
- * (Micrometer or similar), not a bespoke object nobody outside the library can
- * wire up". This is that hook, kept as a one-method interface so it can be a
- * lambda and so Roast depends on no metrics library: a Micrometer binding is a
+ * <p>Statistics should be pushable into whatever an embedder already uses —
+ * Micrometer or similar — rather than trapped behind a bespoke object nobody
+ * outside the library can wire up. Hence a one-method interface: it can be a
+ * lambda, and Roast depends on no metrics library. A Micrometer binding is a
  * few lines in the embedder's own code, and can live outside this module
  * entirely.
  *

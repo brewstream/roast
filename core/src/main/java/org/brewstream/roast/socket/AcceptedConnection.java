@@ -21,11 +21,14 @@ public record AcceptedConnection(
         int flowWindowSize,
         int maxTransmissionUnitSize) {
 
+    /**
+     * Normalises a missing StreamID to the empty string, so it is never null. A
+     * peer may legitimately send none, and a null would leave every consumer to
+     * null-check or trip over it — which is exactly what the CLI did the first
+     * time it met such a peer. {@link ConnectionRequest} already normalises the
+     * same field; this makes the pair consistent.
+     */
     public AcceptedConnection {
-        // A peer may send no StreamID at all, and a null here means every
-        // consumer has to null-check or trip over it - which is exactly what the
-        // CLI did the first time it met a peer without one. ConnectionRequest
-        // already normalises the same field; this makes the pair consistent.
         streamId = streamId == null ? "" : streamId;
     }
 
@@ -40,20 +43,20 @@ public record AcceptedConnection(
      * The largest payload one DATA packet can carry on this connection: the
      * negotiated MTU less the IP+UDP (28) and SRT (16) headers. libsrt names the
      * same figure {@code SRT_LIVE_MAX_PLSIZE} (1456 at the standard 1500 MTU).
+     *
+     * @return the maximum payload size in bytes
      */
     public int maxPayloadSize() {
         return maxTransmissionUnitSize - 28 - 16;
     }
 
     /**
-     * The flow window agreed during the handshake, in packets — both sides of
-     * this codebase's handshake echo the value the other proposed
-     * ({@code ListenerHandshake.buildAcceptResponse} /
-     * {@code CallerHandshake.buildConclusionRequest}), so this is literally the
-     * number we committed to on the wire. {@link SrtConnection} bounds the
-     * "available buffer size" it reports in Full ACKs by it, which is what a
-     * peer's sender treats as its flow-control window — see that class's
-     * {@code tick}.
+     * The flow window agreed during the handshake. Both sides echo the value the
+     * other proposed, so this is literally the number committed to on the wire;
+     * {@link SrtConnection} bounds the available-buffer figure it reports in
+     * Full ACKs by it.
+     *
+     * @return the agreed flow window, in packets
      */
     public int flowWindowSize() {
         return flowWindowSize;

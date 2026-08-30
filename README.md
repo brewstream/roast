@@ -161,10 +161,9 @@ building libsrt.
 
 ## Design notes
 
-`DESIGN.md` (workspace root) carries the phase plan and protocol references;
 `STATUS.md` is a running engineering log — what is built, what is deliberately
 deferred, how each piece is verified, and the bugs found along the way with what
-they cost. Both are worth reading before changing the connection layer.
+they cost. Worth reading before changing the connection layer.
 
 Roast is developed against two reference implementations:
 [gosrt](https://github.com/datarhei/gosrt) (Go, MIT) for structure and golden

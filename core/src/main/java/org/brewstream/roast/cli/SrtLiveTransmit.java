@@ -19,7 +19,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * Relays a live stream between an {@code srt://} endpoint and standard
  * input/output — Roast's counterpart to libsrt's {@code srt-live-transmit}, and
- * DESIGN.md's Phase 6 CLI.
+ * the reference command-line tool.
  *
  * <pre>
  * srt-java-live-transmit [-stats &lt;seconds&gt;] [-t &lt;seconds&gt;] &lt;input&gt; &lt;output&gt;

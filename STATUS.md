@@ -1,16 +1,13 @@
 # Roast — status snapshot
 
-Written 2026-08-28, updated 2026-08-29, as a durable checkpoint in case a session
+Written 2026-08-28, updated 2026-08-30, as a durable checkpoint in case a session
 gets lost. See `CLAUDE.md` for conventions (package root, Netty decision, test
-stack) and `../DESIGN.md` for the full protocol design/phase plan this follows
-(module name predates "Roast" — it says `srt-core` there; also see its
-"Extensibility & observability" section, added 2026-08-29 — read that before
-touching the connection layer's public API again).
+stack) and `README.md` for the public API. Read the extensibility and
+observability notes below before touching the connection layer's public API.
 
 ## Where we are
 
-**Phase 2 (handshake) is essentially done** per DESIGN.md §5's phased plan and its
-own stated definition of done: a real SRT peer reaches "connected" against
+**Phase 2 (handshake) is essentially done** per the phase plan's own stated definition of done: a real SRT peer reaches "connected" against
 `SrtListener`. Confirmed 2026-08-29 against real **libsrt 1.5.7**
 (`srt-live-transmit`, built from source at `roast/references/srt`) — induction,
 cookie verification, StreamID/extension parsing, TSBPD negotiation, and the
@@ -30,7 +27,7 @@ still verified only against gosrt's golden vectors and our own round-trip tests.
 over a real ~10ms tick on the connection's own Netty event loop — an accepted
 connection can actually receive DATA, NAK a gap, ACK periodically, and TLPKTDROP
 a stale gap, all verified over real sockets/timers in `SrtConnectionTest`. This
-is also where DESIGN.md's "Extensibility & observability" hooks became real
+is also where the extensibility/observability hooks became real
 rather than aspirational: `onData`/`onLoss`/`onTlpktDrop` on `SrtConnection`
 (`SrtListener.onConnection` now hands out `SrtConnection`, not bare
 `AcceptedConnection` — see "Architecture decisions" for the API-shape note).
@@ -48,7 +45,7 @@ NAK interval (previously a fixed floor) — see "What's built" and "Testing
 methodology" below. `ReceiveBuffer` now also does TSBPD clock-drift correction
 and 32-bit wire-timestamp wraparound handling, both fed by/tied into the same
 ACKACK/delivery-time machinery. **Phase 3 (receiver path) is feature-complete
-per DESIGN.md's phased plan.**
+per the phase plan.**
 
 **Phase 4 (sender path) is now underway**: `SendBuffer` (new `send` package)
 is built, tested against gosrt's own `send_test.go`, and wired into
@@ -62,7 +59,7 @@ handshake). Wiring this in surfaced and fixed a real bug in `SendBuffer`
 itself — see "Testing methodology." **Confirmed against real libsrt 1.5.7**:
 `LibsrtInteropTest.realListenerSendsDataToRealLibsrtCaller` has a real
 `srt-live-transmit` call our listener and read data *we* write, asserting
-byte-for-byte correctness — the actual DESIGN.md definition-of-done for
+byte-for-byte correctness — the actual definition of done for
 Phase 4's interop story, not just our own round-trip tests.
 
 **Caller-side handshake is done**: `SrtCaller.connect(...)` connects *out* to
@@ -364,11 +361,10 @@ dropped, never thrown.
   String)` returns a `CompletableFuture<SrtConnection>`; single-shot, no
   induction/conclusion retry on packet loss (matches gosrt's `dial.go`, which
   doesn't retry either — a known simplification vs. real libsrt, which does
-  retry with backoff per spec). No HSv4 fallback (DESIGN.md defers that to
-  Phase 7) and no `SrtConfig` yet, matching `SrtListener`'s existing
+  retry with backoff per spec). No HSv4 fallback (deferred) and no `SrtConfig` yet, matching `SrtListener`'s existing
   hardcoded-defaults precedent.
 - `SrtConnectionListener` / `EventDispatcher` / `ConnectionStats` — the
-  observability surface DESIGN.md §4 calls Roast's real value over a libsrt
+  observability surface that is Roast's real value over a libsrt
   binding. **Three mechanisms for three different consumers**, deliberately not
   merged: `onData` stays a single-owner data handler; `SrtConnectionListener`
   is multicast *events* (`onConnected`/`onDisconnected`/`onLoss`/
@@ -397,8 +393,7 @@ dropped, never thrown.
   ordered against `onData`. `SrtListener.connections()` enumerates live
   connections for polling.
 - `ConnectionRequest` / `AcceptDecision` / `AcceptHandler` / `AcceptedConnection`
-  — the extensibility surface added per DESIGN.md's "Extensibility &
-  observability" section: rich accept/reject (peer address, StreamID, SRT
+  — the extensibility surface: rich accept/reject (peer address, StreamID, SRT
   version, requested latency, encryption flag) and a connection-lifecycle hook.
   `AcceptedConnection` stays pure *metadata* (peer info, negotiated latency) —
   `SrtListener.onConnection` hands out the richer `SrtConnection` (wraps it, adds
@@ -592,8 +587,7 @@ whatever the source sends to all currently-connected players as-is. Run via
 what surfaced the ACK-boundary bug above — pushing a real ffmpeg stream
 through it at realistic bitrate was the first time this codebase saw
 sustained real throughput rather than a handful of test packets. A natural,
-minimal early prototype of DESIGN.md's eventual Phase 6
-`srt-java-live-transmit` CLI, though not held to this codebase's usual rigor
+minimal early prototype of the eventual `srt-java-live-transmit` CLI, though not held to this codebase's usual rigor
 (no design-note javadoc, no tests, by design — see the class's own doc
 comment).
 
@@ -642,12 +636,11 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
 - Package root `org.brewstream.roast` (Gradle group `org.brewstream`), not
   `io.github.brewstream` — renamed early on.
 - Transport is built on **Netty** (4.2.17.Final), not raw NIO — an explicit
-  engineering call, not DESIGN.md's original "Option A vs B" (that section of
-  DESIGN.md has since been reworded from an open choice to stating the decision).
+  engineering call, settled early rather than left open.
   Netty 4.2 deprecates `NioEventLoopGroup` in favor of
   `new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory())` — `SrtListener`
   uses the modern form; watch for this if adding more Netty bootstrap code.
-- DESIGN.md's **"Extensibility & observability"** section (§4, added 2026-08-29)
+- The **extensibility & observability** goals (recorded 2026-08-29)
   is now a first-class design constraint on the connection layer, not a Phase 6
   afterthought — this is BrewStream's actual value proposition over a libsrt
   binding (see the connection request/lifecycle hooks above). Read it before
@@ -1032,7 +1025,7 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   rejection is still skipped entirely; noted inline there.
 - **No `SrtConfig`** — `SrtListener` hardcodes 120ms latency (both directions)
   and SRT version `0x010401` (matching gosrt's own baseline).
-- **Encryption** (Phase 5 in DESIGN.md) — **feature-complete and proven
+- **Encryption** — **feature-complete and proven
   against real libsrt**, which keys with a shared passphrase and decrypts
   payloads we encrypted (`LibsrtInteropTest.realLibsrtCallerDecryptsWhatWeEncrypt`).
   Mid-stream key rotation is implemented and wired. Remaining gaps are narrow
@@ -1146,7 +1139,7 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   and "Testing methodology" (the latter for the no-reference-test caveat —
   both gosrt and libsrt implement this, but neither has unit coverage for it).
   This closes the last item under `ReceiveBuffer`'s known gaps — Phase 3 (the
-  receiver path) is now feature-complete per DESIGN.md.
+  receiver path) is now feature-complete.
 - **KEEPALIVE's echo-on-receipt has no rate limit** — ported faithfully from
   gosrt's `handleKeepAlive`, which doesn't gate it either, but two peers that
   *both* echo immediately on receipt could in theory tight-loop forever (neither
@@ -1169,7 +1162,7 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   - **Full send-side stats** (gosrt's `Stats()`: `estimatedInputBW`/
     `estimatedSentBW`/`pktLossRate`) and the 16th/17th-packet bandwidth-probe
     trick — both deliberately not ported, see `SendBuffer`'s javadoc.
-  - ~~Live pollable stats and event hooks~~ **Closed** — DESIGN §4's list is
+  - ~~Live pollable stats and event hooks~~ **Closed** — the extensibility hook list is
     now complete: `SrtConnectionListener`/`ConnectionStats`, the ACK and
     pre-TSBPD events, and `SrtListener.pipeline()` for embedders. That last one
     is exposed **per port, not per connection**: §4 describes a connection's
@@ -1184,7 +1177,7 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
 
 ## Phase 6 (multiplexing & polish) — underway
 
-DESIGN.md scopes this as making Roast usable by someone who isn't us: many
+this phase is about making Roast usable by someone who isn't us: many
 sockets on one port, graceful close, Javadoc, README, an
 `srt-java-live-transmit` CLI, and polish on the *stats surface* (an external
 metrics-sink adapter) — explicitly **not** where hooks first get added, which
@@ -1281,8 +1274,7 @@ was Phase 3-5 work and is done.
 ## How to pick this back up
 
 Read this file, then `CLAUDE.md`, then skim `git log --oneline` (commit messages
-carry real rationale, not just "what changed"). `DESIGN.md` at the workspace root
-still governs overall phase order and protocol references, including the
+carry real rationale, not just "what changed"). The phase order and protocol references above still govern, including the
 extensibility/hooks design constraint added 2026-08-29 — it predates this
 implementation work in its original form, but has been actively edited alongside
 it since, so treat it as current, not frozen.

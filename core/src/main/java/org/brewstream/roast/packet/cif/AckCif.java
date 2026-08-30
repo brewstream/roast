@@ -25,6 +25,7 @@ public record AckCif(
     public static final int SMALL_LENGTH = 16;
     public static final int FULL_LENGTH = 28;
 
+    /** A Lite ACK: just the sequence number, sent between full ACKs at high packet rates. */
     public static AckCif lite(CircularNumber lastAckPacketSequenceNumber) {
         return new AckCif(AckVariant.LITE, lastAckPacketSequenceNumber, 0, 0, 0, 0, 0, 0);
     }

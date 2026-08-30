@@ -37,8 +37,9 @@ import java.util.Optional;
  * which starts at its zero-value — there is no "always send a Full ACK on the
  * very first tick" shortcut. The first Full ACK fires once {@code nowMicros}
  * itself reaches {@link #FULL_ACK_INTERVAL_MICROS}, so callers must pass
- * microseconds elapsed since this receiver's own start (DESIGN.md's "never wall
- * clock on the wire" — same rule applies to this internal clock), not epoch time.
+ * microseconds elapsed since this receiver's own start — this codebase never
+ * puts wall-clock time on the wire, and the same rule applies to this internal
+ * clock — not epoch time.
  */
 public final class AckSender {
 

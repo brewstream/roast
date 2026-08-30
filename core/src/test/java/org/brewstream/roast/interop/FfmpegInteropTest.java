@@ -110,9 +110,8 @@ class FfmpegInteropTest {
 
 
     /**
-     * DESIGN.md's Phase 3 definition of done, in its own words: "publish a 5
-     * Mbps MPEG-TS from ffmpeg → Java listener → byte-exact TS output with 0%
-     * loss".
+     * The receiver path's definition of done: publish a 5 Mbps MPEG-TS from
+     * ffmpeg to a Java listener and get byte-exact TS output with 0% loss.
      *
      * <p>Byte-exactness against ffmpeg looks impossible at first, since its
      * output isn't reproducible run to run. The {@code tee} muxer resolves it:

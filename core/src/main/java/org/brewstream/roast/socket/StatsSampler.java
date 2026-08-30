@@ -98,6 +98,7 @@ public final class StatsSampler implements AutoCloseable {
         }
     }
 
+    /** Stops sampling. A sample already in progress is interrupted rather than awaited. */
     @Override
     public void close() {
         executor.shutdownNow();

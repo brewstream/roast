@@ -55,9 +55,7 @@ import java.util.logging.Logger;
  *
  * <p>Single-shot: no induction/conclusion retry on packet loss, matching gosrt's
  * {@code dial.go} (which doesn't retry either) — a known simplification relative to
- * real libsrt, which does retry with backoff per spec. No HSv4 fallback (DESIGN.md
- * defers that to Phase 7) and no {@code SrtConfig} yet — latency/version/timeout
- * are hardcoded, matching {@link SrtListener}'s existing precedent.
+ * real libsrt, which does retry with backoff per spec. No HSv4 fallback.
  */
 public final class SrtCaller {
 

@@ -13,7 +13,7 @@ import java.util.OptionalLong;
  * Holds accepted DATA packets until their TSBPD delivery deadline arrives (per
  * packet: connection-relative wire timestamp + this receiver's negotiated
  * latency), keeping the ones not yet deliverable sorted by sequence number.
- * Combines what DESIGN.md separately names ReceiveBuffer and TsbpdDeliverer —
+ * Combines buffering and TSBPD delivery timing in one type —
  * gosrt keeps them as one struct too ({@code congestion/live/receive.go}'s
  * {@code receiver}, both storage and delivery timing in the same type).
  *
@@ -266,6 +266,15 @@ public final class ReceiveBuffer {
     }
 
     /**
+     * Where the acknowledgement boundary currently sits — the equivalent of the
+     * receive-window start libsrt judges an incoming DROPREQ's distance
+     * against ({@code getStartSeqNo()}).
+     */
+    public CircularNumber acknowledgedBoundary() {
+        return lastAcked;
+    }
+
+    /**
      * Gives up on everything at or before {@code end} immediately, rather than
      * waiting for its delivery deadline to pass — what a peer's DROPREQ asks
      * for when its sender has discarded those packets and they are never
@@ -280,15 +289,6 @@ public final class ReceiveBuffer {
      * {@code end}, so a caller can tell a redundant DROPREQ from one that
      * actually advanced anything.
      */
-    /**
-     * Where the acknowledgement boundary currently sits — the equivalent of the
-     * receive-window start libsrt judges an incoming DROPREQ's distance
-     * against ({@code getStartSeqNo()}).
-     */
-    public CircularNumber acknowledgedBoundary() {
-        return lastAcked;
-    }
-
     public boolean abandonUpTo(CircularNumber end) {
         if (end.lessThanOrEqual(lastAcked)) {
             return false;

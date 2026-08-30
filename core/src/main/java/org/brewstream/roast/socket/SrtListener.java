@@ -74,6 +74,7 @@ public final class SrtListener {
         return bind(localAddress, SrtConfig.defaults());
     }
 
+    /** Binds with explicit settings; see {@link SrtConfig}. */
     public static SrtListener bind(InetSocketAddress localAddress, SrtConfig config) throws InterruptedException {
         SrtSocketIdDemultiplexer demultiplexer = new SrtSocketIdDemultiplexer();
         EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
@@ -136,13 +137,11 @@ public final class SrtListener {
     /**
      * This listener's Netty pipeline, so an embedder can insert its own
      * {@code ChannelHandler}s — custom telemetry, traffic interception or
-     * mutation — rather than being limited to the hooks above. DESIGN.md §4
-     * asks for this on the grounds that hiding Netty behind a closed API would
-     * waste the fact that the transport *is* Netty.
+     * mutation — rather than being limited to the hooks above. Hiding Netty
+     * behind a closed API would waste the fact that the transport *is* Netty.
      *
      * <p><b>The granularity is per port, not per connection</b>, which is worth
-     * knowing before reaching for it. §4 describes adding handlers to "a
-     * connection's pipeline", but Roast multiplexes every connection for a
+     * knowing before reaching for it: Roast multiplexes every connection for a
      * listener onto one {@code NioDatagramChannel} — that is what makes
      * many-sockets-on-one-port work — so there is exactly one pipeline here and
      * a handler added to it sees traffic for <em>all</em> connections,
@@ -165,10 +164,19 @@ public final class SrtListener {
         return java.util.Collections.unmodifiableCollection(connections.values());
     }
 
+    /**
+     * The address actually bound — worth reading back when binding to port 0,
+     * since that is the only way to learn the port the OS chose.
+     */
     public InetSocketAddress localAddress() {
         return (InetSocketAddress) channel.localAddress();
     }
 
+    /**
+     * Closes every connection this listener accepted, then the port itself.
+     * Each connection is closed gracefully, so data already buffered in either
+     * direction is still delivered rather than discarded.
+     */
     public void close() throws InterruptedException {
         connections.values().forEach(SrtConnection::close);
         channel.close().sync();

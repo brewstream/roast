@@ -66,6 +66,12 @@ public final class CircularNumber {
         return d >= threshold ? max - d + 1 : d;
     }
 
+    /**
+     * Wrap-aware ordering: "less than" means <em>behind</em> in sequence, judged
+     * over the shorter way round the circle, so a number just past the wrap is
+     * correctly greater than one just before it. Plain numeric comparison would
+     * invert exactly there.
+     */
     public boolean lessThan(CircularNumber other) {
         requireSameDomain(other);
         if (value == other.value) {
