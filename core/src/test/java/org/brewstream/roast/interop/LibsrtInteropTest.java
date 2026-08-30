@@ -4,6 +4,7 @@ import io.netty.buffer.Unpooled;
 import org.brewstream.roast.socket.AcceptDecision;
 import org.brewstream.roast.socket.AcceptedConnection;
 import org.brewstream.roast.socket.ConnectionRequest;
+import org.brewstream.roast.socket.SrtCaller;
 import org.brewstream.roast.socket.SrtConnection;
 import org.brewstream.roast.socket.SrtListener;
 import org.junit.jupiter.api.AfterEach;
@@ -14,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -141,6 +143,83 @@ class LibsrtInteropTest {
             System.arraycopy(chunk, 0, expected, i * chunk.length, chunk.length);
         }
         assertThat(Files.readAllBytes(outputFile)).isEqualTo(expected);
+    }
+
+    /**
+     * The third direction, and the one the other two can't cover: <em>we</em>
+     * call out ({@link SrtCaller}) to a real libsrt acting as <em>listener</em>.
+     * Both tests above run {@code srt-live-transmit} as the caller, so until
+     * now Roast's caller-side handshake had only ever been verified against
+     * Roast's own {@code SrtListener} — two pieces of the same codebase agreeing
+     * with each other. This is the independent check.
+     *
+     * <p>The connect is retried in a loop rather than attempted once: libsrt
+     * needs a moment to bind its port after the process starts, and {@link
+     * SrtCaller} is deliberately single-shot with no induction retry (matching
+     * gosrt's {@code dial.go}; real libsrt does retry with backoff — a known,
+     * documented simplification). Retrying here exercises that limitation
+     * honestly instead of hiding it behind a fixed sleep.
+     */
+    @Test
+    void realCallerSendsDataToRealLibsrtListener() throws Exception {
+        int listenerPort = freeUdpPort();
+        Path outputFile = Files.createTempFile("roast-interop-caller-", ".bin");
+        outputFile.toFile().deleteOnExit();
+        srtLiveTransmit = launchSrtLiveTransmitListening(listenerPort, outputFile);
+
+        SrtConnection connection = connectWithRetries(listenerPort);
+        try {
+            byte[] chunk = "roast-caller-path-interop\n".getBytes(StandardCharsets.US_ASCII);
+            int writes = 5;
+            for (int i = 0; i < writes; i++) {
+                connection.write(Unpooled.wrappedBuffer(chunk));
+            }
+
+            boolean exited = srtLiveTransmit.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertThat(exited).as("srt-live-transmit should exit on its own -t timeout").isTrue();
+
+            byte[] expected = new byte[chunk.length * writes];
+            for (int i = 0; i < writes; i++) {
+                System.arraycopy(chunk, 0, expected, i * chunk.length, chunk.length);
+            }
+            assertThat(Files.readAllBytes(outputFile)).isEqualTo(expected);
+        } finally {
+            connection.close();
+        }
+    }
+
+    private static SrtConnection connectWithRetries(int listenerPort) throws Exception {
+        InetSocketAddress remote = new InetSocketAddress("127.0.0.1", listenerPort);
+        Exception last = null;
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline) {
+            try {
+                return SrtCaller.connect(remote, STREAM_ID).get(2, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                last = e;
+                Thread.sleep(200);
+            }
+        }
+        throw new AssertionError("never connected to the libsrt listener on port " + listenerPort, last);
+    }
+
+    /** An ephemeral port, released immediately so libsrt can bind it itself. */
+    private static int freeUdpPort() throws IOException {
+        try (DatagramSocket socket = new DatagramSocket(0)) {
+            return socket.getLocalPort();
+        }
+    }
+
+    /** libsrt listens and reads; {@code file://con} writes the raw bytes it receives to stdout. */
+    private Process launchSrtLiveTransmitListening(int listenerPort, Path outputFile) throws IOException {
+        ProcessBuilder builder = new ProcessBuilder(
+                srtLiveTransmitPath().toString(),
+                "-t", "5",
+                "srt://:" + listenerPort + "?mode=listener",
+                "file://con")
+                .redirectOutput(ProcessBuilder.Redirect.to(outputFile.toFile()))
+                .redirectError(ProcessBuilder.Redirect.DISCARD);
+        return builder.start();
     }
 
     /** {@code srt://} as input (libsrt calls and reads), {@code file://con} as output (raw bytes to stdout). */
