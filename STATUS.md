@@ -223,12 +223,12 @@ packets a peer decided never to send. The one check that would have found it
 immediately (are the received sequence numbers contiguous?) was cheap, and
 was not run until last.
 
-193 tests passing (128 default + 3 gated interop + 2 ACKACK/RTT + 5
+209 tests passing (128 default + 3 gated interop + 2 ACKACK/RTT + 5
 `DriftTracerTest` + 2 `ReceiveBufferTest` drift + 4 `ReceiveBufferTest`
 wraparound + 10 `SendBufferTest` + 1 `SendBufferTest` probe-trick + 5
 `SrtConnectionTest` send-side + 2 `SrtConnectionTest` flow-window + 9
-`ReceiveRateEstimatorTest` + 12 `KeyMaterialCifTest` + 11 `CallerHandshakeTest`
-+ 3 `SrtCallerTest`),
+`ReceiveRateEstimatorTest` + 12 `KeyMaterialCifTest` + 16 `StreamKeyWrapperTest`
++ 11 `CallerHandshakeTest` + 3 `SrtCallerTest`),
 all committed to `main` (no branches). Every commit so far has been asked-for
 explicitly by the user, one narrowly-scoped piece at a time — see git log for
 the exact sequence and rationale (commit messages are detailed).
@@ -457,6 +457,22 @@ numbers and 32-bit timestamps (SRT wraps these on the wire), ported from gosrt's
   `push`'s javadoc, and `ReceiveRateEstimator` above for the receive-side half
   that consumes it); full bandwidth-rate statistics (gosrt's `Stats()`) remain
   deliberately not ported — see known gaps.
+
+**`crypto`** — Phase 5's key handling, not yet wired to anything:
+- `StreamKeyWrapper` — derives the Key Encrypting Key from a passphrase
+  (PBKDF2/HMAC-SHA-1, 2048 iterations) and wraps/unwraps the Stream Encrypting
+  Key(s) with it (AES Key Wrap, RFC 3394), which is what fills in a
+  `KeyMaterialCif`'s otherwise-opaque `wrap` field. Both are JDK built-ins
+  (`PBKDF2WithHmacSHA1`, the `AESWrap` cipher), so unlike gosrt this needs no
+  third-party keywrap dependency. Verified against gosrt's `crypto_test.go`
+  golden vectors for all three key lengths and all three key selections.
+  Two parameterization details worth knowing, both easy to get plausibly wrong
+  and both directly tested: **only the salt's trailing 8 bytes** feed PBKDF2
+  (gosrt's `salt[8:]` — passing all 16 yields a key no other implementation
+  agrees with), and the KEK is **as long as the SEK it wraps**, not a fixed
+  width. `unwrap` returns `null` rather than throwing when the integrity check
+  fails, since a wrong passphrase is an expected peer condition to answer with
+  a "bad secret" rejection.
 
 **`handshake`** — `SynCookie`: MD5-based SYN cookie so a listener can verify an
 INDUCTION cookie was echoed back correctly in CONCLUSION without keeping
@@ -742,6 +758,20 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   (comparing implementations, not confirming a bug in isolation) — worth
   remembering as a general technique whenever "does Roast negotiate the same
   thing a reference does" needs a real answer instead of a guess.
+- **Check what a reference test actually covers before planning around it,
+  2026-08-29.** Phase 5 was planned as PBKDF2 first, then AES key wrap, on the
+  stated basis that gosrt's `TestMarshal`/`TestUnmarshal` would ground them.
+  Reading those tests before writing any code showed they exercise KEK
+  derivation and wrapping *together* and there is no isolated PBKDF2 vector in
+  either reference — so the planned first step would have landed a
+  parameterization (which salt bytes, how many iterations, what key width)
+  that nothing could verify. RFC 6070 vectors wouldn't have helped: they
+  confirm the JDK's PBKDF2 works, which was never in question. The two steps
+  were merged into one commit for that reason. Same lesson as the earlier
+  `KeyMaterialCif` slice, where the golden vector turned out to live in
+  `packet/handshake_test.go` rather than `crypto_test.go` as first claimed:
+  **name the specific test you intend to port, and open it, before treating a
+  piece as grounded.**
 - **The 16th/17th-packet bandwidth-probe trick** — neither half has a gosrt
   test to ground against (`send_test.go` has no probe cases and
   `receive_test.go` has no rate/capacity cases, both checked directly), so
@@ -770,12 +800,15 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   `KeyMaterialCif`/`KeyEncryption` parse and build the Key Material message
   the KMREQ/KMRSP extensions carry, verified byte-for-byte against gosrt's
   own `TestKM` golden vector. Everything else is still untouched and is the
-  bulk of the phase: PBKDF2 key derivation from a passphrase, AES key wrap/
-  unwrap of the SEKs (the `wrap` field is carried as opaque bytes today),
-  AES-CTR payload encryption, even/odd key rotation with pre-announce, and
-  wiring any of it into `ListenerHandshake`/`CallerHandshake`/`SrtConnection`.
-  Deliberately stopped at the codec so nothing is half-wired into the
-  connection path — see "Next steps".
+  bulk of the phase. **Also done**: `StreamKeyWrapper` (new `crypto` package)
+  derives the KEK from a passphrase (PBKDF2) and wraps/unwraps the SEKs (AES
+  Key Wrap), verified against gosrt's golden vectors — so a KM message's
+  `wrap` field can now actually be produced and consumed, though nothing calls
+  it yet. **Still untouched**: AES-CTR payload encryption, even/odd key
+  rotation with pre-announce, and wiring any of it into
+  `ListenerHandshake`/`CallerHandshake`/`SrtConnection`. Deliberately stopped
+  before the wiring so nothing is half-connected into the data path — see
+  "Next steps".
 - ~~Caller-side handshake~~ **Closed** — `SrtCaller`/`CallerHandshake`; see
   "What's built" and "Testing methodology". No HSv4 fallback and no
   induction/conclusion retry-with-backoff, both matching gosrt's own
@@ -894,29 +927,24 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
 
 ## Next steps, in order
 
-1. **Continue Phase 5 (encryption), in this order** — the wire format is done
-   (`KeyMaterialCif`, see "What's built"); everything below is untouched. The
-   split matters: steps a-c are pure, testable functions with real reference
-   tests to port, and none of them touch the connection path, so each is a
-   safe stopping point. Only step d changes live behavior.
-   1. **PBKDF2** — derive the key-encrypting key from the passphrase
-      (SHA-1, 2048 iterations, the KM message's salt). `javax.crypto`'s
-      `PBKDF2WithHmacSHA1` covers this; no third-party dependency needed.
-   2. **AES key wrap/unwrap** (RFC 3394) of the SEKs, filling in
-      `KeyMaterialCif.wrap()`'s currently-opaque bytes. gosrt pulls in an
-      external keywrap package; the JDK exposes this as the `AESWrap` cipher,
-      worth confirming before assuming. **Ground against gosrt's
-      `crypto_test.go` `TestMarshal`/`TestUnmarshal`**, which are exactly
-      these two operations and carry golden vectors for all three key
-      lengths.
-   3. **AES-CTR payload encrypt/decrypt**, keyed by the packet sequence
+1. **Continue Phase 5 (encryption).** Done so far, neither wired to anything:
+   the KM wire format (`KeyMaterialCif`) and KEK derivation + key wrapping
+   (`StreamKeyWrapper`) — see "What's built". What remains:
+   1. **AES-CTR payload encrypt/decrypt**, keyed by the packet sequence
       number — port gosrt's `TestEncode`/`TestDecode`, which pin the counter
-      construction down with a golden vector.
-   4. **Wiring**: KM extension parsing in `HandshakeCif`, passphrase config
-      on both handshake sides, encrypt-on-send/decrypt-on-receive in
+      construction down with a golden vector (gosrt's
+      `EncryptOrDecryptPayload` documents the counter layout inline: the
+      sequence number in bytes 10-13, XORed against the leading 112 bits of
+      the salt). Still a pure function, still no connection-path changes, so
+      it stays a safe stopping point.
+   2. **Wiring**: KM extension parsing in `HandshakeCif` (the codec exists,
+      the handshake just skips the extension by length today), passphrase
+      config on both handshake sides, encrypt-on-send/decrypt-on-receive in
       `SrtConnection`, then even/odd key rotation with pre-announce. This is
-      the step that needs real interop testing against libsrt with a
-      passphrase, and the one worth having quota headroom for.
+      the step that changes live behavior, needs real interop testing against
+      libsrt with a passphrase, and is worth having quota headroom for.
+      Note it will also want an `SrtConfig` of some kind — currently a
+      documented gap, and a passphrase has nowhere to live without it.
 2. Phase 6 (multiplexing & polish) — the alternative major milestone,
    independent of Phase 5 and not blocked by it. Many connections per port,
    live pollable stats, and the `srt-java-live-transmit` CLI that `RelayDemo`
