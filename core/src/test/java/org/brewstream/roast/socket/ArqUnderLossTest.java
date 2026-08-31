@@ -23,6 +23,7 @@ import org.junit.jupiter.api.Test;
 
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -53,6 +54,18 @@ class ArqUnderLossTest {
     private static final int MESSAGES = 300;
     /** 2% is the target; 5% is the top of the useful range, so this is the harder end. */
     private static final double DROP_RATE = 0.05;
+    /**
+     * Deliberately far above the 120ms default. The recovery budget, not the
+     * timeout, is what this test actually needs: TSBPD gives a lost packet only
+     * that long to be NAKed, retransmitted and arrive before TLPKTDROP abandons
+     * it, and on a contended two-core CI runner the ~10ms tick slips enough that
+     * 120ms stops being sufficient. That made this fail on CI while passing on a
+     * fast machine - not a defect, just a test asserting lossless delivery under
+     * conditions where dropping is the designed behaviour. A wider budget keeps
+     * the strict "nothing is lost" claim honest, and exercises a latency setting
+     * nothing else covers.
+     */
+    private static final Duration LATENCY = Duration.ofMillis(500);
 
     private SrtListener listener;
     private SrtConnection callerSide;
@@ -73,7 +86,8 @@ class ArqUnderLossTest {
 
     @Test
     void everyPayloadArrivesInOrderDespiteFivePercentLossInBothDirections() throws Exception {
-        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0),
+                SrtConfig.defaults().withLatency(LATENCY));
         listener.setAcceptHandler(request -> AcceptDecision.accept());
 
         List<String> delivered = new ArrayList<>();
@@ -96,13 +110,14 @@ class ArqUnderLossTest {
         proxy = UdpLossProxy.start(
                 new InetSocketAddress("127.0.0.1", listener.localAddress().getPort()), 0.0);
         callerSide = SrtCaller.connect(
-                        new InetSocketAddress("127.0.0.1", proxy.localPort()), STREAM_ID)
+                        new InetSocketAddress("127.0.0.1", proxy.localPort()), STREAM_ID,
+                        SrtConfig.defaults().withLatency(LATENCY))
                 .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         proxy.setDropRate(DROP_RATE);
 
         // Paced so a lost packet has room for several NAK-driven retries inside
-        // the negotiated 120ms TSBPD budget; blasting them would make TLPKTDROP,
-        // not ARQ, decide the outcome.
+        // the negotiated TSBPD budget; blasting them would make TLPKTDROP, not
+        // ARQ, decide the outcome.
         for (int i = 0; i < MESSAGES; i++) {
             callerSide.write(Unpooled.wrappedBuffer(("msg-" + i).getBytes(StandardCharsets.US_ASCII)));
             Thread.sleep(2);
