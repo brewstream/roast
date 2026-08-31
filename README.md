@@ -27,7 +27,8 @@ production by anyone.
   [Threading and buffer ownership](#threading-and-buffer-ownership) ·
   [Events](#events) · [Statistics](#statistics) ·
   [Admission control](#admission-control) · [Encryption](#encryption) ·
-  [Configuration](#configuration) · [Lifecycle](#lifecycle-and-shutdown)
+  [Configuration](#configuration) · [Lifecycle](#lifecycle-and-shutdown) ·
+  [Your own Netty resources](#running-on-your-own-netty-resources)
 - [Command line](#command-line) · [Building](#building-and-testing) ·
   [Not implemented](#what-is-not-implemented)
 
@@ -425,8 +426,37 @@ listener's connections.
 **Netty pipeline access.** `listener.pipeline()` exposes the underlying
 `ChannelPipeline` if you need to go beyond the hooks above — custom telemetry,
 traffic interception. Note it is per *port*, not per connection: every connection
-on a listener is multiplexed onto one `NioDatagramChannel`, which is what makes
+on a listener is multiplexed onto one datagram channel, which is what makes
 many-sockets-on-one-port work, so a handler you add sees all of them.
+
+## Running on your own Netty resources
+
+By default Roast creates and owns an event loop group and uses
+`NioDatagramChannel`, which suits an application not otherwise using Netty. If
+you already run Netty, hand over your own:
+
+```java
+SrtTransport transport = SrtTransport.shared(existingGroup, EpollDatagramChannel.class);
+
+SrtListener.bind(address, SrtConfig.defaults(), transport);
+SrtCaller.connect(address, streamId, null, 0, SrtConfig.defaults(), transport);
+```
+
+Two reasons this is worth doing. **Threads:** by default every *caller*
+connection gets its own group, and Netty starts a thread for each group that
+receives a channel — so fifty outbound pulls means fifty threads that could have
+been a handful. **Transport:** the default is NIO, while `EpollDatagramChannel`
+(or io_uring) supports `SO_REUSEPORT`, which is how UDP receive scales across
+cores at live packet rates. The channel type must match the group's transport;
+Netty fails the registration if they disagree.
+
+Roast never shuts down a group you lent it — `close()` closes its channels and
+leaves your loops alone, since you are probably still using them. A group Roast
+created is shut down with whatever created it.
+
+This is deliberately not part of `SrtConfig`: an event loop group is a resource
+with a lifecycle, not a setting, and `SrtConfig` is a value object meant to be
+safe to log, copy and share.
 
 ## Command line
 

@@ -45,7 +45,7 @@ public final class SrtListener {
     private static final Logger LOG = Logger.getLogger(SrtListener.class.getName());
 
     private final Channel channel;
-    private final EventLoopGroup eventLoopGroup;
+    private final SrtTransport transport;
     private final SrtSocketIdDemultiplexer demultiplexer;
     private final ListenerHandshake listenerHandshake;
     private final SrtSocketIdGenerator socketIdGenerator;
@@ -59,10 +59,10 @@ public final class SrtListener {
     };
     private final java.util.List<SrtConnectionListener> eventListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
 
-    private SrtListener(Channel channel, EventLoopGroup eventLoopGroup, SrtSocketIdDemultiplexer demultiplexer,
+    private SrtListener(Channel channel, SrtTransport transport, SrtSocketIdDemultiplexer demultiplexer,
             ListenerHandshake listenerHandshake, SrtSocketIdGenerator socketIdGenerator, SrtConfig config) {
         this.channel = channel;
-        this.eventLoopGroup = eventLoopGroup;
+        this.transport = transport;
         this.demultiplexer = demultiplexer;
         this.listenerHandshake = listenerHandshake;
         this.socketIdGenerator = socketIdGenerator;
@@ -76,11 +76,19 @@ public final class SrtListener {
 
     /** Binds with explicit settings; see {@link SrtConfig}. */
     public static SrtListener bind(InetSocketAddress localAddress, SrtConfig config) throws InterruptedException {
+        return bind(localAddress, config, SrtTransport.owned());
+    }
+
+    /**
+     * Binds on an application's own Netty resources rather than resources Roast
+     * creates — see {@link SrtTransport}. Everything else behaves identically.
+     */
+    public static SrtListener bind(InetSocketAddress localAddress, SrtConfig config, SrtTransport transport)
+            throws InterruptedException {
         SrtSocketIdDemultiplexer demultiplexer = new SrtSocketIdDemultiplexer();
-        EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
         Bootstrap bootstrap = new Bootstrap()
-                .group(group)
-                .channel(NioDatagramChannel.class)
+                .group(transport.eventLoopGroup())
+                .channel(transport.channelType())
                 .handler(new ChannelInitializer<DatagramChannel>() {
                     @Override
                     protected void initChannel(DatagramChannel ch) {
@@ -96,7 +104,7 @@ public final class SrtListener {
                 cookie, boundAddress.getAddress(), config.srtVersion(), config.maxMss());
 
         SrtListener listener = new SrtListener(
-                channel, group, demultiplexer, listenerHandshake, new SrtSocketIdGenerator(), config);
+                channel, transport, demultiplexer, listenerHandshake, new SrtSocketIdGenerator(), config);
         demultiplexer.setAcceptor(listener::onHandshakePacket);
         return listener;
     }
@@ -180,7 +188,11 @@ public final class SrtListener {
     public void close() throws InterruptedException {
         connections.values().forEach(SrtConnection::close);
         channel.close().sync();
-        eventLoopGroup.shutdownGracefully().sync();
+        // A group the application lent us is still theirs, and may well be
+        // carrying their other traffic - shutting it down would take that with it.
+        if (transport.shutdownWithOwner()) {
+            transport.eventLoopGroup().shutdownGracefully().sync();
+        }
     }
 
     private void onHandshakePacket(AddressedEnvelope<SrtPacket, InetSocketAddress> msg) {

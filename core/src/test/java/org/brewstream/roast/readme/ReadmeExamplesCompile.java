@@ -2,6 +2,8 @@ package org.brewstream.roast.readme;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.socket.nio.NioDatagramChannel;
 import org.brewstream.roast.packet.cif.LossRange;
 import org.brewstream.roast.packet.cif.RejectionReason;
 import org.brewstream.roast.socket.AcceptDecision;
@@ -11,6 +13,7 @@ import org.brewstream.roast.socket.SrtConfig;
 import org.brewstream.roast.socket.SrtConnection;
 import org.brewstream.roast.socket.SrtConnectionListener;
 import org.brewstream.roast.socket.SrtListener;
+import org.brewstream.roast.socket.SrtTransport;
 import org.brewstream.roast.socket.StatsSampler;
 
 import java.net.InetSocketAddress;
@@ -151,6 +154,14 @@ final class ReadmeExamplesCompile {
         listener.connections();
         listener.localAddress();
         listener.close();
+    }
+
+    static void ownNettyResources(EventLoopGroup existingGroup,
+            InetSocketAddress address, String streamId) throws InterruptedException {
+        SrtTransport transport = SrtTransport.shared(existingGroup, NioDatagramChannel.class);
+
+        SrtListener.bind(address, SrtConfig.defaults(), transport);
+        SrtCaller.connect(address, streamId, null, 0, SrtConfig.defaults(), transport);
     }
 
     private static void accept(String streamId, ByteBuf payload) {

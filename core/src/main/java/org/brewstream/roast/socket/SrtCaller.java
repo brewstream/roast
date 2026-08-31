@@ -71,7 +71,7 @@ public final class SrtCaller {
     private static final long HANDSHAKE_RETRY_MILLIS = 250;
 
     private final Channel channel;
-    private final EventLoopGroup eventLoopGroup;
+    private final SrtTransport transport;
     private final SrtSocketIdDemultiplexer demultiplexer;
     private final CallerHandshake callerHandshake;
     private final InetSocketAddress remoteAddress;
@@ -89,12 +89,12 @@ public final class SrtCaller {
     private HandshakeCif pendingRequest;
     private boolean conclusionSent;
 
-    private SrtCaller(Channel channel, EventLoopGroup eventLoopGroup, SrtSocketIdDemultiplexer demultiplexer,
+    private SrtCaller(Channel channel, SrtTransport transport, SrtSocketIdDemultiplexer demultiplexer,
             InetSocketAddress remoteAddress, InetAddress localAddress, SrtSocketId ownSocketId,
             CircularNumber ownInitialSequenceNumber, String streamId, EncryptionContext encryptionContext,
             SrtConfig config, CompletableFuture<SrtConnection> result) {
         this.channel = channel;
-        this.eventLoopGroup = eventLoopGroup;
+        this.transport = transport;
         this.demultiplexer = demultiplexer;
         this.remoteAddress = remoteAddress;
         this.localAddress = localAddress;
@@ -138,16 +138,26 @@ public final class SrtCaller {
     /** Connects with encryption and explicit settings. */
     public static CompletableFuture<SrtConnection> connect(InetSocketAddress remoteAddress, String streamId,
             char[] passphrase, int keyLength, SrtConfig config) {
+        return connect(remoteAddress, streamId, passphrase, keyLength, config, SrtTransport.owned());
+    }
+
+    /**
+     * Connects on an application's own Netty resources rather than resources
+     * Roast creates — see {@link SrtTransport}. Worth preferring wherever more
+     * than a handful of outbound connections are made: the default gives each
+     * one its own event loop group, and so its own thread.
+     */
+    public static CompletableFuture<SrtConnection> connect(InetSocketAddress remoteAddress, String streamId,
+            char[] passphrase, int keyLength, SrtConfig config, SrtTransport transport) {
         CompletableFuture<SrtConnection> result = new CompletableFuture<>();
         EncryptionContext encryptionContext = passphrase == null
                 ? null
                 : EncryptionContext.generating(passphrase, keyLength,
                         config.keyRefreshPackets(), config.keyPreAnnouncePackets());
         SrtSocketIdDemultiplexer demultiplexer = new SrtSocketIdDemultiplexer();
-        EventLoopGroup group = new MultiThreadIoEventLoopGroup(NioIoHandler.newFactory());
         Bootstrap bootstrap = new Bootstrap()
-                .group(group)
-                .channel(NioDatagramChannel.class)
+                .group(transport.eventLoopGroup())
+                .channel(transport.channelType())
                 .handler(new ChannelInitializer<DatagramChannel>() {
                     @Override
                     protected void initChannel(DatagramChannel ch) {
@@ -157,7 +167,7 @@ public final class SrtCaller {
 
         bootstrap.bind(0).addListener((ChannelFutureListener) future -> {
             if (!future.isSuccess()) {
-                group.shutdownGracefully();
+                shutdownIfOwned(transport);
                 result.completeExceptionally(future.cause());
                 return;
             }
@@ -167,7 +177,7 @@ public final class SrtCaller {
             InetAddress localAddress = ((InetSocketAddress) channel.localAddress()).getAddress();
             CircularNumber ownInitialSequenceNumber = randomInitialSequenceNumber();
 
-            new SrtCaller(channel, group, demultiplexer, remoteAddress, localAddress, ownSocketId,
+            new SrtCaller(channel, transport, demultiplexer, remoteAddress, localAddress, ownSocketId,
                     ownInitialSequenceNumber, streamId, encryptionContext, config, result)
                     .start();
         });
@@ -272,7 +282,7 @@ public final class SrtCaller {
             SrtConnection connection = new SrtConnection(channel, demultiplexer, metadata, ownInitialSequenceNumber,
                     () -> {
                         channel.close();
-                        eventLoopGroup.shutdownGracefully();
+                        shutdownIfOwned(transport);
                     },
                     encryptionContext, config.peerIdleTimeout().toNanos() / 1_000);
 
@@ -312,7 +322,7 @@ public final class SrtCaller {
         stopRetrying();
         demultiplexer.unregister(ownSocketId);
         channel.close();
-        eventLoopGroup.shutdownGracefully();
+        shutdownIfOwned(transport);
         result.completeExceptionally(cause);
     }
 
@@ -332,6 +342,16 @@ public final class SrtCaller {
 
     private int elapsedMicros() {
         return (int) ((System.nanoTime() - startNanos) / 1000);
+    }
+
+    /**
+     * Only a transport Roast created is ours to shut down; one an application
+     * lent us may be carrying its other traffic.
+     */
+    private static void shutdownIfOwned(SrtTransport transport) {
+        if (transport.shutdownWithOwner()) {
+            transport.eventLoopGroup().shutdownGracefully();
+        }
     }
 
     private static CircularNumber randomInitialSequenceNumber() {
