@@ -156,6 +156,20 @@ final class ReadmeExamplesCompile {
         listener.close();
     }
 
+    static void asANettyChannel(SrtConnection connection, io.netty.channel.Channel downstream,
+            io.netty.buffer.ByteBuf chunk) {
+        connection.pipeline().addLast(new io.netty.channel.ChannelInboundHandlerAdapter());
+
+        io.netty.channel.Channel channel = connection.channel();
+        assert channel != null;
+
+        if (connection.channel().isWritable()) {
+            connection.channel().writeAndFlush(chunk);
+        }
+
+        connection.channel().config().setAutoRead(downstream.isWritable());
+    }
+
     static void ownNettyResources(EventLoopGroup existingGroup,
             InetSocketAddress address, String streamId) throws InterruptedException {
         SrtTransport transport = SrtTransport.shared(existingGroup, NioDatagramChannel.class);

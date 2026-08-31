@@ -28,6 +28,7 @@ production by anyone.
   [Events](#events) · [Statistics](#statistics) ·
   [Admission control](#admission-control) · [Encryption](#encryption) ·
   [Configuration](#configuration) · [Lifecycle](#lifecycle-and-shutdown) ·
+  [As a Netty channel](#the-connection-as-a-netty-channel) ·
   [Your own Netty resources](#running-on-your-own-netty-resources)
 - [Command line](#command-line) · [Building](#building-and-testing) ·
   [Not implemented](#what-is-not-implemented)
@@ -81,6 +82,7 @@ target.
 | Keepalive origination | ✅ | ❌ | ✅ |
 | Peer idle timeout | ✅ | ✅ | ✅ |
 | Per-connection event hooks | ✅ | ❌ | ❌ |
+| Connection as a Netty channel | ✅ | ❌ | n/a |
 | Pushable metrics sink | ✅ | ❌ | ❌ |
 | Buffer/stream mode | ❌ | ❌ | ✅ |
 | File transfer congestion control | ❌ | ❌ | ✅ |
@@ -429,6 +431,61 @@ traffic interception. Note it is per *port*, not per connection: every connectio
 on a listener is multiplexed onto one datagram channel, which is what makes
 many-sockets-on-one-port work, so a handler you add sees all of them.
 
+## The connection as a Netty channel
+
+Most applications should use the callbacks above. If you want your own handlers
+on the data path — an MPEG-TS demultiplexer, an RTP packetiser, traffic shaping,
+logging — every connection is also a Netty channel:
+
+```java
+connection.pipeline().addLast(new MpegTsDecoder(), new RtpPacketizer());
+
+Channel channel = connection.channel();
+```
+
+`onData` is implemented as a terminal handler on that same pipeline, installed
+when you first call it, so there is one delivery path rather than two. Ordering
+is ordinary Netty `addLast` ordering: set `onData` and it is the terminal
+consumer; add handlers instead and they are.
+
+**Backpressure.** `channel().isWritable()` goes false once the peer's negotiated
+flow window is full and Netty's write water marks are exceeded. This is the only
+backpressure signal Roast offers — `write()` and `writeAndFlush()` otherwise
+accept whatever you give them — so an application that can outrun its link
+should consult it:
+
+```java
+if (connection.channel().isWritable()) {
+    connection.channel().writeAndFlush(chunk);
+}
+```
+
+`writeAndFlush` also returns a `ChannelFuture`, so a write refused for being
+oversized, or dropped because the connection closed, fails observably instead of
+vanishing.
+
+**Bridging to another transport.** Because it is a real channel, the standard
+Netty proxy idiom works — throttle the SRT side when the downstream backs up:
+
+```java
+srtConnection.channel().config().setAutoRead(downstream.isWritable());
+```
+
+With `autoRead` off, delivered payloads queue on the channel rather than being
+fired at your handlers. Note that queue is local to this process: it does not
+yet narrow the receive window advertised to the peer, so backpressure stops here
+rather than reaching the sender.
+
+`SrtConnection` deliberately *has* a channel rather than *being* one. Netty's
+`write(Object)` means "queue, don't flush"; `SrtConnection.write(ByteBuf)` means
+"send this". One class cannot carry both meanings of the same word without
+misleading somebody, and keeping them apart leaves the callback API exactly as
+simple as it was.
+
+A handler added after the connection is live joins an already-active channel and
+will not see `channelActive`; use `handlerAdded` with `isActive()`, as you would
+attaching to any live channel.
+
 ## Running on your own Netty resources
 
 By default Roast creates and owns an event loop group and uses
@@ -514,7 +571,10 @@ reasoning in full.
   does not space them further, so a bursty writer bursts onto the wire. This is
   exact parity with gosrt, whose `pktSndPeriod` is computed for statistics and
   never delays a send; libsrt does enforce an interval. Fine for a self-pacing
-  source such as a live encoder — worth revisiting if you feed Roast from a file.
+  source such as a live encoder. If you feed Roast from a file, either consult
+  `channel().isWritable()` or put a `ChannelTrafficShapingHandler` on the
+  connection's pipeline — being a Netty channel makes rate limiting somebody
+  else's already-solved problem.
 
 ## Design notes
 

@@ -3,6 +3,8 @@ package org.brewstream.roast.socket;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.AddressedEnvelope;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.DefaultAddressedEnvelope;
 import io.netty.util.concurrent.ScheduledFuture;
 import org.brewstream.roast.packet.ControlPacket;
@@ -137,6 +139,9 @@ public final class SrtConnection {
      */
     private static final long KEEPALIVE_INTERVAL_MICROS = 1_000_000;
 
+    /** Pipeline name of the handler backing {@link #onData}; see {@link #installDataHandler}. */
+    private static final String DATA_HANDLER_NAME = "srt-on-data";
+
     /**
      * Fallback receive window, in packets, used only when the handshake didn't
      * yield a usable one — matches {@code CallerHandshake}'s own advertised
@@ -177,6 +182,7 @@ public final class SrtConnection {
     private final long peerIdleTimeoutMicros;
 
     private final EventDispatcher events;
+    private final SrtChannel srtChannel;
 
     private long packetsSent;
     private long packetsRetransmitted;
@@ -275,6 +281,77 @@ public final class SrtConnection {
         demultiplexer.register(metadata.socketId(), this::onPacket);
         this.scheduledTick = channel.eventLoop().scheduleAtFixedRate(
                 this::tick, TICK_INTERVAL_MILLIS, TICK_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+
+        // Registered on the same loop every packet for this connection already
+        // arrives on, so the pipeline never hops threads. Delivery runs through
+        // it even when nobody has added a handler: onData is implemented as its
+        // tail, so there is one delivery path rather than two.
+        this.srtChannel = new SrtChannel(channel, this);
+        channel.eventLoop().register(srtChannel);
+        srtChannel.markActive();
+    }
+
+    /**
+     * This connection as a Netty {@link io.netty.channel.Channel} — see {@link
+     * SrtChannel}. For applications that want their own handlers on the data
+     * path, or need to coordinate backpressure with another channel; the
+     * callback API is the simpler route and stays fully supported.
+     */
+    public SrtChannel channel() {
+        return srtChannel;
+    }
+
+    /** This connection's own pipeline; shorthand for {@code channel().pipeline()}. */
+    public io.netty.channel.ChannelPipeline pipeline() {
+        return srtChannel.pipeline();
+    }
+
+    /**
+     * Installs the terminal handler backing {@link #onData}, once, at the tail of
+     * the pipeline as it stands. Deliberately installed here rather than at
+     * construction: a handler added at construction would sit <em>before</em>
+     * anything the application adds later, and since this one consumes the
+     * payload, their handlers would never see a byte. Installing on first use
+     * gives ordinary Netty {@code addLast} ordering — set {@code onData} and it
+     * is the terminal consumer; add handlers instead and they are.
+     */
+    private void installDataHandler() {
+        if (srtChannel.pipeline().get(DATA_HANDLER_NAME) != null) {
+            return;
+        }
+        srtChannel.pipeline().addLast(DATA_HANDLER_NAME, new ChannelInboundHandlerAdapter() {
+            @Override
+            public void channelRead(ChannelHandlerContext ctx, Object message) {
+                if (message instanceof ByteBuf payload) {
+                    onData.accept(payload);
+                    return;
+                }
+                ctx.fireChannelRead(message);
+            }
+
+            @Override
+            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+                LOG.log(Level.WARNING, "a pipeline handler threw on " + metadata.socketId(), cause);
+            }
+        });
+    }
+
+    /**
+     * Whether the peer's negotiated flow window has room for another packet.
+     * Drives {@link SrtChannel}'s backpressure: outstanding data beyond this is
+     * more than the peer has said it will accept.
+     */
+    boolean hasSendWindowRoom() {
+        return sendBuffer.queuedCount() + sendBuffer.inFlightCount() < metadata.flowWindowSize();
+    }
+
+    /** Queues an already-validated payload. Event loop only; called from {@link SrtChannel#doWrite}. */
+    void enqueueForSend(ByteBuf payload) {
+        if (tornDown) {
+            payload.release();
+            return;
+        }
+        sendBuffer.push(payload, elapsedMicros());
     }
 
     /** Peer address, StreamID, and the values negotiated during the handshake. */
@@ -319,6 +396,7 @@ public final class SrtConnection {
     /** Fires once per delivered packet, in sequence order, post-TSBPD. The handler owns releasing the {@link ByteBuf}. */
     public void onData(Consumer<ByteBuf> handler) {
         this.onData = handler;
+        installDataHandler();
     }
 
     /** Fires once per newly-detected gap (mirrors the immediate NAK this also sends). */
@@ -368,13 +446,11 @@ public final class SrtConnection {
                     + maxPayloadSize + "-byte limit; live mode sends one packet per write and does not "
                     + "split messages, so the caller must chunk");
         }
-        channel.eventLoop().execute(() -> {
-            if (tornDown) {
-                payload.release();
-                return;
-            }
-            sendBuffer.push(payload, elapsedMicros());
-        });
+        // Routed through the channel rather than straight to the send buffer, so
+        // there is one outbound path: a payload written this way is subject to
+        // the same flow-window backpressure, and passes through any handlers the
+        // application installed.
+        srtChannel.writeAndFlush(payload);
     }
 
     /**
@@ -430,12 +506,13 @@ public final class SrtConnection {
         // stream. See ReceiveBuffer.drainAll.
         for (DataPacket remaining : receiveBuffer.drainAll()) {
             try {
-                onData.accept(remaining.body());
+                srtChannel.deliverInbound(remaining.body());
             } catch (RuntimeException e) {
-                LOG.log(Level.WARNING, "onData threw while draining on close", e);
+                LOG.log(Level.WARNING, "delivery threw while draining on close", e);
                 remaining.body().release();
             }
         }
+        srtChannel.closeFromConnection();
         receiveBuffer.dispose();
         sendBuffer.flush();
         if (encryptionContext != null) {
@@ -735,10 +812,12 @@ public final class SrtConnection {
 
         DeliveryResult result = receiveBuffer.deliver(ackBoundary.lastAckSequenceNumber(), now);
         for (DataPacket delivered : result.delivered()) {
-            onData.accept(delivered.body());
+            srtChannel.deliverInbound(delivered.body());
         }
 
         sendBuffer.tick(elapsedMicros());
+        // Retries anything the flow window made doWrite stop short on.
+        srtChannel.onTick();
 
         // Keeps us visible to a peer applying the same idle rule we do. This is a
         // backstop, not something that fires in normal operation: AckSender emits
