@@ -1204,7 +1204,7 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   caller-side handshake first, since Roast only needed to be the *listener*
   here, with libsrt calling in and reading.
 
-## Phase 6 (multiplexing & polish) — underway
+## Phase 6 (multiplexing & polish) — complete
 
 this phase is about making Roast usable by someone who isn't us: many
 sockets on one port, graceful close, Javadoc, README, an
@@ -1266,39 +1266,90 @@ was Phase 3-5 work and is done.
 
 ## Next steps, in order
 
-1. **Finish Phase 5 (encryption) — only the wiring is left.** Every piece of
-   the cryptography now exists, and *none of it is connected to anything*:
-   `KeyMaterialCif` (the KM wire format), `StreamKeyWrapper` (KEK derivation +
-   SEK wrapping), `PayloadCipher` (AES-CTR) — all three verified against gosrt
-   golden vectors — and `EncryptionContext`, the per-connection state that
-   composes them. See "What's built". The remaining step is
-   deliberately the one that was saved for last, because it's the only one
-   that changes live behavior:
-   - **Phase 5 is complete.** Key material codec, KEK derivation and key
-     wrapping, AES-CTR, the per-connection `EncryptionContext`, handshake
-     integration, connection wiring, mid-stream key rotation, and the
-     Encryption Field are all done, and encryption is proven against a real
-     implementation in **both** directions (libsrt decrypts ours;
-     `FfmpegInteropTest` shows we decrypt a real sender's).
-   - ~~Rotation against a real peer~~ **Closed** —
-     `LibsrtInteropTest.realLibsrtFollowsAKeyRotationWeInitiate` watches real
-     libsrt keep decrypting across several mid-stream key changes, made
-     possible by `SrtConfig`'s rotation schedule. **Phases 0-5 are now
-     complete.** The test counts the rotations it performed: without that it
-     would pass whether or not anything rotated, since libsrt decrypts happily
-     with the original key.
-2. Phase 6 (multiplexing & polish) — the alternative major milestone,
-   independent of Phase 5 and not blocked by it. Many connections per port,
-   live pollable stats, and the `srt-java-live-transmit` CLI that `RelayDemo`
-   is a rough prototype of.
-3. *(Optional, low-priority)* Try `ffmpeg --enable-libsrt`'s own `srt://` muxer
-   against `SrtListener`, for full belt-and-suspenders confidence beyond
-   `srt-live-transmit` — not expected to surface anything new, since ffmpeg
-   wraps the same libsrt handshake code already exercised.
-4. ~~Report real rate figures in Full ACKs~~ and ~~thread the negotiated flow
-   window through `AcceptedConnection`~~ — **both done**; see
-   `ReceiveRateEstimator` in "What's built" and the flow-window entry in
-   "Known gaps". Nothing in the ACK CIF is a hardcoded placeholder any more.
+Phases 0-6 are complete. What follows is the tail of v1: four small
+divergences from the references, and one deliberately deferred piece of test
+infrastructure.
+
+1. **Send-side statistics.** `ConnectionStats` reports RTT, loss, retransmits,
+   buffer occupancy and the negotiated flow window, but not gosrt's
+   `estimatedInputBW` / `estimatedSentBW` / `pktLossRate`. This is the item to
+   do first, because per-connection observability is the stated reason this
+   library exists rather than a libsrt binding (see the design's extensibility
+   goals, recorded under "Architecture decisions in force"), and the bandwidth
+   estimates are the visible hole in it.
+2. **MSS negotiation.** `ListenerHandshake.validateConclusion` *rejects* a peer
+   whose declared MSS exceeds ours, where libsrt negotiates down to the
+   minimum of the two. Practically inert at the 1500 default - no real peer
+   exceeds it - but it is not what the protocol asks for.
+3. **Peer idle timeout as an `SrtConfig` knob.** Landed as a constant (see
+   "Known gaps"); both references expose it, and a satellite or mobile link is
+   a real reason to want it longer than five seconds. Needs `SrtConnection` to
+   see the config, which it does not today.
+4. **Encryption Field validation.** Carried in the handshake but never checked
+   against what we can do. Cosmetic: the KM CIF carries the authoritative key
+   length and *is* validated, including the downgrade check. Closing the doc
+   entry may matter more than changing the code.
+
+**Not a gap, on inspection.** Two long-standing entries turned out to describe
+problems that do not exist, both verified 2026-08-31:
+
+- *Unknown handshake extensions.* `ExtensionType.fromCode` returns null for an
+  unrecognised code and `HandshakeCif.decode`'s loop falls through to
+  `skipBytes`, so libsrt's CONGESTION/FILTER/GROUP extensions are skipped
+  cleanly rather than rejected. The old "Congestion Control extension
+  parsing/mismatch rejection is skipped entirely" note reads like a hole and
+  is not one.
+- *Message chunking.* `write` sends one DATA packet per call and rejects
+  anything larger. That is live mode's actual contract, not a shortfall -
+  MPEG-TS's 1316-byte unit sits well under the limit. Real reassembly is
+  Phase 7's message mode, an explicit v1 non-goal.
+
+### The interop matrix: deliberately parked
+
+The design's definition of done is a matrix of five peers x both roles x
+{0%, 2%} loss x {120ms, 500ms} latency x {plain, AES-128} - 72 cells, 64 of
+them automatable. It is **achievable**, and it is **parked on purpose**.
+Recording why, so this is not rediscovered as an oversight:
+
+Everything needed is already here. ffmpeg (with `latency`, `passphrase` and
+`pbkeylen` on `srt://` URLs), `srt-live-transmit`, Go with gosrt's
+`contrib/client` and `contrib/server`, and prism at
+`/Users/vinicius/projects/go/prism`, which builds. The harness has every
+primitive: `@Tag("interop")` keeps these off the default task, `Assumptions`
+gates on tool presence, peers launch via `ProcessBuilder`, and `UdpLossProxy`
+already exists. Adding the dimensions is parameterisation, not new machinery.
+
+What argues against building it now:
+
+- **The value is concentrated in about two cells.** Encrypted-under-real-loss
+  is the one that carries genuinely new information, because retransmits are
+  encrypted on the retransmit path - the exact bug class the
+  `retainedDuplicate()` aliasing defect came from, which today has only a unit
+  regression test and has never been proven against a real peer. A 500ms
+  latency run is the other, being a deeper TSBPD buffer than anything yet
+  exercised. The remaining ~18 cells of a sensible reduced matrix are
+  regression insurance: they protect future changes, not present correctness.
+- **The handshake is still moving.** Item 2 above changes the very MSS
+  behaviour a matrix would assert, so cells built now get re-tuned as it lands.
+- **Flakiness risk.** Dozens of externally-timed cells spawning real processes
+  under induced loss is a flakiness factory, and a matrix that is red one run
+  in ten teaches people to ignore it. `UdpLossProxy` drops on an unseeded
+  `ThreadLocalRandom`; it needs a seed before any of this becomes standing
+  coverage.
+
+Two rows are not achievable as written regardless: **OBS** is a GUI
+application and not installed, so it is a one-time manual smoke test rather
+than a cell; and `srt-live-transmit`'s **soak** is a nightly job by nature.
+**prism** is achievable but low value - it binds libsrt through cgo
+(`zsiec/srtgo`), so it re-tests libsrt behind a Go API and proves nothing
+about protocol independence that the libsrt rows do not. A separate
+constraint found this session: `srt-live-transmit` never transmits from a
+redirected file (its own `pktSent` stays empty), so that row's sender half is
+blocked by the tool, not by Roast. ffmpeg is the tool that actually sends.
+
+**When this is picked up**, build the two high-information cells first
+(encrypted under 2% loss, both directions), seed the loss proxy, and only then
+decide whether the remaining insurance is worth its maintenance.
 
 ## How to pick this back up
 
