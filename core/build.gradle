@@ -1,9 +1,13 @@
 description = 'Pure-Java SRT (Secure Reliable Transport) protocol implementation'
 
 dependencies {
-    implementation platform('io.netty:netty-bom:4.2.17.Final')
+    // api, not implementation: Netty types are part of Roast's public API, not an
+    // internal detail. ByteBuf appears in SrtConnection.onData/write, and
+    // ChannelPipeline in SrtListener.pipeline(), so a consumer that only got these
+    // transitively at runtime could not compile against the library at all.
+    api platform('io.netty:netty-bom:4.2.17.Final')
+    api 'io.netty:netty-buffer'
+    api 'io.netty:netty-transport'
     implementation 'io.netty:netty-common'
-    implementation 'io.netty:netty-buffer'
-    implementation 'io.netty:netty-transport'
     implementation 'io.netty:netty-codec'
 }
