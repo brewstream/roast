@@ -51,11 +51,11 @@ import java.util.function.Consumer;
  * reference tests exist for this piece, unlike several other pieces of this
  * codebase (RTT/drift/wraparound) where none did.
  *
- * <p>Deliberately deferred, not part of this class: full bandwidth-rate-window
- * statistics ({@code estimatedInputBW}/{@code estimatedSentBW}/{@code
- * pktLossRate} — gosrt's {@code Stats()}). See STATUS.md's known gaps. The
- * 16th/17th-packet bandwidth-probe trick <em>is</em> ported — see {@link
- * #push}'s javadoc.
+ * <p>Bandwidth-rate-window statistics (gosrt's {@code estimatedInputBW}/{@code
+ * estimatedSentBW}/{@code pktLossRate}) are not computed here either: they live
+ * in {@link SendRateEstimator}, which this class feeds from {@link #push} and
+ * from each delivery. The 16th/17th-packet bandwidth-probe trick <em>is</em>
+ * ported — see {@link #push}'s javadoc.
  *
  * <p><b>ByteBuf ownership</b>: {@code deliver} always receives a {@link
  * #duplicate}, never the entry actually held in {@code packetList}/{@code

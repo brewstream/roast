@@ -19,8 +19,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * No gosrt test file maps to this split the way send_test.go did for
  * SendBuffer - dial.go's own tests (dial_test.go) are integration-style
  * against a hand-rolled fake listener, not narrow unit tests of an isolated
- * piece. Self-designed against dial.go's source, same rigor tier as
- * ListenerHandshake's own tests - see STATUS.md's testing methodology.
+ * piece. Self-designed against dial.go's source rather than ported, the same
+ * rigor tier as ListenerHandshake's own tests.
  */
 class CallerHandshakeTest {
 

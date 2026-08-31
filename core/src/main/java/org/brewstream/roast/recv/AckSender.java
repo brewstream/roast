@@ -24,7 +24,7 @@ import java.util.Optional;
  * ever advance as far as {@code LossList}'s own bookkeeping, which stayed
  * frozen at the *oldest* unresolved gap until something else explicitly
  * cleared it — confirmed via real interop testing to starve a real peer's
- * send buffer under sustained loss (see STATUS.md). This class no longer
+ * send buffer under sustained loss. This class no longer
  * depends on {@link LossList} at all — it's purely the timing/variant
  * decision and CIF construction.
  *

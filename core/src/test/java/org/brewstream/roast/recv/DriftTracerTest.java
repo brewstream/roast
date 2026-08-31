@@ -10,8 +10,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * No reference test exists to ground these against: gosrt has no working
  * drift implementation at all (a dead field, never assigned), and libsrt's
  * {@code DriftTracer} (utilities.h), the only real reference, has no
- * dedicated unit tests either. Self-designed directly against libsrt's
- * source - see STATUS.md's testing methodology section.
+ * dedicated unit tests either. Self-designed directly against libsrt's source,
+ * which is a weaker footing than a ported reference scenario and worth knowing
+ * when changing it.
  */
 class DriftTracerTest {
 

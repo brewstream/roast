@@ -257,7 +257,9 @@ class SrtConnectionTest {
      * by collapsing its window to 0 and dropping ~42% of a published live
      * stream before it ever hit the wire (confirmed via its own pktSndDrop/
      * pktFlowWindow counters). Every receive-side loss counter stayed clean
-     * throughout, because the packets were never sent at all. See STATUS.md.
+     * throughout, because the packets were never sent at all - which is why
+     * this went undiagnosed through a long chain of internal-consistency
+     * checks.
      */
     @Test
     void fullAckAdvertisesRealReceiveWindowNotZero() throws Exception {

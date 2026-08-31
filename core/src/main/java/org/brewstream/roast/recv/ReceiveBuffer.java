@@ -40,8 +40,8 @@ import java.util.OptionalLong;
  * {@code TestRecvDropTooLate}, which asserts them as genuinely distinct
  * fields, and {@code TestIssue67}, a real historical gosrt bug fix for
  * <em>this exact failure mode</em> (a real interop session against libsrt hit
- * the same category of bug independently before this was ported — see
- * STATUS.md). {@link #computeAckBoundary} walks {@link #buffered} from {@link
+ * the same category of bug independently, before this was ported).
+ * {@link #computeAckBoundary} walks {@link #buffered} from {@link
  * #lastAcked} forward: a packet whose own deadline has already passed
  * advances the boundary past it <em>even across a gap</em> — the actual
  * TLPKTDROP "give up" decision happens here, not in {@link #deliver} — while
@@ -67,7 +67,9 @@ import java.util.OptionalLong;
  * from {@link #addDriftSample}, fed by the connection on every ACKACK — see
  * that method's javadoc for the exact formula, ported from libsrt's {@code
  * CTsbpdTime::addDriftSample}. No dedicated test exists in either reference
- * for this piece (STATUS.md's testing methodology section has the detail).
+ * for this piece — checked directly, and gosrt's own drift support is dead
+ * code — so the tests here are self-designed against libsrt's source rather
+ * than ported from a reference scenario.
  *
  * <p><b>32-bit wire-timestamp wraparound</b> (draft-sharabayko-srt.md §4.5.1.1's
  * "TSBPD Time Base Calculation"): SRT's microsecond timestamps wrap every ~71
@@ -84,8 +86,8 @@ import java.util.OptionalLong;
  * gosrt's separate-field approach — a natural fit since delivery time here is
  * already a live, recomputed-at-{@link #deliver}-time function of stored
  * state (see "Drift correction" above), not frozen at insertion. Neither
- * reference has a dedicated test for this piece either (checked directly);
- * self-designed against both sources — see STATUS.md's testing methodology.
+ * reference has a dedicated test for this piece either (checked directly), so
+ * its tests are self-designed against both sources rather than ported.
  *
  * <p>Not thread-safe, same as {@link LossList}/{@link AckSender}.
  */

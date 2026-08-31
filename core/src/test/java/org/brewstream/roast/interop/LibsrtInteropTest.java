@@ -241,8 +241,9 @@ class LibsrtInteropTest {
      *
      * <p>The reverse direction (libsrt encrypts, we decrypt) is not covered
      * here: {@code srt-live-transmit} reading a redirected file connects but
-     * never transmits, which its own empty {@code pktSent} stats confirm. Doing
-     * that needs {@code ffmpeg}'s muxer instead - see STATUS.md.
+     * never transmits, which its own empty {@code pktSent} stats confirm. That
+     * direction needs {@code ffmpeg}'s muxer instead, and is covered by
+     * {@code FfmpegInteropTest.weDecryptWhatARealFfmpegSenderEncrypts}.
      */
     @Test
     void realLibsrtCallerDecryptsWhatWeEncrypt() throws Exception {

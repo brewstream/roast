@@ -767,8 +767,8 @@ public final class SrtConnection {
      * them with DROPREQ instead. Against real ffmpeg/libsrt that silently cost
      * ~35% of the published stream — the packets were never put on the wire at
      * all, which is why every receive-side loss counter stayed clean while the
-     * relayed output was visibly corrupt. See STATUS.md for the full
-     * investigation.
+     * relayed output was visibly corrupt: the cheap check that found it was
+     * whether arriving sequence numbers were contiguous.
      */
     private void tick() {
         long now = elapsedMicros();

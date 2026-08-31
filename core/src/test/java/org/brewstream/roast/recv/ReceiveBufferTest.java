@@ -140,8 +140,7 @@ class ReceiveBufferTest {
      * exactly this failure mode (an ACK boundary that stays frozen behind a
      * gap even once a later, non-contiguous packet's own deadline has
      * passed). This is the identical category of bug a real interop session
-     * against libsrt hit independently before this test existed here - see
-     * STATUS.md.
+     * against libsrt hit independently, before this test existed here.
      */
     @Test
     void matchesGosrtTestIssue67() {
@@ -240,8 +239,8 @@ class ReceiveBufferTest {
     }
 
     // --- 32-bit wire-timestamp wraparound (no reference test exists in gosrt
-    // or libsrt to port - self-designed against both sources' source code;
-    // see STATUS.md's testing methodology). All timestamps below are unsigned
+    // or libsrt to port - self-designed against both sources' source code).
+    // All timestamps below are unsigned
     // 32-bit microsecond values; ts(long) reinterprets one as the signed int
     // DataPacket.timestamp() actually stores on the wire.
 

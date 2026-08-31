@@ -555,8 +555,8 @@ those binaries are missing. See `references/` (gitignored) for building libsrt.
 
 ## What is not implemented
 
-Each of these is a decision rather than an omission; `STATUS.md` records the
-reasoning in full.
+Each of these is a decision rather than an omission, and the reasoning is with
+each one below.
 
 - **HSv4.** Only HSv5 is spoken. gosrt supports v4; Roast declines it, because it
   is a second handshake path rather than a fallback branch, and every modern peer
@@ -576,15 +576,20 @@ reasoning in full.
   connection's pipeline — being a Netty channel makes rate limiting somebody
   else's already-solved problem.
 
-## Engineering log
+## Reference implementations
 
-`STATUS.md` records what is built, what is deliberately deferred and why, how
-each piece is verified, and the bugs found along the way with what they cost. The flow-window story in particular is the best argument in this
-repository for testing against a real peer rather than against yourself. Worth
-reading before changing the connection layer.
+Roast is developed against two: [gosrt](https://github.com/datarhei/gosrt) (Go,
+MIT) for structure and golden vectors, and
+[libsrt](https://github.com/Haivision/srt) (C++, MPL-2.0) as the
+interoperability target. Where they disagree, or where Roast follows neither,
+the javadoc on the class in question says which one it follows and why —
+`SrtConnection`'s keepalive handling and `ReceiveBuffer`'s ACK boundary are the
+two worth reading first.
 
-Where the two reference implementations disagree, or where Roast deviates from
-both, `STATUS.md` records why.
+Test grounding is stated per piece, because the difference matters when you
+change something: some tests are ported from a reference's own suite, others are
+self-designed against reference *source* where neither implementation has a test
+to port. The javadoc says which.
 
 ## Licence
 

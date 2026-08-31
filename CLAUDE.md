@@ -1,7 +1,9 @@
 # Roast
 
-Pure-Java SRT (Secure Reliable Transport) protocol library. `STATUS.md` records
-what is built, what is known to be missing, and how the testing is grounded.
+Pure-Java SRT (Secure Reliable Transport) protocol library. `README.md` covers
+the public API and what is deliberately not implemented. `STATUS.md` is a local,
+untracked engineering log — present in a working copy but deliberately not in
+the repository, so do not cite it from code or documentation that is.
 `references/draft-sharabayko-srt.md` is the protocol spec; cite it by section
 when a decision follows from the wire format.
 

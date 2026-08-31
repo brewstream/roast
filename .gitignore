@@ -14,3 +14,8 @@ out/
 # a directory up, outside this repository, so this matches nothing today - it is
 # here to keep a stray copy from being committed later.
 DESIGN.md
+
+# Engineering log kept locally rather than in the repo: useful while working,
+# but it is a narrative of decisions already recorded in javadoc and commit
+# messages, and it went stale five times while it was tracked.
+STATUS.md

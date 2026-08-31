@@ -72,12 +72,11 @@ class ArqUnderLossTest {
             payload.release();
         }));
 
-        // The caller reaches the listener only through the relay - but loss is
-        // switched on only after the handshake. SrtCaller is single-shot with no
-        // handshake retry (matching gosrt's dial.go), so a dropped INDUCTION or
-        // CONCLUSION fails the connect outright. That is a real and separate
-        // limitation - noted in STATUS.md - and letting it decide this test would
-        // just make it flaky without telling us anything about ARQ.
+        // The caller reaches the listener only through the relay, but loss is
+        // switched on after the handshake completes. The caller does retry a
+        // lost INDUCTION or CONCLUSION, so connecting through loss would work -
+        // it is just a different thing to measure, and letting handshake retry
+        // decide this test would tell us nothing about ARQ.
         proxy = UdpLossProxy.start(
                 new InetSocketAddress("127.0.0.1", listener.localAddress().getPort()), 0.0);
         callerSide = SrtCaller.connect(
