@@ -1050,7 +1050,15 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
 
 - ~~Caller-side handshake~~ **Closed** — `SrtCaller`/`CallerHandshake`,
   including **encryption** (the caller generates the keys and announces them;
-  see "What's built"). No HSv4 fallback, matching gosrt.
+  see "What's built"). **No HSv4 support** — and the claim previously made
+  here, that this matched gosrt, was simply wrong: gosrt does implement HSv4
+  (`connection.go` branches on `version == 4` throughout, with dedicated
+  `handleHSRequest`/`handleHSResponse` for HSv4's post-connection extension
+  exchange). This is the one and only feature on gosrt's own published list
+  that Roast does not have. The design deprioritises it explicitly — "support
+  v4 peers only if trivial; v5 is the target" — and it is not trivial, being a
+  second handshake path rather than a fallback branch. Modern libsrt, ffmpeg
+  and OBS all negotiate HSv5.
 - ~~`SrtCaller` does not retry its handshake~~ **Closed, 2026-08-30** — it now
   repeats whichever step is unanswered every 250ms (libsrt's own rule),
   bounded by the 5s connect timeout. One of the few places Roast deliberately
