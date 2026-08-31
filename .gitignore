@@ -9,3 +9,8 @@ out/
 # as the structural reference, libsrt (MPL-2.0) as the interop target.
 # Not ours to push upstream - keep out of this repo's history.
 /references/
+
+# Planning notes kept locally rather than in the repo. DESIGN.md currently lives
+# a directory up, outside this repository, so this matches nothing today - it is
+# here to keep a stray copy from being committed later.
+DESIGN.md

@@ -576,11 +576,10 @@ reasoning in full.
   connection's pipeline — being a Netty channel makes rate limiting somebody
   else's already-solved problem.
 
-## Design notes
+## Engineering log
 
-`STATUS.md` is a running engineering log: what is built, what is deliberately
-deferred, how each piece is verified, and the bugs found along the way with what
-they cost. The flow-window story in particular is the best argument in this
+`STATUS.md` records what is built, what is deliberately deferred and why, how
+each piece is verified, and the bugs found along the way with what they cost. The flow-window story in particular is the best argument in this
 repository for testing against a real peer rather than against yourself. Worth
 reading before changing the connection layer.
 
