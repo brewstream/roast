@@ -33,25 +33,37 @@ public final class CallerHandshake {
 
     /** The magic value SRT uses in an induction reply's Extension Field to advertise SRT support (vs. plain UDT). */
     private static final int SRT_MAGIC_CODE = 0x4A17;
-    private static final int MAX_MSS_SIZE = 1500;
+    private static final int DEFAULT_MAX_MSS_SIZE = 1500;
     private static final int DEFAULT_FLOW_WINDOW_SIZE = 8192;
 
     private final int flowWindowSize;
+    private final int maxMssSize;
 
     public CallerHandshake() {
-        this(DEFAULT_FLOW_WINDOW_SIZE);
+        this(DEFAULT_FLOW_WINDOW_SIZE, DEFAULT_MAX_MSS_SIZE);
     }
 
     /** @param flowWindowSize the receive window advertised in the induction request (see {@code SrtConfig}) */
     public CallerHandshake(int flowWindowSize) {
+        this(flowWindowSize, DEFAULT_MAX_MSS_SIZE);
+    }
+
+    /**
+     * @param flowWindowSize the receive window advertised in the induction request (see {@code SrtConfig})
+     * @param maxMssSize     this caller's own MTU, declared in both handshake phases. The listener
+     *                       negotiates the smaller of this and its own and reports the result in its
+     *                       conclusion reply, which is the value the connection then uses.
+     */
+    public CallerHandshake(int flowWindowSize, int maxMssSize) {
         this.flowWindowSize = flowWindowSize;
+        this.maxMssSize = maxMssSize;
     }
 
     /** The fixed induction request: version 4, zero ISN/cookie, no extensions — matches gosrt's {@code sendInduction} exactly. */
     public HandshakeCif buildInductionRequest(SrtSocketId ownSocketId, InetAddress ownAddress) {
         return new HandshakeCif(
                 true, 4, 0, 2,
-                CircularNumber.of(0, SrtPacket.MAX_SEQUENCE_NUMBER), MAX_MSS_SIZE, flowWindowSize,
+                CircularNumber.of(0, SrtPacket.MAX_SEQUENCE_NUMBER), maxMssSize, flowWindowSize,
                 HandshakeType.INDUCTION.code(),
                 ownSocketId, 0, ownAddress, null, null);
     }
@@ -63,7 +75,10 @@ public final class CallerHandshake {
 
     /**
      * Builds the conclusion request from a validated induction reply: echoes the
-     * cookie and MTU/flow-window unchanged, carries our own initial sequence number
+     * cookie and flow window unchanged, declares our <em>own</em> MTU rather than
+     * echoing the listener's (it has to be ours for the listener to have anything
+     * to negotiate against — it replies with the smaller of the two), carries our
+     * own initial sequence number
      * (see the class javadoc), and attaches the HSREQ + (if non-empty) SID
      * extensions. {@code extensionField} uses the same bit convention
      * {@link ListenerHandshake#buildAcceptResponse} already does.
@@ -98,7 +113,7 @@ public final class CallerHandshake {
 
         return new HandshakeCif(
                 true, 5, encryptionField, extensionField,
-                ownInitialSequenceNumber, inductionReply.maxTransmissionUnitSize(), inductionReply.maxFlowWindowSize(),
+                ownInitialSequenceNumber, maxMssSize, inductionReply.maxFlowWindowSize(),
                 HandshakeType.CONCLUSION.code(),
                 ownSocketId, inductionReply.synCookie(), ownAddress, extension, streamId, keyMaterial);
     }

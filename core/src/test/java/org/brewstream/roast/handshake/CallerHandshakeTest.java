@@ -58,7 +58,7 @@ class CallerHandshakeTest {
     }
 
     @Test
-    void conclusionRequestCarriesOwnIsnAndEchoesInductionReplyFields() {
+    void conclusionRequestCarriesOwnIsnAndMtuAndEchoesTheRest() {
         HandshakeCif inductionReply = inductionReply(5, 0x4A17, seq(1), 1400, 4096, 0xABCD);
 
         HandshakeCif request = handshake.buildConclusionRequest(
@@ -68,7 +68,9 @@ class CallerHandshakeTest {
         assertThat(request.version()).isEqualTo(5);
         assertThat(request.handshakeType()).isEqualTo(HandshakeType.CONCLUSION);
         assertThat(request.initialPacketSequenceNumber()).isEqualTo(seq(777)); // ours, not the reply's
-        assertThat(request.maxTransmissionUnitSize()).isEqualTo(1400); // echoed from the induction reply
+        // Ours, not the reply's: the listener negotiates the smaller of the two,
+        // so echoing its value back would leave it nothing to compare against.
+        assertThat(request.maxTransmissionUnitSize()).isEqualTo(1500);
         assertThat(request.maxFlowWindowSize()).isEqualTo(4096); // echoed from the induction reply
         assertThat(request.synCookie()).isEqualTo(0xABCD); // echoed from the induction reply
         assertThat(request.streamId()).isEqualTo("live/test");

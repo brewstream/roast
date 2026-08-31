@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -159,6 +160,34 @@ class MultiplexingTest {
      * unbounded leak, and {@code connections()} reporting long-dead
      * connections to anyone polling stats.
      */
+    /**
+     * A listener configured for a smaller MTU - a tunnel or VPN, the reason the
+     * setting exists - must negotiate an ordinary 1500-byte caller down to it,
+     * and both sides must end up agreeing on the result. This used to reject the
+     * caller outright, which made the knob worse than useless.
+     */
+    @Test
+    void aSmallerListenerMtuIsNegotiatedAndAgreedByBothSides() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0),
+                SrtConfig.defaults().withMaxMss(1200));
+        listener.setAcceptHandler(request -> AcceptDecision.accept());
+        CompletableFuture<SrtConnection> listenerSide = new CompletableFuture<>();
+        listener.onConnection(listenerSide::complete);
+
+        SrtConnection callerSide = SrtCaller.connect(
+                        new InetSocketAddress("127.0.0.1", listener.localAddress().getPort()), "live/small-mtu")
+                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        try {
+            assertThat(callerSide.metadata().maxTransmissionUnitSize()).isEqualTo(1200);
+            assertThat(listenerSide.get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                    .metadata().maxTransmissionUnitSize()).isEqualTo(1200);
+            // The payload ceiling has to move with it, or writes would exceed the path.
+            assertThat(callerSide.metadata().maxPayloadSize()).isEqualTo(1200 - 28 - 16);
+        } finally {
+            callerSide.close();
+        }
+    }
+
     @Test
     void theListenerForgetsConnectionsAsTheyClose() throws Exception {
         listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));

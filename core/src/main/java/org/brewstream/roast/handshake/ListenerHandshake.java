@@ -28,6 +28,14 @@ public final class ListenerHandshake {
     /** The magic value SRT uses in an induction reply's Extension Field to advertise SRT support (vs. plain UDT). */
     private static final int SRT_MAGIC_CODE = 0x4A17;
 
+    /**
+     * The floor an MSS has to clear to carry anything at all: an IPv4 and UDP
+     * header (28 bytes) plus SRT's own 16, plus libsrt's 4 bytes of "required for
+     * passing any data". Its {@code MinimumMSS} in {@code core.cpp}, and the only
+     * MSS libsrt actually rejects for.
+     */
+    private static final int MINIMUM_MSS = 28 + 16 + 4;
+
     private final SynCookie cookie;
     private final InetAddress ownAddress;
     private final int srtVersion;
@@ -42,7 +50,7 @@ public final class ListenerHandshake {
         this(cookie, ownAddress, srtVersion, 1500);
     }
 
-    /** @param maxMssSize the largest MTU this listener will accept from a peer */
+    /** @param maxMssSize this listener's own MTU, the ceiling for what it will negotiate with a peer */
     public ListenerHandshake(SynCookie cookie, InetAddress ownAddress, int srtVersion, int maxMssSize) {
         this.cookie = cookie;
         this.ownAddress = ownAddress;
@@ -70,7 +78,7 @@ public final class ListenerHandshake {
         if (!cookie.verify(request.synCookie(), senderAddress)) {
             return new ConclusionOutcome.Rejected(buildRejectResponse(request, RejectionReason.ROGUE));
         }
-        if (request.maxTransmissionUnitSize() > maxMssSize) {
+        if (negotiatedMss(request) < MINIMUM_MSS) {
             return new ConclusionOutcome.Rejected(buildRejectResponse(request, RejectionReason.ROGUE));
         }
         if (request.version() != 5) {
@@ -150,8 +158,23 @@ public final class ListenerHandshake {
 
         return new HandshakeCif(
                 false, 5, encryptionField, extensionField,
-                request.initialPacketSequenceNumber(), request.maxTransmissionUnitSize(),
+                request.initialPacketSequenceNumber(), negotiatedMss(request),
                 request.maxFlowWindowSize(), HandshakeType.CONCLUSION.code(),
                 assignedSocketId, 0, ownAddress, responseExtension, request.streamId(), keyMaterial);
+    }
+
+    /**
+     * The MTU both sides will actually use: the smaller of the peer's and ours,
+     * which is what libsrt's {@code acceptAndRespond} computes and then writes
+     * back into its own response, so the caller learns the agreed value.
+     *
+     * <p>This used to <em>reject</em> a peer declaring more than ours, which
+     * inverted the meaning of the setting: configuring a 1200-byte MTU for a
+     * tunnel refused every ordinary 1500-byte peer instead of accommodating it,
+     * making the knob worse than useless. libsrt rejects on MTU only when the
+     * negotiated result is too small to carry data at all.
+     */
+    private int negotiatedMss(HandshakeCif request) {
+        return Math.min(maxMssSize, request.maxTransmissionUnitSize());
     }
 }

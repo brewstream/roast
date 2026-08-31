@@ -81,6 +81,62 @@ class ListenerHandshakeTest {
         return new ListenerHandshake(deterministicCookie(), ownAddressUnchecked(), SRT_VERSION);
     }
 
+    private static ListenerHandshake listenerWithMss(int maxMss) {
+        return new ListenerHandshake(deterministicCookie(), ownAddressUnchecked(), SRT_VERSION, maxMss);
+    }
+
+    private static HandshakeCif conclusionRequestWithMss(int mss) throws UnknownHostException {
+        int cookie = deterministicCookie().get(SENDER_ADDRESS);
+        return new HandshakeCif(
+                true, 5, 0, 1, seq(42), mss, 8192, HandshakeType.CONCLUSION.code(),
+                SrtSocketId.of(0xABCDEF), cookie, callerAddress(), validExtension(), "live/test");
+    }
+
+    /**
+     * The case that was outright broken: configuring a smaller MTU - the whole
+     * point of the setting, for a tunnel or VPN - used to reject every ordinary
+     * 1500-byte peer instead of negotiating down to it.
+     */
+    @Test
+    void aPeerDeclaringALargerMtuIsNegotiatedDownNotRejected() throws UnknownHostException {
+        HandshakeCif request = conclusionRequestWithMss(1500);
+        ListenerHandshake listener = listenerWithMss(1200);
+
+        assertThat(listener.validateConclusion(request, SENDER_ADDRESS))
+                .isInstanceOf(ConclusionOutcome.Valid.class);
+
+        HandshakeCif response = listener.buildAcceptResponse(
+                request, SrtSocketId.of(1), 120, 120);
+
+        assertThat(response.maxTransmissionUnitSize())
+                .as("the response must carry the agreed value, so the caller learns it")
+                .isEqualTo(1200);
+    }
+
+    /** When the peer is the smaller of the two, its value is the one that wins. */
+    @Test
+    void aPeerDeclaringASmallerMtuSetsTheNegotiatedValue() throws UnknownHostException {
+        HandshakeCif request = conclusionRequestWithMss(900);
+
+        HandshakeCif response = listenerWithMss(1500).buildAcceptResponse(
+                request, SrtSocketId.of(1), 120, 120);
+
+        assertThat(response.maxTransmissionUnitSize()).isEqualTo(900);
+    }
+
+    /**
+     * libsrt rejects on MTU only when the negotiated result cannot carry data at
+     * all - headers plus four bytes. Anything above that is a legitimate,
+     * if unusual, connection.
+     */
+    @Test
+    void anMtuTooSmallToCarryDataIsRejected() throws UnknownHostException {
+        HandshakeCif request = conclusionRequestWithMss(40);
+
+        assertThat(listener().validateConclusion(request, SENDER_ADDRESS))
+                .isInstanceOf(ConclusionOutcome.Rejected.class);
+    }
+
     private static InetAddress ownAddressUnchecked() {
         try {
             return ownAddress();
@@ -148,13 +204,21 @@ class ListenerHandshakeTest {
         assertThat(response.rejectionReason()).isEqualTo(RejectionReason.ROGUE);
     }
 
+    /**
+     * Replaces a test that asserted the opposite. A peer declaring more than we
+     * accept is negotiated down, not refused - only an MTU too small to carry
+     * data is a rejection, which is libsrt's rule. The old expectation was the
+     * bug, so the test had to go with it rather than be adjusted around.
+     */
     @Test
-    void validateConclusionRejectsAnOversizedMtu() throws UnknownHostException {
+    void validateConclusionAcceptsAnOversizedMtuAndNegotiatesItDown() throws UnknownHostException {
         HandshakeCif request = withMtu(validConclusionRequest(), 2000);
 
         ConclusionOutcome outcome = listener().validateConclusion(request, SENDER_ADDRESS);
 
-        assertRejectedWith(outcome, RejectionReason.ROGUE);
+        assertThat(outcome).isInstanceOf(ConclusionOutcome.Valid.class);
+        assertThat(listener().buildAcceptResponse(request, SrtSocketId.of(1), 120, 120)
+                .maxTransmissionUnitSize()).isEqualTo(1500);
     }
 
     @Test

@@ -103,7 +103,7 @@ public final class SrtCaller {
         this.streamId = streamId;
         this.encryptionContext = encryptionContext;
         this.config = config;
-        this.callerHandshake = new CallerHandshake(config.flowWindowPackets());
+        this.callerHandshake = new CallerHandshake(config.flowWindowPackets(), config.maxMss());
         this.result = result;
     }
 

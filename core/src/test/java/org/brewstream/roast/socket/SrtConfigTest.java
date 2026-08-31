@@ -116,19 +116,28 @@ class SrtConfigTest {
         assertThat(elapsedMillis).isLessThan(3_000);
     }
 
-    /** A peer whose MTU exceeds our configured ceiling must be rejected. */
+    /**
+     * A configured MTU is a ceiling to negotiate down to, not a filter to reject
+     * on. This test previously asserted the opposite - that an ordinary
+     * 1500-byte caller was refused - which made the setting useless for the case
+     * it exists to serve: lowering the MTU for a tunnel would have refused every
+     * normal peer rather than accommodating one.
+     */
     @Test
-    void configuredMaxMssBoundsWhatWeAccept() throws Exception {
+    void configuredMaxMssIsNegotiatedDownToRatherThanRejectedOn() throws Exception {
         listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0),
                 SrtConfig.defaults().withMaxMss(1000));
         listener.setAcceptHandler(request -> AcceptDecision.accept());
 
         // The caller advertises the standard 1500, above the listener's ceiling.
-        Throwable thrown = catchThrowable(() -> SrtCaller.connect(
+        SrtConnection connection = SrtCaller.connect(
                         new InetSocketAddress("127.0.0.1", listener.localAddress().getPort()), "live/mss")
-                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS));
-
-        assertThat(thrown).isInstanceOf(ExecutionException.class);
+                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        try {
+            assertThat(connection.metadata().maxTransmissionUnitSize()).isEqualTo(1000);
+        } finally {
+            connection.close();
+        }
     }
 
     // --- validation: a bad value should fail where it is written, not mid-handshake
