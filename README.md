@@ -597,4 +597,12 @@ to port. The javadoc says which.
 
 ## Licence
 
-See the workspace root.
+[Apache License 2.0](LICENSE). Every source file carries the header;
+`scripts/license-header.sh` adds it to anything missing one, and
+`--check` fails if something is.
+
+Roast is an independent implementation written against the IETF draft. It is not
+a port of libsrt and contains none of its code. It does owe real structural debt
+to [gosrt](https://github.com/datarhei/gosrt) (MIT), several of whose algorithms
+and test vectors it ports — see [NOTICE](NOTICE) for the specifics, and the
+javadoc on individual classes for what each one took.

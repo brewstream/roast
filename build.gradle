@@ -48,6 +48,15 @@ subprojects {
         }
     }
 
+    // Wired into `check` rather than left as a script someone remembers to run:
+    // a convention that is only written down is one that rots.
+    tasks.register('licenseCheck', Exec) {
+        description = 'Fails if any Java source is missing the Apache 2.0 header.'
+        group = 'verification'
+        commandLine "${rootDir}/scripts/license-header.sh", '--check'
+    }
+    tasks.named('check') { dependsOn 'licenseCheck' }
+
     tasks.register('interopTest', Test) {
         description = 'Runs interop tests against real SRT peers (e.g. srt-live-transmit). ' +
                 'Requires a locally built peer binary - see roast/references/srt. Skips itself ' +

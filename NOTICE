@@ -1,0 +1,39 @@
+Roast
+Copyright 2026 the original author or authors.
+
+This product includes software developed at BrewStream.
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+--------------------------------------------------------------------------------
+Third-party attribution
+--------------------------------------------------------------------------------
+
+Roast is an independent implementation of the SRT protocol, written against the
+IETF draft "The SRT Protocol" (draft-sharabayko-srt) as the normative source. Two
+existing implementations were used as references during development, and are
+acknowledged here.
+
+gosrt — https://github.com/datarhei/gosrt
+    MIT License, Copyright (c) 2020-2022 FOSS GmbH
+
+    Used as the primary structural reference. Several algorithms in Roast are
+    ports of gosrt's own: the two-boundary ACK/delivery model in ReceiveBuffer,
+    the send- and receive-side rate estimators, the RTT smoothing in
+    SrtConnection, and the 16th/17th-packet bandwidth probe. Some tests are
+    ported from gosrt's test suite, including its TestIssue67 regression case,
+    and some are verified against golden vectors taken from it. The Java is
+    written fresh rather than transliterated, but the debt is real and the MIT
+    licence's attribution requirement is met here. Individual classes name what
+    they took in their own javadoc.
+
+libsrt — https://github.com/Haivision/srt
+    Mozilla Public License 2.0, Copyright (c) 2018 Haivision Systems Inc.
+
+    Used as the interoperability target and as the authority on behaviour where
+    the draft is ambiguous — the keepalive and peer-idle-timeout model, MTU
+    negotiation, the encryption key-material exchange, and the drift-correction
+    formula were all settled by reading it. No libsrt code is copied into Roast,
+    and none of Roast is a derivative work of it under the MPL: the source was
+    read to learn observable protocol behaviour, which was then implemented
+    independently in Java.
