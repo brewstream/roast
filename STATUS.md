@@ -1270,30 +1270,43 @@ Phases 0-6 are complete. What follows is the tail of v1: four small
 divergences from the references, and one deliberately deferred piece of test
 infrastructure.
 
-1. **Send-side statistics.** `ConnectionStats` reports RTT, loss, retransmits,
-   buffer occupancy and the negotiated flow window, but not gosrt's
-   `estimatedInputBW` / `estimatedSentBW` / `pktLossRate`. This is the item to
-   do first, because per-connection observability is the stated reason this
-   library exists rather than a libsrt binding (see the design's extensibility
-   goals, recorded under "Architecture decisions in force"), and the bandwidth
-   estimates are the visible hole in it.
-2. **MSS negotiation.** `ListenerHandshake.validateConclusion` *rejects* a peer
-   whose declared MSS exceeds ours, where libsrt negotiates down to the
-   minimum of the two. Practically inert at the 1500 default - no real peer
-   exceeds it - but it is not what the protocol asks for.
-3. **Peer idle timeout as an `SrtConfig` knob.** Landed as a constant (see
-   "Known gaps"); both references expose it, and a satellite or mobile link is
-   a real reason to want it longer than five seconds. Needs `SrtConnection` to
-   see the config, which it does not today.
-4. ~~**Encryption Field validation.**~~ **Closed, 2026-08-31** — it was already
-   implemented and the entry was stale: `SrtListener` checks the declared field
-   against the key material's own KLen and rejects a disagreement as ROGUE
-   (malformed, not unauthenticated), treating zero as "no method advertised".
-   Reading that code did turn up a real defect beside it, now fixed:
-   `ConnectionRequest.encryptionRequested` was derived from the Encryption
-   Field alone, and gosrt sends zero there *even when encrypting* — so an
-   accept handler routing on that flag saw an encrypting peer as plaintext. It
-   now keys off the key material, with the field as a secondary signal.
+All four are **done as of 2026-08-31**; kept here with their outcomes, since
+what a change turned out to be is usually more useful than what it was
+planned to be.
+
+1. ~~**Send-side statistics.**~~ **Done.** `SendRateEstimator` ports the rate
+   block from gosrt's `congestion/live/send.go` — input bandwidth, sent
+   bandwidth, and a byte-based loss rate — mirroring `ReceiveRateEstimator` on
+   the other side. The two bandwidth figures are separate on purpose: input
+   above sent means the send buffer is filling and TLPKTDROP is about to
+   discard, which is worth seeing *before* it shows up in a drop counter.
+   Named `sendLossRatePercent` rather than gosrt's `pktLossRate`, which is
+   computed from bytes despite the name, and distinct from the existing
+   lifetime `retransmitRate()`.
+2. ~~**MSS negotiation.**~~ **Done, and it was worse than a divergence.**
+   Rejecting a peer above our MTU inverted the meaning of
+   `SrtConfig.withMaxMss`: lowering it for a tunnel refused every ordinary
+   1500-byte peer, so the only settings that worked were the ones that changed
+   nothing. Now `min(ours, theirs)`, written into the reply so the caller
+   learns it, rejecting only below libsrt's `MinimumMSS`. `CallerHandshake`
+   had to stop echoing the listener's MTU back, or there was nothing to
+   negotiate against.
+3. ~~**Peer idle timeout as an `SrtConfig` knob.**~~ **Done.** Only the timeout
+   is threaded into `SrtConnection`, not the whole config: everything else it
+   needs was negotiated with the peer and arrives via `AcceptedConnection`.
+   Paid for itself immediately — the reap test now configures 400ms instead of
+   waiting out the 5s default.
+4. ~~**Encryption Field validation.**~~ **Done — it was already implemented**
+   and the entry was stale. `SrtListener` checks the declared field against the
+   key material's KLen and rejects a disagreement as ROGUE. Reading that code
+   found a real defect beside it: `ConnectionRequest.encryptionRequested` was
+   derived from the field alone, and gosrt sends zero there *even when
+   encrypting*, so an accept handler routing on it saw an encrypting peer as
+   plaintext. Now keyed off the key material.
+
+**What is left for v1:** the interop matrix below, and nothing else on this
+list. Phase 7's stretch items (rendezvous, HSv4, bidirectional, message mode)
+remain explicit non-goals.
 
 **Not a gap, on inspection.** Two long-standing entries turned out to describe
 problems that do not exist, both verified 2026-08-31:
