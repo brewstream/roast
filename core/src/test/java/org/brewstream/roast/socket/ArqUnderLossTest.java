@@ -27,6 +27,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -66,6 +67,21 @@ class ArqUnderLossTest {
      * nothing else covers.
      */
     private static final Duration LATENCY = Duration.ofMillis(500);
+    /**
+     * Packets sent after the payloads, purely so that a payload lost at the very
+     * end is still followed by something.
+     *
+     * <p>Loss of the final packets is not recoverable by ARQ alone: the receiver
+     * detects loss by seeing a <em>later</em> sequence number arrive, so if the
+     * last packets vanish there is no gap to notice, no NAK, and no
+     * retransmission. Nothing is late and nothing is dropped - the receiver
+     * simply never learns more was coming. libsrt covers this with a sender-side
+     * retransmission timer (FASTREXMIT, {@code checkRexmitTimer}); gosrt has no
+     * equivalent and neither does Roast, so this test must not assert a
+     * guarantee the protocol here does not make. Twenty-five trailers at 5% loss
+     * makes "every trailer also lost" vanishingly unlikely.
+     */
+    private static final int TRAILERS = 25;
 
     private SrtListener listener;
     private SrtConnection callerSide;
@@ -91,16 +107,22 @@ class ArqUnderLossTest {
         listener.setAcceptHandler(request -> AcceptDecision.accept());
 
         List<String> delivered = new ArrayList<>();
-        CompletableFuture<Void> allArrived = new CompletableFuture<>();
-        listener.onConnection(connection -> connection.onData(payload -> {
-            synchronized (delivered) {
-                delivered.add(payload.toString(StandardCharsets.US_ASCII));
-                if (delivered.size() == MESSAGES) {
-                    allArrived.complete(null);
+        CountDownLatch allArrived = new CountDownLatch(MESSAGES);
+        CompletableFuture<SrtConnection> listenerSide = new CompletableFuture<>();
+        listener.onConnection(connection -> {
+            listenerSide.complete(connection);
+            connection.onData(payload -> {
+                String message = payload.toString(StandardCharsets.US_ASCII);
+                payload.release();
+                if (!message.startsWith("msg-")) {
+                    return; // a trailer; see TRAILERS
                 }
-            }
-            payload.release();
-        }));
+                synchronized (delivered) {
+                    delivered.add(message);
+                }
+                allArrived.countDown();
+            });
+        });
 
         // The caller reaches the listener only through the relay, but loss is
         // switched on after the handshake completes. The caller does retry a
@@ -122,8 +144,29 @@ class ArqUnderLossTest {
             callerSide.write(Unpooled.wrappedBuffer(("msg-" + i).getBytes(StandardCharsets.US_ASCII)));
             Thread.sleep(2);
         }
+        // See TRAILERS: these exist only to give a lost final payload a
+        // later sequence number to be noticed against. They are not asserted on.
+        for (int i = 0; i < TRAILERS; i++) {
+            callerSide.write(Unpooled.wrappedBuffer(("tail-" + i).getBytes(StandardCharsets.US_ASCII)));
+            Thread.sleep(2);
+        }
 
-        allArrived.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        // Not a bare future.get: a timeout there reports only that time ran out,
+        // which is the least useful thing it could say. Waiting on the latch and
+        // then asserting lets the failure carry how far delivery actually got,
+        // and what the proxy did, which is the difference between "slow" and
+        // "permanently lost".
+        boolean complete = allArrived.await(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        int arrived;
+        synchronized (delivered) {
+            arrived = delivered.size();
+        }
+        assertThat(complete)
+                .as("only %d of %d payloads arrived in %ds (proxy relayed %d, dropped %d); "
+                                + "sender stats %s; receiver stats %s",
+                        arrived, MESSAGES, TIMEOUT_SECONDS, proxy.relayedPackets(), proxy.droppedPackets(),
+                        callerSide.stats(), listenerSide.get().stats())
+                .isTrue();
 
         List<String> expected = new ArrayList<>();
         for (int i = 0; i < MESSAGES; i++) {

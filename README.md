@@ -77,6 +77,7 @@ target.
 | NAK and periodic NAK | ✅ | ✅ | ✅ |
 | Live congestion control (LiveCC) | ✅ | ✅ | ✅ |
 | Rate pacing (enforced send interval) | ❌ | ❌ | ✅ |
+| Tail-loss retransmit (FASTREXMIT) | ❌ | ❌ | ✅ |
 | Encryption (AES-128/192/256) | ✅ | ✅ | ✅ |
 | Mid-stream key rotation | ✅ | ✅ | ✅ |
 | Message mode | ✅ | ✅ | ✅ |
@@ -575,6 +576,14 @@ each one below.
 - **Message chunking.** One `write` is one packet, matching gosrt, whose live
   sender also emits only single-packet messages. Multi-packet reassembly would be
   message mode proper.
+- **Tail-loss retransmission.** ARQ notices loss by seeing a *later* sequence
+  number arrive, so if the final packets of a stream are lost there is no gap to
+  detect, no NAK, and no retransmission — the receiver never learns more was
+  coming. libsrt covers this with a sender-side retransmission timer
+  (`FASTREXMIT`, resending unacknowledged data when ACKs stop progressing);
+  gosrt has no equivalent and neither does Roast. Harmless mid-stream, where the
+  next packet exposes the gap immediately; it means the last packets of a stream
+  can be silently truncated.
 - **Rate pacing.** `SendBuffer` releases each packet at its scheduled time and
   does not space them further, so a bursty writer bursts onto the wire. This is
   exact parity with gosrt, whose `pktSndPeriod` is computed for statistics and
