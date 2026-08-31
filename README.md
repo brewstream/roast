@@ -39,8 +39,13 @@ Java 21 or newer. Netty is the only runtime dependency, and it is exposed as
 `api` rather than `implementation` — `ByteBuf` and `ChannelPipeline` are part of
 Roast's surface, so you get them on your compile classpath.
 
-**Not yet published to any repository**, and the build has no publishing plugin
-configured — so for now the way to consume it is a Gradle composite build:
+```groovy
+implementation 'io.github.brewstream:roast:0.1.0'
+```
+
+**Not yet on Maven Central** — publishing is configured and tag-triggered
+(`v0.1.0` cuts `0.1.0`), but no release has been cut. Until one is, consume it
+as a Gradle composite build:
 
 ```groovy
 // settings.gradle
@@ -48,12 +53,11 @@ includeBuild '../roast'
 
 // build.gradle
 dependencies {
-    implementation 'org.brewstream:core'
+    implementation 'io.github.brewstream:roast'
 }
 ```
 
-Gradle substitutes the dependency for the local project. Coordinates will change
-when this is published properly.
+Gradle substitutes the dependency for the local project.
 
 ## Feature matrix
 

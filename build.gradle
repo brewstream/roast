@@ -1,3 +1,7 @@
+plugins {
+    id 'com.vanniktech.maven.publish' version '0.30.0' apply false
+}
+
 subprojects {
     apply plugin: 'java-library'
     // For the srt-java-live-transmit CLI: produces a real launcher via
@@ -6,8 +10,15 @@ subprojects {
     // relayed through it.
     apply plugin: 'application'
 
-    group = 'org.brewstream'
-    version = '0.1.0-SNAPSHOT'
+    // io.github.brewstream, not org.brewstream: Maven Central verifies that you
+    // control the namespace, and the org.* form would mean proving ownership of
+    // brewstream.org by DNS record. The io.github.* form only needs the GitHub
+    // org to exist, which is the route inference4j took. The Java packages stay
+    // org.brewstream.roast - Central checks the group ID, never package names -
+    // so if the domain is verified later, moving the group ID is a one-line
+    // change and the packages already match.
+    group = findProperty('publishGroup') ?: 'io.github.brewstream'
+    version = findProperty('version') != 'unspecified' ? findProperty('version') : '0.1.0-SNAPSHOT'
 
     java {
         toolchain {

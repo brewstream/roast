@@ -1,3 +1,5 @@
+apply plugin: 'com.vanniktech.maven.publish'
+
 description = 'Pure-Java SRT (Secure Reliable Transport) protocol implementation'
 
 dependencies {
@@ -10,4 +12,51 @@ dependencies {
     api 'io.netty:netty-transport'
     implementation 'io.netty:netty-common'
     implementation 'io.netty:netty-codec'
+}
+
+// Published as io.github.brewstream:roast, not :core. The Gradle module is named
+// core because it is this build's only module; that is an internal detail, and
+// "core" alone would be a poor coordinate to hand a stranger.
+base {
+    archivesName = 'roast'
+}
+
+mavenPublishing {
+    publishToMavenCentral(com.vanniktech.maven.publish.SonatypeHost.CENTRAL_PORTAL)
+    // Signed only when keys are actually present, so an ordinary local build and
+    // publishToMavenLocal keep working without a GPG setup.
+    if (project.findProperty('signing.gnupg.keyName') || project.findProperty('signingInMemoryKey')) {
+        signAllPublications()
+    }
+
+    coordinates(project.group.toString(), 'roast', project.version.toString())
+
+    pom {
+        name = 'Roast'
+        description = project.description
+        url = 'https://github.com/brewstream/roast'
+        inceptionYear = '2026'
+
+        licenses {
+            license {
+                name = 'The Apache License, Version 2.0'
+                url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+                distribution = 'repo'
+            }
+        }
+
+        developers {
+            developer {
+                id = 'viniciusccarvalho'
+                name = 'Vinicius Carvalho'
+                url = 'https://github.com/viniciusccarvalho'
+            }
+        }
+
+        scm {
+            connection = 'scm:git:git://github.com/brewstream/roast.git'
+            developerConnection = 'scm:git:ssh://github.com:brewstream/roast.git'
+            url = 'https://github.com/brewstream/roast'
+        }
+    }
 }
