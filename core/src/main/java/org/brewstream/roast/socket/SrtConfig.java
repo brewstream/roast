@@ -26,9 +26,11 @@ import java.time.Duration;
  * them would quietly break interoperability or security rather than tune
  * anything. Every public knob is permanent API and a new way to be
  * misconfigured; libsrt has some forty socket options and most people get them
- * wrong. Six is a deliberate ceiling, not an oversight — if something here
- * genuinely needs tuning later, adding it then is easy, whereas removing a knob
- * never is.
+ * wrong. The count is kept deliberately low rather than treated as free — if
+ * something here genuinely needs tuning, adding it then is easy, whereas
+ * removing a knob never is. {@code peerIdleTimeout} was added on exactly that
+ * basis: it started as an internal constant, and a link with long outages is a
+ * real reason to want it longer than five seconds.
  *
  * @param latency               TSBPD delivery delay, the central SRT trade-off: longer gives
  *                              retransmission more room to recover loss, at the cost of
@@ -40,8 +42,13 @@ import java.time.Duration;
  * @param keyPreAnnouncePackets how far ahead of a rotation the next key is announced
  * @param srtVersion            the SRT version advertised in the handshake, for compatibility
  *                              testing against a specific peer
- * @param maxMss                largest acceptable MTU, in bytes — lower it for tunnels or VPNs
- *                              whose path MTU is below the usual 1500
+ * @param maxMss                this side's MTU, in bytes — lower it for tunnels or VPNs whose
+ *                              path MTU is below the usual 1500. Negotiated with the peer, which
+ *                              may lower it further; a peer asking for more is brought down to
+ *                              this, not refused
+ * @param peerIdleTimeout       how long a peer may go completely silent before its connection is
+ *                              closed as dead. Any inbound packet resets it, so only a genuinely
+ *                              unreachable peer reaches it — raise it for links with long outages
  */
 public record SrtConfig(
         Duration latency,
@@ -50,7 +57,8 @@ public record SrtConfig(
         long keyRefreshPackets,
         long keyPreAnnouncePackets,
         int srtVersion,
-        int maxMss) {
+        int maxMss,
+        Duration peerIdleTimeout) {
 
     /** gosrt's own baseline, and what this codebase advertised before it was configurable. */
     private static final int DEFAULT_SRT_VERSION = 0x010401;
@@ -71,6 +79,7 @@ public record SrtConfig(
         if (keyPreAnnouncePackets <= 0) {
             throw new IllegalArgumentException("keyPreAnnouncePackets must be positive");
         }
+        requirePositive(peerIdleTimeout, "peerIdleTimeout");
         if (maxMss < 576 || maxMss > 1500) {
             // 576 is IPv4's guaranteed-reassembly minimum; above 1500 a datagram
             // would fragment on any ordinary path.
@@ -78,7 +87,10 @@ public record SrtConfig(
         }
     }
 
-    /** SRT's usual defaults: 120ms latency, 8192-packet window, key rotation every 2^24 packets. */
+    /**
+     * SRT's usual defaults: 120ms latency, 8192-packet window, key rotation every
+     * 2^24 packets, and a 5s peer idle timeout (both references' own default).
+     */
     public static SrtConfig defaults() {
         return new SrtConfig(
                 Duration.ofMillis(120),
@@ -87,22 +99,23 @@ public record SrtConfig(
                 1L << 24,
                 1L << 12,
                 DEFAULT_SRT_VERSION,
-                1500);
+                1500,
+                Duration.ofSeconds(5));
     }
 
     public SrtConfig withLatency(Duration latency) {
         return new SrtConfig(latency, connectTimeout, flowWindowPackets, keyRefreshPackets,
-                keyPreAnnouncePackets, srtVersion, maxMss);
+                keyPreAnnouncePackets, srtVersion, maxMss, peerIdleTimeout);
     }
 
     public SrtConfig withConnectTimeout(Duration connectTimeout) {
         return new SrtConfig(latency, connectTimeout, flowWindowPackets, keyRefreshPackets,
-                keyPreAnnouncePackets, srtVersion, maxMss);
+                keyPreAnnouncePackets, srtVersion, maxMss, peerIdleTimeout);
     }
 
     public SrtConfig withFlowWindowPackets(int flowWindowPackets) {
         return new SrtConfig(latency, connectTimeout, flowWindowPackets, keyRefreshPackets,
-                keyPreAnnouncePackets, srtVersion, maxMss);
+                keyPreAnnouncePackets, srtVersion, maxMss, peerIdleTimeout);
     }
 
     /**
@@ -111,17 +124,23 @@ public record SrtConfig(
      */
     public SrtConfig withKeyRotation(long refreshPackets, long preAnnouncePackets) {
         return new SrtConfig(latency, connectTimeout, flowWindowPackets, refreshPackets,
-                preAnnouncePackets, srtVersion, maxMss);
+                preAnnouncePackets, srtVersion, maxMss, peerIdleTimeout);
     }
 
     public SrtConfig withSrtVersion(int srtVersion) {
         return new SrtConfig(latency, connectTimeout, flowWindowPackets, keyRefreshPackets,
-                keyPreAnnouncePackets, srtVersion, maxMss);
+                keyPreAnnouncePackets, srtVersion, maxMss, peerIdleTimeout);
     }
 
     public SrtConfig withMaxMss(int maxMss) {
         return new SrtConfig(latency, connectTimeout, flowWindowPackets, keyRefreshPackets,
-                keyPreAnnouncePackets, srtVersion, maxMss);
+                keyPreAnnouncePackets, srtVersion, maxMss, peerIdleTimeout);
+    }
+
+    /** How long a peer may stay silent before we close the connection as dead. */
+    public SrtConfig withPeerIdleTimeout(Duration peerIdleTimeout) {
+        return new SrtConfig(latency, connectTimeout, flowWindowPackets, keyRefreshPackets,
+                keyPreAnnouncePackets, srtVersion, maxMss, peerIdleTimeout);
     }
 
     /** Latency as the milliseconds the handshake actually carries. */

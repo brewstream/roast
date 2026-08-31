@@ -274,7 +274,7 @@ public final class SrtCaller {
                         channel.close();
                         eventLoopGroup.shutdownGracefully();
                     },
-                    encryptionContext);
+                    encryptionContext, config.peerIdleTimeout().toNanos() / 1_000);
 
             if (!result.complete(connection)) {
                 // A racing timeout already failed this connect - don't leak the connection we just built.

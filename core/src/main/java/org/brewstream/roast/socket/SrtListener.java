@@ -302,7 +302,7 @@ public final class SrtListener {
                     connections.remove(assignedSocketId);
                     acceptedByPeerSocketId.remove(peerSocketId);
                 },
-                encryptionContext);
+                encryptionContext, config.peerIdleTimeout().toNanos() / 1_000);
         eventListeners.forEach(connection::addEventListener);
         connections.put(assignedSocketId, connection);
         connectionHandler.accept(connection);

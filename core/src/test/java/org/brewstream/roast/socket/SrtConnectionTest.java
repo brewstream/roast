@@ -31,11 +31,13 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -55,8 +57,6 @@ class SrtConnectionTest {
     /** What a caller advertises unless a test needs a distinguishable value. */
     private static final int DEFAULT_FLOW_WINDOW = 8192;
     private static final SrtSocketId CALLER_SOCKET_ID = SrtSocketId.of(0x9000);
-    /** Mirrors SrtConnection's own PEER_IDLE_TIMEOUT_MICROS. */
-    private static final int PEER_IDLE_TIMEOUT_SECONDS = 5;
 
     private SrtListener listener;
     private DatagramSocket caller;
@@ -188,17 +188,39 @@ class SrtConnectionTest {
      */
     @Test
     void aPeerThatGoesSilentIsReapedRatherThanLeaked() throws Exception {
-        SrtConnection connection = connectAndAccept();
+        // A short timeout rather than the 5s default: this asserts the reaping,
+        // not the default's value, and holding the whole suite for five seconds
+        // to re-measure a constant is a poor trade. aConfiguredPeerIdleTimeout...
+        // below covers the setting being honoured at all.
+        SrtConnection connection = connectAndAccept(
+                DEFAULT_FLOW_WINDOW, SrtConfig.defaults().withPeerIdleTimeout(Duration.ofMillis(400)));
         CompletableFuture<Void> closed = new CompletableFuture<>();
         connection.onClose(() -> closed.complete(null));
         assertThat(listener.connections()).hasSize(1);
 
         // The fake caller simply stops reading and sending from here on.
-        closed.get(PEER_IDLE_TIMEOUT_SECONDS + 5, TimeUnit.SECONDS);
+        closed.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 
         assertThat(listener.connections())
                 .as("the reaped connection must not linger in the listener's map")
                 .isEmpty();
+    }
+
+    /**
+     * The configured value has to be the one actually used, not merely accepted:
+     * a long timeout must keep a silent peer alive well past the 5s default.
+     */
+    @Test
+    void aConfiguredPeerIdleTimeoutIsHonouredRatherThanTheDefault() throws Exception {
+        SrtConnection connection = connectAndAccept(
+                DEFAULT_FLOW_WINDOW, SrtConfig.defaults().withPeerIdleTimeout(Duration.ofMinutes(1)));
+        CompletableFuture<Void> closed = new CompletableFuture<>();
+        connection.onClose(() -> closed.complete(null));
+
+        // Silent well past the default, which would have reaped it by now.
+        assertThatThrownBy(() -> closed.get(6, TimeUnit.SECONDS))
+                .isInstanceOf(TimeoutException.class);
+        assertThat(listener.connections()).hasSize(1);
     }
 
     @Test
@@ -817,7 +839,11 @@ class SrtConnectionTest {
     }
 
     private SrtConnection connectAndAccept(int flowWindowSize) throws Exception {
-        listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0));
+        return connectAndAccept(flowWindowSize, SrtConfig.defaults());
+    }
+
+    private SrtConnection connectAndAccept(int flowWindowSize, SrtConfig config) throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0), config);
         listener.setAcceptHandler(request -> AcceptDecision.accept());
         CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
         listener.onConnection(connected::complete);

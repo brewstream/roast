@@ -120,15 +120,15 @@ public final class SrtConnection {
     private static final double INITIAL_RTT_VAR_MICROS = 50_000;
 
     /**
-     * How long a peer may stay silent before we treat it as gone. Five seconds is
-     * both references' default (gosrt's {@code PeerIdleTimeout}, libsrt's
-     * {@code SRTO_PEERIDLETIMEO}), and <em>any</em> packet resets it — data, ACK,
-     * KEEPALIVE alike — so only a genuinely dead peer reaches it. Deliberately not
-     * an {@code SrtConfig} knob for now: both references make it tunable, but
-     * {@code SrtConnection} has no view of the config today, and the plumbing is a
-     * bigger change than the fix.
+     * Default for how long a peer may stay silent before we treat it as gone.
+     * Five seconds is both references' own default (gosrt's {@code
+     * PeerIdleTimeout}, libsrt's {@code SRTO_PEERIDLETIMEO}). <em>Any</em> packet
+     * resets the clock — data, ACK, KEEPALIVE alike — so only a genuinely
+     * unreachable peer reaches it. Overridable via {@link
+     * SrtConfig#withPeerIdleTimeout}, since a link with long outages is a real
+     * reason to want longer.
      */
-    private static final long PEER_IDLE_TIMEOUT_MICROS = 5_000_000;
+    private static final long DEFAULT_PEER_IDLE_TIMEOUT_MICROS = 5_000_000;
 
     /**
      * Send a KEEPALIVE when nothing else has gone out for this long — libsrt's
@@ -174,6 +174,7 @@ public final class SrtConnection {
     private final Map<Integer, Long> pendingAcks = new HashMap<>();
     private final Runnable onChannelOwnerClose;
     private final EncryptionContext encryptionContext;
+    private final long peerIdleTimeoutMicros;
 
     private final EventDispatcher events;
 
@@ -188,7 +189,7 @@ public final class SrtConnection {
     private long lastPeriodicNakMicros;
     /**
      * When we last heard anything at all from the peer, and when we last sent
-     * anything to it — the two clocks behind {@link #PEER_IDLE_TIMEOUT_MICROS} and
+     * anything to it — the two clocks behind {@link #peerIdleTimeoutMicros} and
      * {@link #KEEPALIVE_INTERVAL_MICROS}. Both are written and read on the event
      * loop only, like {@link #lastPeriodicNakMicros}, so neither needs to be
      * volatile. Starting at zero (the connection epoch) is correct: a peer that
@@ -214,7 +215,8 @@ public final class SrtConnection {
 
     public SrtConnection(Channel channel, SrtSocketIdDemultiplexer demultiplexer, AcceptedConnection metadata,
             CircularNumber initialSequenceNumber) {
-        this(channel, demultiplexer, metadata, initialSequenceNumber, () -> { }, null);
+        this(channel, demultiplexer, metadata, initialSequenceNumber, () -> { }, null,
+                DEFAULT_PEER_IDLE_TIMEOUT_MICROS);
     }
 
     /**
@@ -228,7 +230,8 @@ public final class SrtConnection {
      */
     SrtConnection(Channel channel, SrtSocketIdDemultiplexer demultiplexer, AcceptedConnection metadata,
             CircularNumber initialSequenceNumber, Runnable onChannelOwnerClose) {
-        this(channel, demultiplexer, metadata, initialSequenceNumber, onChannelOwnerClose, null);
+        this(channel, demultiplexer, metadata, initialSequenceNumber, onChannelOwnerClose, null,
+                DEFAULT_PEER_IDLE_TIMEOUT_MICROS);
     }
 
     /**
@@ -239,6 +242,21 @@ public final class SrtConnection {
     SrtConnection(Channel channel, SrtSocketIdDemultiplexer demultiplexer, AcceptedConnection metadata,
             CircularNumber initialSequenceNumber, Runnable onChannelOwnerClose,
             EncryptionContext encryptionContext) {
+        this(channel, demultiplexer, metadata, initialSequenceNumber, onChannelOwnerClose, encryptionContext,
+                DEFAULT_PEER_IDLE_TIMEOUT_MICROS);
+    }
+
+    /**
+     * As above, with the peer idle timeout from {@code SrtConfig} rather than the
+     * default. Only the timeout is threaded through rather than the whole config
+     * object: everything else a connection needs was already negotiated with the
+     * peer and reaches it via {@link AcceptedConnection}, and passing settings
+     * that no longer apply would invite reading the wrong one.
+     */
+    SrtConnection(Channel channel, SrtSocketIdDemultiplexer demultiplexer, AcceptedConnection metadata,
+            CircularNumber initialSequenceNumber, Runnable onChannelOwnerClose,
+            EncryptionContext encryptionContext, long peerIdleTimeoutMicros) {
+        this.peerIdleTimeoutMicros = peerIdleTimeoutMicros;
         this.encryptionContext = encryptionContext;
         this.events = new EventDispatcher(metadata.socketId().toString());
         this.channel = channel;
@@ -683,9 +701,9 @@ public final class SrtConnection {
         // disposing the receive buffer, so the rest of the tick would be operating
         // on a connection that no longer exists. libsrt checks its own expiry in
         // the same place, and bails the same way.
-        if (now - lastReceiveMicros >= PEER_IDLE_TIMEOUT_MICROS) {
+        if (now - lastReceiveMicros >= peerIdleTimeoutMicros) {
             LOG.log(Level.FINE, () -> "closing " + metadata.socketId() + ": nothing received from "
-                    + metadata.peerAddress() + " for " + (PEER_IDLE_TIMEOUT_MICROS / 1_000_000) + "s");
+                    + metadata.peerAddress() + " for " + (peerIdleTimeoutMicros / 1_000) + "ms");
             close();
             return;
         }
