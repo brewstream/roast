@@ -292,7 +292,10 @@ public final class SrtConnection {
                 receiveRateEstimator.receivingRateBytesPerSecond(),
                 receiveRateEstimator.estimatedLinkCapacityPacketsPerSecond(),
                 receiveBuffer.bufferedCount(), sendBuffer.queuedCount(), sendBuffer.inFlightCount(),
-                receiveFlowWindowPackets);
+                receiveFlowWindowPackets,
+                sendBuffer.rates().estimatedInputBytesPerSecond(),
+                sendBuffer.rates().estimatedSentBytesPerSecond(),
+                sendBuffer.rates().sendLossRatePercent());
     }
 
     /** Fires once per delivered packet, in sequence order, post-TSBPD. The handler owns releasing the {@link ByteBuf}. */

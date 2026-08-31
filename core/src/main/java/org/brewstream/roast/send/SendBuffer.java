@@ -78,6 +78,7 @@ public final class SendBuffer {
     private final long dropThresholdMicros;
     private final Deque<Entry> packetList = new ArrayDeque<>();
     private final Deque<Entry> lossList = new ArrayDeque<>();
+    private final SendRateEstimator rateEstimator = new SendRateEstimator();
     private final Consumer<DataPacket> deliver;
 
     private CircularNumber nextSequenceNumber;
@@ -122,6 +123,8 @@ public final class SendBuffer {
      * pieces.
      */
     public void push(ByteBuf payload, long scheduledSendMicros) {
+        rateEstimator.onPushed(payload.readableBytes());
+
         CircularNumber seq = nextSequenceNumber;
         nextSequenceNumber = nextSequenceNumber.inc();
 
@@ -155,9 +158,12 @@ public final class SendBuffer {
      * have called {@code retainedDuplicate()} on an already-released buffer.)
      */
     public void tick(long nowMicros) {
+        rateEstimator.tick(nowMicros);
+
         while (!packetList.isEmpty() && packetList.peekFirst().scheduledSendMicros() <= nowMicros) {
             Entry entry = packetList.pollFirst();
             avgPayloadSize = avgPayloadSize * 0.875 + entry.packet().payload().readableBytes() * 0.125;
+            rateEstimator.onSent(entry.packet().payload().readableBytes(), false);
             deliver.accept(duplicate(entry.packet(), false));
             lossList.addLast(entry);
         }
@@ -199,6 +205,7 @@ public final class SendBuffer {
             Entry entry = it.next();
             for (LossRange range : ranges) {
                 if (entry.seq().greaterThanOrEqual(range.start()) && entry.seq().lessThanOrEqual(range.end())) {
+                    rateEstimator.onSent(entry.packet().payload().readableBytes(), true);
                     deliver.accept(duplicate(entry.packet(), true));
                     break;
                 }
@@ -224,6 +231,11 @@ public final class SendBuffer {
     }
 
     /** Packets queued but not yet due to send — surfaced through {@code ConnectionStats}. */
+    /** The send-side rate figures; see {@link SendRateEstimator}. */
+    public SendRateEstimator rates() {
+        return rateEstimator;
+    }
+
     public int queuedCount() {
         return packetList.size();
     }

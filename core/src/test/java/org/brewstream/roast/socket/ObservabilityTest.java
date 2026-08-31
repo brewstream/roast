@@ -1,5 +1,6 @@
 package org.brewstream.roast.socket;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import org.brewstream.roast.harness.UdpLossProxy;
 import org.brewstream.roast.packet.cif.LossRange;
@@ -204,6 +205,43 @@ class ObservabilityTest {
         assertThat(receiverStats.packetsReceived()).isGreaterThanOrEqualTo(messages);
         assertThat(receiverStats.bytesReceived()).isGreaterThanOrEqualTo((long) messages * chunk.length);
         assertThat(receiverStats.droppedEvents()).isZero();
+    }
+
+    /**
+     * The send-side bandwidth figures have to survive the trip from
+     * {@code SendRateEstimator} through {@code SendBuffer} to {@code stats()} —
+     * the estimator's own unit tests can't catch a wiring mistake. Takes over a
+     * second by construction: the rate window is 1s, and nothing is reported
+     * until one has closed.
+     */
+    @Test
+    void sendRatesReachStatsOnceAWindowHasClosed() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
+        listener.setAcceptHandler(request -> AcceptDecision.accept());
+        listener.onConnection(connection -> connection.onData(ByteBuf::release));
+
+        caller = SrtCaller.connect(
+                        new InetSocketAddress("127.0.0.1", listener.localAddress().getPort()), STREAM_ID)
+                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+        assertThat(caller.stats().estimatedSentBytesPerSecond())
+                .as("nothing should be reported before a window has closed")
+                .isZero();
+
+        byte[] chunk = new byte[1000];
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(1400);
+        while (System.nanoTime() < deadline) {
+            caller.write(Unpooled.wrappedBuffer(chunk));
+            Thread.sleep(5);
+        }
+
+        ConnectionStats stats = caller.stats();
+        assertThat(stats.estimatedInputBytesPerSecond())
+                .as("the application offered ~200KB/s").isPositive();
+        assertThat(stats.estimatedSentBytesPerSecond())
+                .as("and it actually went out").isPositive();
+        // No induced loss here, so nothing should have been resent.
+        assertThat(stats.sendLossRatePercent()).isZero();
     }
 
     /** Under real loss, the loss and retransmit signals must actually fire and be counted. */

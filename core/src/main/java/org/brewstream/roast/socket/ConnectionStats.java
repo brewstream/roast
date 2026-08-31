@@ -39,6 +39,14 @@ package org.brewstream.roast.socket;
  * @param sendBufferedPackets          packets queued but not yet due to send
  * @param sendInFlightPackets          packets sent and retained for possible retransmission
  * @param flowWindowPackets            the receive window advertised to the peer
+ * @param estimatedInputBytesPerSecond  bytes per second the application offered over the last
+ *                                      window — compare against {@code estimatedSentBytesPerSecond}
+ *                                      to see the send buffer filling before TLPKTDROP reports it
+ * @param estimatedSentBytesPerSecond   bytes per second actually sent over the last window,
+ *                                      retransmissions included
+ * @param sendLossRatePercent           retransmitted bytes as a percentage of all bytes sent over
+ *                                      the last window — a <em>current</em> figure, unlike
+ *                                      {@link #retransmitRate()}'s lifetime one
  */
 public record ConnectionStats(
         long packetsSent,
@@ -57,12 +65,22 @@ public record ConnectionStats(
         int receiveBufferedPackets,
         int sendBufferedPackets,
         int sendInFlightPackets,
-        int flowWindowPackets) {
+        int flowWindowPackets,
+        int estimatedInputBytesPerSecond,
+        int estimatedSentBytesPerSecond,
+        double sendLossRatePercent) {
 
     /**
      * Retransmissions as a fraction of everything sent — the figure most worth
      * alerting on, since a rising value means the link is degrading well before
      * anything is actually lost. Zero when nothing has been sent yet.
+     */
+    /**
+     * Retransmitted packets as a fraction of all packets sent, over the
+     * connection's whole life. See {@link #sendLossRatePercent()} for the
+     * last-window equivalent — a connection that recovered from a bad patch
+     * shows a low figure in both, while one in trouble right now shows a low
+     * lifetime figure and a high current one.
      */
     public double retransmitRate() {
         return packetsSent == 0 ? 0 : (double) packetsRetransmitted / packetsSent;
