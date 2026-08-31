@@ -314,9 +314,16 @@ public final class SrtListener {
     private static ConnectionRequest toConnectionRequest(HandshakeCif request, InetSocketAddress peerAddress) {
         HandshakeExtension extension = request.handshakeExtension();
         String streamId = request.streamId() == null ? "" : request.streamId();
+        // Key material is the authoritative signal, not the Encryption Field:
+        // gosrt always sends zero there even when it is encrypting, so keying off
+        // the field alone told the accept handler "unencrypted" for a peer that
+        // was doing no such thing. The field is a hint about cipher and key size,
+        // checked against the key material a few lines above; whether encryption
+        // is on at all is decided by whether keys were offered.
+        boolean encryptionRequested = request.keyMaterial() != null || request.encryptionField() != 0;
         return new ConnectionRequest(
                 peerAddress, request.srtSocketId(), streamId, extension.srtVersion(),
-                request.encryptionField() != 0,
+                encryptionRequested,
                 extension.receiveTsbpdDelayMillis(), extension.sendTsbpdDelayMillis());
     }
 

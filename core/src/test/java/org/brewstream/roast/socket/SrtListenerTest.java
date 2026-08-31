@@ -10,6 +10,8 @@ import org.brewstream.roast.packet.cif.HandshakeCif;
 import org.brewstream.roast.packet.cif.HandshakeExtension;
 import org.brewstream.roast.packet.cif.HandshakeExtensionFlags;
 import org.brewstream.roast.packet.cif.HandshakeType;
+import org.brewstream.roast.packet.cif.KeyEncryption;
+import org.brewstream.roast.packet.cif.KeyMaterialCif;
 import org.brewstream.roast.packet.cif.RejectionReason;
 import org.brewstream.roast.util.CircularNumber;
 import org.junit.jupiter.api.AfterEach;
@@ -66,6 +68,31 @@ class SrtListenerTest {
         assertThat(reply.handshakeType()).isEqualTo(HandshakeType.INDUCTION);
         assertThat(reply.srtSocketId()).isEqualTo(callerSocketId);
         assertThat(reply.synCookie()).isNotZero();
+    }
+
+    /**
+     * gosrt sends a zero Encryption Field even when it is encrypting, so deriving
+     * this from the field alone reported an encrypting peer to the accept handler
+     * as plaintext. Key material is the authoritative signal.
+     */
+    @Test
+    void encryptionIsReportedFromKeyMaterialNotJustTheEncryptionField() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0));
+        CompletableFuture<ConnectionRequest> seenRequest = new CompletableFuture<>();
+        listener.setAcceptHandler(request -> {
+            seenRequest.complete(request);
+            return AcceptDecision.reject(RejectionReason.UNSECURE);
+        });
+        caller = newCaller();
+        SrtSocketId callerSocketId = SrtSocketId.of(0x2010);
+
+        HandshakeCif inductionReply = sendAndReceive(inductionRequest(callerSocketId));
+        sendAndReceive(conclusionRequestWithKeysAndZeroEncryptionField(
+                callerSocketId, inductionReply.synCookie()));
+
+        assertThat(seenRequest.get(TIMEOUT_SECONDS, TimeUnit.SECONDS).encryptionRequested())
+                .as("a peer offering keys is requesting encryption whatever the field says")
+                .isTrue();
     }
 
     @Test
@@ -201,6 +228,19 @@ class SrtListenerTest {
         return new HandshakeCif(
                 true, 5, 0, 5, seq(1), 1500, 8192, HandshakeType.CONCLUSION.code(),
                 callerSocketId, synCookie, LOCALHOST, extension, streamId);
+    }
+
+    /** A CONCLUSION carrying key material while declaring a zero Encryption Field — what gosrt sends. */
+    private static HandshakeCif conclusionRequestWithKeysAndZeroEncryptionField(
+            SrtSocketId callerSocketId, int synCookie) {
+        HandshakeExtension extension = new HandshakeExtension(
+                0x010401, new HandshakeExtensionFlags(true, true, true, true, true, true, false, false), 120, 120);
+        // 16-byte SEK plus AES Key Wrap's 8 bytes of overhead.
+        KeyMaterialCif keyMaterial = new KeyMaterialCif(
+                0, KeyEncryption.EVEN, 2, 0, new byte[16], new byte[16 + 8]);
+        return new HandshakeCif(
+                true, 5, 0, 5 | 2, seq(1), 1500, 8192, HandshakeType.CONCLUSION.code(),
+                callerSocketId, synCookie, LOCALHOST, extension, "live/test", keyMaterial);
     }
 
     private static CircularNumber seq(long value) {

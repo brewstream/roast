@@ -1285,10 +1285,15 @@ infrastructure.
    "Known gaps"); both references expose it, and a satellite or mobile link is
    a real reason to want it longer than five seconds. Needs `SrtConnection` to
    see the config, which it does not today.
-4. **Encryption Field validation.** Carried in the handshake but never checked
-   against what we can do. Cosmetic: the KM CIF carries the authoritative key
-   length and *is* validated, including the downgrade check. Closing the doc
-   entry may matter more than changing the code.
+4. ~~**Encryption Field validation.**~~ **Closed, 2026-08-31** — it was already
+   implemented and the entry was stale: `SrtListener` checks the declared field
+   against the key material's own KLen and rejects a disagreement as ROGUE
+   (malformed, not unauthenticated), treating zero as "no method advertised".
+   Reading that code did turn up a real defect beside it, now fixed:
+   `ConnectionRequest.encryptionRequested` was derived from the Encryption
+   Field alone, and gosrt sends zero there *even when encrypting* — so an
+   accept handler routing on that flag saw an encrypting peer as plaintext. It
+   now keys off the key material, with the field as a secondary signal.
 
 **Not a gap, on inspection.** Two long-standing entries turned out to describe
 problems that do not exist, both verified 2026-08-31:
