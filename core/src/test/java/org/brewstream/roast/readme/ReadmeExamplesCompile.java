@@ -38,7 +38,7 @@ final class ReadmeExamplesCompile {
 
             connection.onData(payload -> {
                 try {
-                    publish(streamId, payload);
+                    accept(streamId, payload);
                 } finally {
                     payload.release();
                 }
@@ -153,7 +153,7 @@ final class ReadmeExamplesCompile {
         listener.close();
     }
 
-    private static void publish(String streamId, ByteBuf payload) {
+    private static void accept(String streamId, ByteBuf payload) {
     }
 
     private static void remove(String streamId) {

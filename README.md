@@ -3,12 +3,17 @@
 A pure-Java implementation of [SRT](https://github.com/Haivision/srt) (Secure
 Reliable Transport), built on Netty. Part of **BrewStream**.
 
-Roast is built for applications that need to *route* live streams, not merely
-carry them. Loss, retransmission, jitter, buffer occupancy and key rotation are
-all first-class API — observable per connection, in real time, from Java. That
-is the reason to prefer it over a JNI binding to libsrt, where the same
-information is either absent or behind a C++ struct you cannot extend without
-forking.
+Use it anywhere a JVM application needs to speak SRT: accepting contribution
+feeds, pulling a stream to record or transcode, feeding an MPEG-TS decoder or an
+analyser, relaying between endpoints, or publishing out of a service you already
+run. It is a general-purpose SRT stack rather than a component shaped around one
+kind of pipeline.
+
+What it adds over a JNI binding to libsrt is visibility. Loss, retransmission,
+jitter, buffer occupancy and key rotation are first-class API — observable per
+connection, in real time, from Java — where otherwise they are absent or sit
+behind a C++ struct you cannot extend without forking. That is as useful to
+something measuring stream health as to something forwarding it.
 
 **Status:** v1 is complete. The protocol is verified against real libsrt in both
 directions — handshake, ARQ, TSBPD with drift correction, encryption with
@@ -21,7 +26,7 @@ production by anyone.
 - **Integrating:** [Receiving](#receiving-a-stream) · [Sending](#sending-a-stream) ·
   [Threading and buffer ownership](#threading-and-buffer-ownership) ·
   [Events](#events) · [Statistics](#statistics) ·
-  [Admission control](#admission-control-and-routing) · [Encryption](#encryption) ·
+  [Admission control](#admission-control) · [Encryption](#encryption) ·
   [Configuration](#configuration) · [Lifecycle](#lifecycle-and-shutdown)
 - [Command line](#command-line) · [Building](#building-and-testing) ·
   [Not implemented](#what-is-not-implemented)
@@ -102,16 +107,17 @@ listener.onConnection(connection -> {
     String streamId = connection.metadata().streamId();
 
     connection.onData(payload -> {
-        // One MPEG-TS chunk, in order, after TSBPD buffering.
-        // You own this buffer — release it.
+        // One MPEG-TS chunk, in order, after TSBPD buffering. Decode it,
+        // record it, analyse it, forward it — you own this buffer, so
+        // release it when you are done.
         try {
-            router.publish(streamId, payload);
+            pipeline.accept(streamId, payload);
         } finally {
             payload.release();
         }
     });
 
-    connection.onClose(() -> router.remove(streamId));
+    connection.onClose(() -> pipeline.remove(streamId));
 });
 ```
 
@@ -293,10 +299,10 @@ Three of these are worth understanding rather than merely graphing:
   trouble *right now* reads low on the lifetime figure and high on the current
   one. Alert on the second, report the first.
 
-## Admission control and routing
+## Admission control
 
-The accept handler sees enough of the handshake to make a routing decision, and
-runs before any resources are committed to the connection.
+The accept handler runs before any resources are committed to the connection,
+and sees enough of the handshake to decide on more than the StreamID.
 
 ```java
 listener.setAcceptHandler(request -> {
@@ -393,13 +399,13 @@ class SrtIngest implements AutoCloseable {
     private final SrtListener listener;
     private final StatsSampler sampler;
 
-    SrtIngest(StreamRouter router, MeterRegistry registry) throws InterruptedException {
+    SrtIngest(IngestPipeline pipeline, MeterRegistry registry) throws InterruptedException {
         this.listener = SrtListener.bind(new InetSocketAddress(9000),
                 SrtConfig.defaults().withLatency(Duration.ofMillis(200)));
-        listener.setAcceptHandler(request -> router.accepts(request.streamId())
+        listener.setAcceptHandler(request -> pipeline.accepts(request.streamId())
                 ? AcceptDecision.accept()
                 : AcceptDecision.reject(RejectionReason.FORBIDDEN));
-        listener.onConnection(connection -> router.attach(connection));
+        listener.onConnection(connection -> pipeline.attach(connection));
         this.sampler = StatsSampler.start(Duration.ofSeconds(1), listener,
                 new MicrometerSink(registry));
     }
