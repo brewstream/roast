@@ -1,11 +1,43 @@
 # Roast — status snapshot
 
-Written 2026-08-28, updated 2026-08-30, as a durable checkpoint in case a session
+Written 2026-08-28, updated 2026-08-31, as a durable checkpoint in case a session
 gets lost. See `CLAUDE.md` for conventions (package root, Netty decision, test
 stack) and `README.md` for the public API. Read the extensibility and
 observability notes below before touching the connection layer's public API.
 
 ## Where we are
+
+**v1 is complete as of 2026-08-31.** Phases 0-6 are done; 338 tests and 8 interop
+tests pass. Roast interoperates with real libsrt in both directions, encrypted
+and unencrypted, including mid-stream key rotation, verified against
+`srt-live-transmit` and ffmpeg rather than only against itself.
+
+Measured against **gosrt's own published feature list**, Roast matches seven of
+its eight supported features — caller-listener handshake, message mode, TSBPD,
+TLPKTDROP, LiveCC, NAK and periodic NAK, and encryption — and lacks none of the
+four gosrt itself doesn't have (buffer mode, rendezvous, FileCC, bonding). It
+goes beyond gosrt on handshake retry, keepalive origination, live drift
+correction, and the whole observability surface.
+
+**Three things are deliberately not in v1**, each decided rather than forgotten:
+
+- **HSv4.** gosrt supports it; Roast does not. Declined 2026-08-31: the design
+  says "support v4 peers only if trivial", and it is a second handshake path
+  rather than a fallback branch, while every modern peer (libsrt, ffmpeg, OBS)
+  negotiates HSv5.
+- **Live-mode rate pacing.** `SendBuffer` releases each packet at its own
+  scheduled time and does not space them further, so a bursty writer bursts onto
+  the wire. This is exact parity with gosrt, whose `pktSndPeriod` is computed
+  for statistics and never delays a send; libsrt does enforce an interval.
+  Parked on the gosrt-parity bar. Revisit if a non-self-pacing source (a relay
+  reading from a file, say) is ever a target — a live encoder paces itself.
+- **The full interop matrix.** See its own section under "Next steps" for why,
+  and which two cells to build first.
+
+Everything below is the historical narrative of how it got here, kept for the
+debugging record — most usefully the flow-window story, which is the best
+argument in this document for testing against a real peer rather than against
+yourself.
 
 **Phase 2 (handshake) is essentially done** per the phase plan's own stated definition of done: a real SRT peer reaches "connected" against
 `SrtListener`. Confirmed 2026-08-29 against real **libsrt 1.5.7**
@@ -1311,9 +1343,12 @@ planned to be.
    encrypting*, so an accept handler routing on it saw an encrypting peer as
    plaintext. Now keyed off the key material.
 
-**What is left for v1:** the interop matrix below, and nothing else on this
-list. Phase 7's stretch items (rendezvous, HSv4, bidirectional, message mode)
-remain explicit non-goals.
+**Nothing is left for v1.** It was declared complete on 2026-08-31. The three
+deliberate exclusions — HSv4, live-mode rate pacing, and the interop matrix —
+are recorded with their reasoning at the top of this document under "Where we
+are", and the matrix has its own section below naming the two cells worth
+building first. Phase 7's stretch items (rendezvous, bidirectional, FileCC,
+connection bonding) remain explicit non-goals, as they are for gosrt.
 
 **Not a gap, on inspection.** Two long-standing entries turned out to describe
 problems that do not exist, both verified 2026-08-31:
