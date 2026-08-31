@@ -10,12 +10,11 @@ out/
 # Not ours to push upstream - keep out of this repo's history.
 /references/
 
-# Planning notes kept locally rather than in the repo. DESIGN.md currently lives
-# a directory up, outside this repository, so this matches nothing today - it is
-# here to keep a stray copy from being committed later.
+# Working notes kept out of the repository. Useful in a checkout, but they are
+# narratives of decisions that the javadoc, README and commit messages already
+# record - and while STATUS.md was tracked it went stale five times, twice in
+# ways that cost real time. DESIGN.md currently lives a directory up, outside
+# this repository, so that rule matches nothing today and is only a guard.
+CLAUDE.md
 DESIGN.md
-
-# Engineering log kept locally rather than in the repo: useful while working,
-# but it is a narrative of decisions already recorded in javadoc and commit
-# messages, and it went stale five times while it was tracked.
 STATUS.md

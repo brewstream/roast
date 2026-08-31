@@ -548,6 +548,10 @@ isn't.
 ./gradlew interopTest   # against real libsrt and ffmpeg; skips itself if absent
 ```
 
+Tests are JUnit 5 with **AssertJ** assertions (`assertThat(...)`, not JUnit's
+`assertEquals`) and Mockito where a collaborator is a callback rather than a
+value worth constructing for real.
+
 The interop suite runs Roast against a locally built `srt-live-transmit` and
 against `ffmpeg`, in both directions, encrypted and not, including a mid-stream
 key rotation a real libsrt peer has to follow. It skips rather than fails when
