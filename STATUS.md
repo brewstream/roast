@@ -1018,11 +1018,16 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
 
 ## Known gaps / deliberately deferred
 
-- **MSS/payload-size negotiation** — the negotiated MTU is now carried on
-  `AcceptedConnection` and bounds `write`, but `ListenerHandshake` still echoes
-  the peer's value rather than negotiating down to our own limit (no config
-  object to hold ours). **Congestion Control extension** parsing/mismatch
-  rejection is still skipped entirely; noted inline there.
+- ~~**MSS/payload-size negotiation**~~ **Closed, 2026-08-31** —
+  `ListenerHandshake` now negotiates `min(ours, peer's)` and writes the result
+  into its reply so the caller learns it, rejecting only below libsrt's
+  `MinimumMSS`; `CallerHandshake` declares its own MTU rather than echoing the
+  listener's. This was not a cosmetic divergence: rejecting a larger peer made
+  `SrtConfig.withMaxMss` worse than useless, since lowering it for a tunnel
+  refused every ordinary 1500-byte peer. The **Congestion Control extension**
+  note here was wrong — unknown extension types (CONGESTION, FILTER, GROUP)
+  are skipped cleanly, because `ExtensionType.fromCode` returns null and
+  `HandshakeCif.decode`'s loop falls through to `skipBytes`. Nothing to fix.
 - ~~No `SrtConfig`~~ **Closed** — `SrtConfig` is an immutable record with
   `defaults()` and `with*` copies; see "What's built". Six knobs deliberately,
   with the passphrase kept out of it (it belongs on `AcceptDecision`, per
@@ -1030,27 +1035,19 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
   *not* a knob: the peer idle timeout above — both references make it tunable,
   but `SrtConnection` has no view of the config today and the plumbing is a
   larger change than the fix was.
-- **Encryption** — **feature-complete and proven
-  against real libsrt**, which keys with a shared passphrase and decrypts
-  payloads we encrypted (`LibsrtInteropTest.realLibsrtCallerDecryptsWhatWeEncrypt`).
-  Mid-stream key rotation is implemented and wired. Remaining gaps are narrow
-  — see "Next steps": rotation has not been exercised against a real peer
-  (the schedule is 16.7M packets), the reverse interop direction (libsrt
-  encrypting to us) needs `ffmpeg`, and the handshake's Encryption Field is
-  carried but not acted on.
-  `KeyMaterialCif`/`KeyEncryption` parse and build the Key Material message
-  the KMREQ/KMRSP extensions carry, verified byte-for-byte against gosrt's
-  own `TestKM` golden vector. Everything else is still untouched and is the
-  bulk of the phase. **Also done**: `StreamKeyWrapper` (new `crypto` package)
-  derives the KEK from a passphrase (PBKDF2) and wraps/unwraps the SEKs (AES
-  Key Wrap), verified against gosrt's golden vectors — so a KM message's
-  `wrap` field can now actually be produced and consumed, though nothing calls
-  it yet, and `PayloadCipher` does AES-CTR payload encryption/decryption.
-  **Still untouched**: even/odd key rotation with pre-announce, and wiring any
-  of it into
-  `ListenerHandshake`/`CallerHandshake`/`SrtConnection`. Deliberately stopped
-  before the wiring so nothing is half-connected into the data path — see
-  "Next steps".
+- ~~**Encryption**~~ **Closed — Phase 5 is complete.** Key material codec, KEK
+  derivation and AES Key Wrap, AES-CTR, the per-connection `EncryptionContext`,
+  handshake integration, mid-stream key rotation, and the Encryption Field are
+  all done and proven against real implementations in **both** directions:
+  libsrt decrypts what we encrypt and follows a rotation we initiate
+  (`LibsrtInteropTest`), and we decrypt what a real ffmpeg sender encrypts
+  (`FfmpegInteropTest`). Passphrase mismatch is cleanly refused. The three
+  caveats this entry used to carry — rotation unproven against a real peer,
+  reverse-direction interop still needing ffmpeg, and the Encryption Field
+  carried but not acted on — are all closed; the last of them was found to
+  have been implemented all along, with the real defect beside it (see the
+  next-steps list).
+
 - ~~Caller-side handshake~~ **Closed** — `SrtCaller`/`CallerHandshake`,
   including **encryption** (the caller generates the keys and announces them;
   see "What's built"). No HSv4 fallback, matching gosrt.
@@ -1188,9 +1185,11 @@ checks `$SRT_LIVE_TRANSMIT` env var first, falls back to
     error, matching libsrt's live-mode behaviour. Actually splitting a message
     needs receive-side reassembly (the packet-position flags), which is Phase
     7's "message mode".
-  - **Full send-side stats** (gosrt's `Stats()`: `estimatedInputBW`/
-    `estimatedSentBW`/`pktLossRate`) and the 16th/17th-packet bandwidth-probe
-    trick — both deliberately not ported, see `SendBuffer`'s javadoc.
+  - ~~**Full send-side stats**~~ **Closed, 2026-08-31** — `SendRateEstimator`
+    ports gosrt's `estimatedInputBW`/`estimatedSentBW`/`pktLossRate` and they
+    surface on `ConnectionStats`. The 16th/17th-packet bandwidth-probe trick is
+    implemented on both sides (see `SendBuffer.push` and
+    `ReceiveRateEstimator`).
   - ~~Live pollable stats and event hooks~~ **Closed** — the extensibility hook list is
     now complete: `SrtConnectionListener`/`ConnectionStats`, the ACK and
     pre-TSBPD events, and `SrtListener.pipeline()` for embedders. That last one
