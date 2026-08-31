@@ -7,10 +7,40 @@ observability notes below before touching the connection layer's public API.
 
 ## Where we are
 
-**v1 is complete as of 2026-08-31.** Phases 0-6 are done; 338 tests and 8 interop
-tests pass. Roast interoperates with real libsrt in both directions, encrypted
-and unencrypted, including mid-stream key rotation, verified against
-`srt-live-transmit` and ffmpeg rather than only against itself.
+**v1 is complete as of 2026-08-31.** Phases 0-6 are done. Roast interoperates
+with real libsrt in both directions, encrypted and unencrypted, including
+mid-stream key rotation, verified against `srt-live-transmit` and ffmpeg rather
+than only against itself.
+
+Deliberately no test count here. Counts and pass/fail are what `./gradlew test
+interopTest` reports in seconds, and every previous attempt to keep them written
+down went stale within a day — this document has been wrong about its own state
+five times. What belongs here is the reasoning the build cannot tell you.
+
+**Embedding (added after v1 was declared).** Two changes make Roast usable
+inside an application that already runs Netty, rather than only alongside one:
+
+- `SrtTransport` lets an application supply its own `EventLoopGroup` and
+  datagram channel type. Previously Roast created its own and hardcoded NIO,
+  which took two decisions belonging to the embedder — thread count and
+  transport — and put `EpollDatagramChannel`, io_uring and `SO_REUSEPORT` out of
+  reach. The caller side was the worse of the two: the group was created inside
+  `connect()`, so it was one group, and one thread, per outbound connection. A
+  borrowed group is never shut down by Roast.
+- `SrtChannel` makes every connection a Netty `Channel` — an `AbstractChannel`
+  child of the datagram channel, one per connection, in the shape Netty's QUIC
+  codec gives a QUIC connection. Reached by `SrtConnection.pipeline()` and
+  `.channel()`. By composition, not inheritance: Netty's `write(Object)` means
+  "queue, don't flush" while `SrtConnection.write(ByteBuf)` means "send this",
+  and one class cannot carry both meanings of the same word. The callback API is
+  unchanged, and the evidence for that is that all 343 tests then existing passed
+  through the switch untouched.
+
+  This closed a real gap rather than adding a nicety: there had been **no
+  backpressure signal of any kind**. Writes were accepted unconditionally into an
+  unbounded queue, so an application outrunning its link found out when the heap
+  did. `doWrite` now stops at the peer's negotiated flow window and lets Netty's
+  water marks turn the remainder into `isWritable()` going false.
 
 Measured against **gosrt's own published feature list**, Roast matches seven of
 its eight supported features — caller-listener handshake, message mode, TSBPD,
@@ -29,8 +59,10 @@ correction, and the whole observability surface.
   scheduled time and does not space them further, so a bursty writer bursts onto
   the wire. This is exact parity with gosrt, whose `pktSndPeriod` is computed
   for statistics and never delays a send; libsrt does enforce an interval.
-  Parked on the gosrt-parity bar. Revisit if a non-self-pacing source (a relay
-  reading from a file, say) is ever a target — a live encoder paces itself.
+  Parked on the gosrt-parity bar, and `SrtChannel` has since weakened the case
+  for ever building it: an embedder can consult `isWritable()` or put a
+  `ChannelTrafficShapingHandler` on the connection's pipeline, which makes rate
+  limiting a solved problem borrowed rather than a protocol feature written.
 - **The full interop matrix.** See its own section under "Next steps" for why,
   and which two cells to build first.
 
