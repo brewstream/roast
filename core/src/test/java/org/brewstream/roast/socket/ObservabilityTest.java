@@ -260,6 +260,58 @@ class ObservabilityTest {
         assertThat(stats.sendLossRatePercent()).isZero();
     }
 
+    /**
+     * A receiver must be able to see the recovery it is getting.
+     *
+     * <p>{@code packetsRetransmitted} counts what <em>this</em> side resent, so on
+     * a connection that only receives it is always zero — and a stream losing and
+     * silently recovering thousands of packets reads identically to one losing
+     * none. {@code packetsRecovered} counts arrivals carrying the retransmit flag,
+     * which is the figure that shows ARQ working.
+     */
+    @Test
+    void aReceiverCountsThePacketsItGotBackThroughRetransmission() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
+        listener.setAcceptHandler(request -> AcceptDecision.accept());
+        CompletableFuture<SrtConnection> listenerSide = new CompletableFuture<>();
+        listener.onConnection(connection -> {
+            listenerSide.complete(connection);
+            connection.onData(ByteBuf::release);
+        });
+
+        proxy = UdpLossProxy.start(
+                new InetSocketAddress("127.0.0.1", listener.localAddress().getPort()), 0.0);
+        caller = SrtCaller.connect(new InetSocketAddress("127.0.0.1", proxy.localPort()), STREAM_ID)
+                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        proxy.setDropRate(0.05);
+
+        SrtConnection receiver = listenerSide.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        for (int i = 0; i < 400; i++) {
+            caller.write(Unpooled.wrappedBuffer(("r" + i).getBytes(StandardCharsets.US_ASCII)));
+            Thread.sleep(2);
+        }
+        // Trailers, so a loss near the end still has a later sequence number to be
+        // noticed against - see ArqUnderLossTest on why tail loss is unrecoverable.
+        for (int i = 0; i < 25; i++) {
+            caller.write(Unpooled.wrappedBuffer("tail".getBytes(StandardCharsets.US_ASCII)));
+            Thread.sleep(2);
+        }
+
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TIMEOUT_SECONDS);
+        while (System.nanoTime() < deadline && receiver.stats().packetsRecovered() == 0) {
+            Thread.sleep(20);
+        }
+
+        ConnectionStats stats = receiver.stats();
+        assertThat(stats.packetsRecovered())
+                .as("5%% loss over 425 packets must have produced retransmissions we received")
+                .isPositive();
+        assertThat(stats.recoveryRate()).isPositive();
+        assertThat(stats.packetsRetransmitted())
+                .as("this side sent no data, so it retransmitted nothing")
+                .isZero();
+    }
+
     /** Under real loss, the loss and retransmit signals must actually fire and be counted. */
     @Test
     void lossAndRetransmissionAreReportedUnderRealLoss() throws Exception {

@@ -211,6 +211,7 @@ public final class SrtConnection {
     private long bytesReceived;
     private long packetsLost;
     private long packetsDropped;
+    private long packetsRecovered;
 
     private long lastPeriodicNakMicros;
     /**
@@ -429,7 +430,7 @@ public final class SrtConnection {
     private ConnectionStats snapshot() {
         return new ConnectionStats(
                 packetsSent, packetsRetransmitted, packetsReceived, bytesSent, bytesReceived,
-                packetsLost, packetsDropped, events.droppedEvents(),
+                packetsLost, packetsDropped, packetsRecovered, events.droppedEvents(),
                 Math.round(rttMicros), Math.round(rttVarMicros),
                 receiveRateEstimator.packetsPerSecond(),
                 receiveRateEstimator.receivingRateBytesPerSecond(),
@@ -774,6 +775,15 @@ public final class SrtConnection {
         bytesReceived += payloadBytes;
         int arrivedSequenceNumber = data.sequenceNumber();
         boolean wasRetransmitted = data.retransmitted();
+        if (wasRetransmitted) {
+            // Counted separately from packetsRetransmitted, which is the
+            // send-side figure. On a receive-only connection that one is always
+            // zero - the peer did the retransmitting - so without this the
+            // recovery ARQ performs is invisible from here, and a stream losing
+            // and silently recovering thousands of packets looks identical to one
+            // losing none.
+            packetsRecovered++;
+        }
         events.fire(listener ->
                 listener.onPacketReceived(this, arrivedSequenceNumber, payloadBytes, wasRetransmitted));
 

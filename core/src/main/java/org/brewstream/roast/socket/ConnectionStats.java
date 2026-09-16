@@ -44,6 +44,11 @@ package org.brewstream.roast.socket;
  * @param bytesReceived         payload bytes accepted from the peer
  * @param packetsLost           packets a peer's gap detection reported missing to us
  * @param packetsDropped        packets given up on because their deadline passed (TLPKTDROP)
+ * @param packetsRecovered      packets that arrived carrying the retransmit flag — data a peer
+ *                              resent because we asked for it. Distinct from
+ *                              {@code packetsRetransmitted}, which counts what <em>we</em> resent:
+ *                              on a receive-only connection that is always zero, and this is the
+ *                              figure showing ARQ actually working
  * @param droppedEvents         observability events discarded because listeners fell behind —
  *                              nonzero means this connection's own reporting is incomplete
  * @param rttMicros             smoothed round-trip time
@@ -72,6 +77,7 @@ public record ConnectionStats(
         long bytesReceived,
         long packetsLost,
         long packetsDropped,
+        long packetsRecovered,
         long droppedEvents,
         long rttMicros,
         long rttVarMicros,
@@ -91,6 +97,19 @@ public record ConnectionStats(
      * alerting on, since a rising value means the link is degrading well before
      * anything is actually lost. Zero when nothing has been sent yet.
      */
+    /**
+     * Recovered packets as a fraction of everything that should have arrived.
+     *
+     * <p>The receive-side counterpart to {@link #retransmitRate()}. A connection
+     * losing ten percent of its packets and recovering all of them reads zero
+     * loss everywhere else — this is the only figure that shows the work being
+     * done, and it should track the network's actual loss rate closely.
+     */
+    public double recoveryRate() {
+        long expected = packetsReceived + packetsDropped;
+        return expected == 0 ? 0 : (double) packetsRecovered / expected;
+    }
+
     /**
      * Retransmitted packets as a fraction of all packets sent, over the
      * connection's whole life. See {@link #sendLossRatePercent()} for the
