@@ -90,6 +90,38 @@ class SendBufferTest {
         }
     }
 
+    /**
+     * Retransmissions go out oldest first.
+     *
+     * <p>A deliberate divergence from gosrt, which walks its loss list backwards
+     * ({@code lossList.Back()} then {@code Prev()}) and which this used to match.
+     * The oldest packet is the one nearest its TSBPD deadline at the receiver, so
+     * sending it last is the single ordering most likely to make it arrive too
+     * late to be used. Raised by an external review, and the reasoning holds.
+     */
+    @Test
+    void nakRetransmitsOldestFirst() {
+        List<DataPacket> delivered = new ArrayList<>();
+        SendBuffer buffer = sendBuffer(delivered::add);
+
+        for (int i = 0; i < 10; i++) {
+            buffer.push(Unpooled.buffer(0), i + 1);
+        }
+        buffer.tick(10);
+        delivered.clear();
+
+        buffer.nak(List.of(new LossRange(seq(2), seq(6))));
+
+        List<Long> order = delivered.stream()
+                .map(p -> (long) p.sequenceNumber())
+                .toList();
+        assertThat(order).as("ascending, so the most urgent packet leaves first")
+                .containsExactly(2L, 3L, 4L, 5L, 6L);
+
+        delivered.forEach(p -> p.payload().release());
+        buffer.flush();
+    }
+
     /** Ported from gosrt's TestSendRetransmit. */
     @Test
     void nakRetransmitsMatchingPackets() {

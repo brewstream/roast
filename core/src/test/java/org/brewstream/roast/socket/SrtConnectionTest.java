@@ -53,6 +53,7 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.TimeoutException;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -684,7 +685,57 @@ class SrtConnectionTest {
     }
 
 
+    /**
+     * Teardown must happen exactly once even when close() falls back to running
+     * it inline. await() signals a drain timeout by returning false rather than
+     * throwing, so the fallback path is reachable, and running teardown twice
+     * would double-release buffers and announce the disconnect twice.
+     */
+    @Test
+    void closingTwiceFromDifferentThreadsTearsDownExactlyOnce() throws Exception {
+        SrtConnection connection = connectAndAccept();
+        AtomicInteger closes = new AtomicInteger();
+        connection.onClose(closes::incrementAndGet);
+
+        Thread other = new Thread(connection::close);
+        other.start();
+        connection.close();
+        other.join(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS));
+        Thread.sleep(200);
+
+        assertThat(closes.get()).as("teardown ran exactly once").isEqualTo(1);
+    }
+
     // --- DROPREQ: a peer telling us it has given up on a range of packets
+
+    /**
+     * A DROPREQ spanning the 31-bit sequence wrap must still be acted on.
+     *
+     * <p>The distance check used raw subtraction, so with the boundary just below
+     * MAX and the dropped range just past zero the difference was about -2^31 —
+     * far outside the sanity threshold — and every valid drop request at the wrap
+     * point was silently discarded. Once a connection has sent 2^31 packets it
+     * crosses this every time.
+     */
+    @Test
+    void aDropRequestSpanningTheSequenceWrapIsHonoured() throws Exception {
+        long max = SrtPacket.MAX_SEQUENCE_NUMBER;
+        SrtConnection connection = connectAndAccept(DEFAULT_FLOW_WINDOW, SrtConfig.defaults(), seq(max - 2));
+        CompletableFuture<LossRange> dropped = new CompletableFuture<>();
+        connection.onTlpktDrop(dropped::complete);
+        connection.onData(ByteBuf::release);
+
+        // One packet just below the wrap, so our boundary sits there. Then a
+        // DROPREQ whose range starts just *past* the wrap: wrap-aware the two are
+        // four apart, but raw subtraction makes it about -2^31, which is what
+        // used to trip the sanity threshold and discard the request.
+        sendData(connection.metadata().socketId(), (int) (max - 2), 0, "before-wrap");
+        sendDropRequest(connection.metadata().socketId(), 2, 5);
+
+        LossRange range = dropped.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        assertThat(range.end().value()).as("the abandoned range must be acted on, not discarded")
+                .isEqualTo(5);
+    }
 
     /**
      * Without DROPREQ handling the stream stalls behind the gap until TSBPD
@@ -861,14 +912,20 @@ class SrtConnectionTest {
     }
 
     private SrtConnection connectAndAccept(int flowWindowSize, SrtConfig config) throws Exception {
+        return connectAndAccept(flowWindowSize, config, seq(1));
+    }
+
+    /** Connects with an explicit initial sequence number, for exercising the wrap boundary. */
+    private SrtConnection connectAndAccept(int flowWindowSize, SrtConfig config, CircularNumber isn)
+            throws Exception {
         listener = SrtListener.bind(new InetSocketAddress(LOCALHOST, 0), config);
         listener.setAcceptHandler(request -> AcceptDecision.accept());
         CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
         listener.onConnection(connected::complete);
         caller = newCaller();
 
-        HandshakeCif inductionReply = sendAndReceiveHandshake(inductionRequest(flowWindowSize));
-        sendAndReceiveHandshake(conclusionRequest(inductionReply.synCookie(), flowWindowSize));
+        HandshakeCif inductionReply = sendAndReceiveHandshake(inductionRequest(flowWindowSize, isn));
+        sendAndReceiveHandshake(conclusionRequest(inductionReply.synCookie(), flowWindowSize, isn));
 
         return connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
     }
@@ -1076,8 +1133,12 @@ class SrtConnectionTest {
     }
 
     private static HandshakeCif inductionRequest(int flowWindowSize) {
+        return inductionRequest(flowWindowSize, seq(1));
+    }
+
+    private static HandshakeCif inductionRequest(int flowWindowSize, CircularNumber isn) {
         return new HandshakeCif(
-                true, 5, 0, 0, seq(1), 1500, flowWindowSize, HandshakeType.INDUCTION.code(),
+                true, 5, 0, 0, isn, 1500, flowWindowSize, HandshakeType.INDUCTION.code(),
                 CALLER_SOCKET_ID, 0, LOCALHOST, null, null);
     }
 
@@ -1086,10 +1147,14 @@ class SrtConnectionTest {
     }
 
     private static HandshakeCif conclusionRequest(int synCookie, int flowWindowSize) {
+        return conclusionRequest(synCookie, flowWindowSize, seq(1));
+    }
+
+    private static HandshakeCif conclusionRequest(int synCookie, int flowWindowSize, CircularNumber isn) {
         HandshakeExtension extension = new HandshakeExtension(
                 0x010401, new HandshakeExtensionFlags(true, true, true, true, true, true, false, false), 120, 120);
         return new HandshakeCif(
-                true, 5, 0, 5, seq(1), 1500, flowWindowSize, HandshakeType.CONCLUSION.code(),
+                true, 5, 0, 5, isn, 1500, flowWindowSize, HandshakeType.CONCLUSION.code(),
                 CALLER_SOCKET_ID, synCookie, LOCALHOST, extension, "live/test");
     }
 

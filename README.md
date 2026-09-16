@@ -78,6 +78,7 @@ target.
 | Live congestion control (LiveCC) | ✅ | ✅ | ✅ |
 | Rate pacing (enforced send interval) | ❌ | ❌ | ✅ |
 | Tail-loss retransmit (FASTREXMIT) | ❌ | ❌ | ✅ |
+| Sender-side DROPREQ emission | ❌ | ❌ | ✅ |
 | Encryption (AES-128/192/256) | ✅ | ✅ | ✅ |
 | Mid-stream key rotation | ✅ | ✅ | ✅ |
 | Message mode | ✅ | ✅ | ✅ |
@@ -576,6 +577,13 @@ each one below.
 - **Message chunking.** One `write` is one packet, matching gosrt, whose live
   sender also emits only single-packet messages. Multi-packet reassembly would be
   message mode proper.
+- **Sender-side DROPREQ.** When the send buffer gives up on packets past its
+  drop threshold, the peer is not told. libsrt sends a DROPREQ so the receiver
+  stops asking; gosrt has no DROPREQ send path at all, and neither does Roast.
+  The cost is bounded — the peer NAKs for those packets until its own TSBPD
+  budget expires, then abandons them itself — but it is wasted traffic and
+  delayed recovery against a libsrt peer. Roast *handles* an inbound DROPREQ
+  correctly; it just never originates one.
 - **Tail-loss retransmission.** ARQ notices loss by seeing a *later* sequence
   number arrive, so if the final packets of a stream are lost there is no gap to
   detect, no NAK, and no retransmission — the receiver never learns more was

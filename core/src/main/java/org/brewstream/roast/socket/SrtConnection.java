@@ -134,6 +134,8 @@ public final class SrtConnection {
     private static final long MIN_NAK_INTERVAL_MICROS = 20_000;
     /** How long {@link #close} waits for teardown to run on the event loop before giving up on it. */
     private static final long CLOSE_DRAIN_TIMEOUT_MILLIS = 500;
+    /** How long {@link #stats} waits for the event loop before falling back to a direct read. */
+    private static final long STATS_TIMEOUT_MILLIS = 200;
     private static final double INITIAL_RTT_MICROS = 100_000;
     private static final double INITIAL_RTT_VAR_MICROS = 50_000;
 
@@ -185,6 +187,8 @@ public final class SrtConnection {
     private final long startNanos = System.nanoTime();
     /** Guards {@link #close} against running teardown twice; set from any thread. */
     private final AtomicBoolean closed = new AtomicBoolean(false);
+    /** Guards {@link #doClose} against running twice; see its javadoc. */
+    private final AtomicBoolean tornDownOnce = new AtomicBoolean(false);
     /**
      * Whether teardown has actually run. Distinct from {@link #closed}, which is
      * set the moment close is <em>requested</em>: a {@link #write} already
@@ -393,8 +397,36 @@ public final class SrtConnection {
         events.fire(listener -> listener.onConnected(this));
     }
 
-    /** A point-in-time snapshot of this connection's counters and gauges. */
+    /**
+     * A point-in-time snapshot of this connection's counters and gauges.
+     *
+     * <p>Safe to call from any thread. Every field it reads is owned by the event
+     * loop and mutated there without synchronisation - including
+     * {@code ReceiveBuffer.bufferedCount()}, which reads a plain {@code
+     * ArrayList} - so a sampler thread reading them directly would race, and
+     * could see a size that no longer matches the list. Rather than make a dozen
+     * counters volatile and still leave the collection unsafe, the read is
+     * marshalled onto the loop that owns them, the same way {@link #write} and
+     * {@link #close} already marshal theirs. From the event loop itself it runs
+     * inline, so the hot path pays nothing.
+     */
     public ConnectionStats stats() {
+        if (channel.eventLoop().inEventLoop()) {
+            return snapshot();
+        }
+        try {
+            return channel.eventLoop().submit(this::snapshot).get(STATS_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return snapshot();
+        } catch (Exception e) {
+            // A congested or dead loop should degrade to a possibly-torn read
+            // rather than failing the caller: a metrics sampler must not throw.
+            return snapshot();
+        }
+    }
+
+    private ConnectionStats snapshot() {
         return new ConnectionStats(
                 packetsSent, packetsRetransmitted, packetsReceived, bytesSent, bytesReceived,
                 packetsLost, packetsDropped, events.droppedEvents(),
@@ -495,7 +527,18 @@ public final class SrtConnection {
             return;
         }
         try {
-            channel.eventLoop().submit(this::doClose).await(CLOSE_DRAIN_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            // await() reports timeout by returning false, not by throwing. Ignoring
+            // it let a caller believe teardown had finished while a congested event
+            // loop had not run it - the connection stayed registered and its tick
+            // kept firing. Falling back to inline teardown is what the loop-is-gone
+            // branch below already does, and doClose guards against running twice.
+            boolean drained = channel.eventLoop().submit(this::doClose)
+                    .await(CLOSE_DRAIN_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            if (!drained) {
+                LOG.log(Level.FINE, "Close did not drain within {0}ms on socket {1}; tearing down inline",
+                        new Object[]{CLOSE_DRAIN_TIMEOUT_MILLIS, metadata.socketId()});
+                doClose();
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (RuntimeException e) {
@@ -506,6 +549,14 @@ public final class SrtConnection {
     }
 
     private void doClose() {
+        // Idempotent because close() may now run it inline after a drain timeout
+        // while the event loop still has the submitted task queued. Running the
+        // teardown twice would double-release buffers and fire onDisconnected
+        // twice. An atomic rather than the tornDown flag, since the two callers
+        // can be on different threads.
+        if (!tornDownOnce.compareAndSet(false, true)) {
+            return;
+        }
         tornDown = true;
         // Give already-queued outbound data its chance before announcing the
         // shutdown, so the peer receives it rather than being told to stop first.
@@ -671,8 +722,12 @@ public final class SrtConnection {
         }
         // A range far from what we are actually waiting for is not a drop we can
         // make sense of - libsrt bounds this the same way.
-        long distance = first.value() - receiveBuffer.acknowledgedBoundary().value();
-        if (Math.abs(distance) > SrtPacket.MAX_SEQUENCE_NUMBER / 4) {
+        // distance() is wrap-aware and already written; raw subtraction is not.
+        // Across the 31-bit wrap - boundary just below MAX, first just above 0 -
+        // the naive difference is about -2^31, which cleared the threshold and
+        // silently discarded every valid DROPREQ at the wrap point.
+        long distance = first.distance(receiveBuffer.acknowledgedBoundary());
+        if (distance > SrtPacket.MAX_SEQUENCE_NUMBER / 4) {
             LOG.log(Level.FINE, "Discarding DROPREQ too distant from our receive window on socket {0}",
                     metadata.socketId());
             return;
@@ -683,7 +738,7 @@ public final class SrtConnection {
         }
         lossList.abandon(last);
         LossRange dropped = new LossRange(first, last);
-        packetsDropped += last.value() - first.value() + 1;
+        packetsDropped += first.distance(last) + 1;
         onTlpktDrop.accept(dropped);
         events.fire(listener -> listener.onTlpktDrop(this, dropped));
     }
@@ -731,7 +786,7 @@ public final class SrtConnection {
                 seq, data.body().readableBytes(), data.retransmitted(), elapsedMicros());
 
         for (LossRange range : immediateLoss) {
-            packetsLost += range.end().value() - range.start().value() + 1;
+            packetsLost += range.start().distance(range.end()) + 1;
             sendNak(List.of(range));
             onLoss.accept(range);
             events.fire(listener -> listener.onLoss(this, range));
@@ -803,7 +858,7 @@ public final class SrtConnection {
 
         AckBoundaryResult ackBoundary = receiveBuffer.computeAckBoundary(now);
         for (LossRange abandoned : ackBoundary.abandoned()) {
-            packetsDropped += abandoned.end().value() - abandoned.start().value() + 1;
+            packetsDropped += abandoned.start().distance(abandoned.end()) + 1;
             lossList.abandon(abandoned.end());
             onTlpktDrop.accept(abandoned);
             events.fire(listener -> listener.onTlpktDrop(this, abandoned));

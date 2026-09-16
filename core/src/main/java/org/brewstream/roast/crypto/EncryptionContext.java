@@ -87,6 +87,11 @@ public final class EncryptionContext {
 
     private final char[] passphrase;
     private int keyLength;
+
+    private PayloadCipher.Session evenSession;
+    private byte[] evenSessionKey;
+    private PayloadCipher.Session oddSession;
+    private byte[] oddSessionKey;
     private final long kmRefreshRate;
     private final long kmPreAnnounce;
 
@@ -274,19 +279,46 @@ public final class EncryptionContext {
     }
 
     /**
+     * The cipher for one key, created on first use and discarded whenever that
+     * key changes.
+     *
+     * <p>Caching is keyed on the key <em>array identity</em> deliberately. Key
+     * rotation replaces {@code evenSek}/{@code oddSek} with new arrays, so an
+     * identity check invalidates the session exactly when the key changes and
+     * never when it has not — a rotation that silently kept encrypting with the
+     * superseded key would be invisible to every unit test and would only show
+     * up as a peer that stops being able to decrypt.
+     */
+    private PayloadCipher.Session sessionFor(KeyEncryption key) {
+        byte[] sek = keyFor(key);
+        if (key == KeyEncryption.EVEN) {
+            if (evenSession == null || evenSessionKey != sek) {
+                evenSession = new PayloadCipher.Session(sek);
+                evenSessionKey = sek;
+            }
+            return evenSession;
+        }
+        if (oddSession == null || oddSessionKey != sek) {
+            oddSession = new PayloadCipher.Session(sek);
+            oddSessionKey = sek;
+        }
+        return oddSession;
+    }
+
+    /**
      * Encrypts a payload in place with the {@linkplain #activeKey() active key}.
      * The caller must put that key in the DATA packet's KK field so the peer
      * knows which one to decrypt with.
      */
     public void encrypt(byte[] payload, int packetSequenceNumber) {
         requireKeys();
-        PayloadCipher.encryptOrDecrypt(payload, keyFor(activeKey), salt, packetSequenceNumber);
+        sessionFor(activeKey).apply(payload, salt, packetSequenceNumber);
     }
 
     /** As {@link #encrypt(byte[], int)}, for a packet payload held in a {@link ByteBuf}. */
     public void encrypt(ByteBuf payload, int packetSequenceNumber) {
         requireKeys();
-        PayloadCipher.encryptOrDecrypt(payload, keyFor(activeKey), salt, packetSequenceNumber);
+        sessionFor(activeKey).apply(payload, salt, packetSequenceNumber);
     }
 
     /**
@@ -298,7 +330,7 @@ public final class EncryptionContext {
         if (!canUse(key)) {
             return false;
         }
-        PayloadCipher.encryptOrDecrypt(payload, keyFor(key), salt, packetSequenceNumber);
+        sessionFor(key).apply(payload, salt, packetSequenceNumber);
         return true;
     }
 
@@ -307,7 +339,7 @@ public final class EncryptionContext {
         if (!canUse(key)) {
             return false;
         }
-        PayloadCipher.encryptOrDecrypt(payload, keyFor(key), salt, packetSequenceNumber);
+        sessionFor(key).apply(payload, salt, packetSequenceNumber);
         return true;
     }
 
@@ -407,6 +439,10 @@ public final class EncryptionContext {
         }
         evenSek = null;
         oddSek = null;
+        evenSession = null;
+        evenSessionKey = null;
+        oddSession = null;
+        oddSessionKey = null;
         salt = null;
     }
 

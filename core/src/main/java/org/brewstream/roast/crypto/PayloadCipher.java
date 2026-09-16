@@ -116,6 +116,87 @@ public final class PayloadCipher {
         payload.setBytes(payload.readerIndex(), bytes);
     }
 
+    /**
+     * A reusable cipher bound to one key, for the per-packet path.
+     *
+     * <p>The static methods above call {@code Cipher.getInstance} per call, which
+     * means a JCA provider lookup, a fresh {@code Cipher}, a {@code
+     * SecretKeySpec} and an {@code IvParameterSpec} for every packet — at live
+     * rates, tens of thousands of provider lookups a second on the event loop.
+     * The original design notes warned against exactly this. A session holds the
+     * cipher and the key, and re-initialises only the IV, which is all that
+     * changes between packets.
+     *
+     * <p>Only the IV can be reused safely this way: AES-CTR's security depends on
+     * never repeating a counter under one key, and the counter here is derived
+     * from the packet sequence number, so it varies per packet by construction.
+     * Reusing the {@code Cipher} object changes nothing about that.
+     *
+     * <p>Not thread-safe — one per connection, on its event loop, like the rest
+     * of this package's state.
+     */
+    public static final class Session {
+
+        private final Cipher cipher;
+        private final SecretKeySpec key;
+        private byte[] scratch = EMPTY;
+
+        /**
+         * @param sek the stream encrypting key, 16, 24 or 32 bytes
+         */
+        public Session(byte[] sek) {
+            if (sek.length != 16 && sek.length != 24 && sek.length != 32) {
+                throw new IllegalArgumentException("key length must be 16, 24, or 32 bytes, got " + sek.length);
+            }
+            try {
+                this.cipher = Cipher.getInstance("AES/CTR/NoPadding");
+            } catch (GeneralSecurityException e) {
+                throw new IllegalStateException("AES-CTR unavailable", e);
+            }
+            this.key = new SecretKeySpec(sek, "AES");
+        }
+
+        /** Transforms {@code payload} in place. Encryption and decryption are the same operation in CTR. */
+        public void apply(byte[] payload, byte[] salt, int packetSequenceNumber) {
+            if (salt.length != SALT_BYTES) {
+                throw new IllegalArgumentException("salt must be " + SALT_BYTES + " bytes, got " + salt.length);
+            }
+            try {
+                cipher.init(Cipher.ENCRYPT_MODE, key,
+                        new IvParameterSpec(counterFor(salt, packetSequenceNumber)));
+                cipher.doFinal(payload, 0, payload.length, payload, 0);
+            } catch (GeneralSecurityException e) {
+                throw new IllegalStateException("AES-CTR failed", e);
+            }
+        }
+
+        /**
+         * As {@link #apply(byte[], byte[], int)}, for a {@link ByteBuf}. Reuses one
+         * growable scratch array rather than allocating per packet; the buffer's
+         * indices are unchanged.
+         */
+        public void apply(ByteBuf payload, byte[] salt, int packetSequenceNumber) {
+            int length = payload.readableBytes();
+            if (length == 0) {
+                return;
+            }
+            if (scratch.length < length) {
+                scratch = new byte[length];
+            }
+            payload.getBytes(payload.readerIndex(), scratch, 0, length);
+            try {
+                cipher.init(Cipher.ENCRYPT_MODE, key,
+                        new IvParameterSpec(counterFor(salt, packetSequenceNumber)));
+                cipher.doFinal(scratch, 0, length, scratch, 0);
+            } catch (GeneralSecurityException e) {
+                throw new IllegalStateException("AES-CTR failed", e);
+            }
+            payload.setBytes(payload.readerIndex(), scratch, 0, length);
+        }
+    }
+
+    private static final byte[] EMPTY = new byte[0];
+
     /** Visible for testing the counter construction directly — see the class javadoc for the layout. */
     static byte[] counterFor(byte[] salt, int packetSequenceNumber) {
         byte[] counter = new byte[COUNTER_BYTES];

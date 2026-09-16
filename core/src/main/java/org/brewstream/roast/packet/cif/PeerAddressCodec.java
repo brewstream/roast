@@ -61,13 +61,29 @@ public final class PeerAddressCodec {
             standard[i] = wire[WIRE_LENGTH - 1 - i];
         }
 
-        boolean isIPv4 = true;
-        for (int i = 0; i < 12; i++) {
+        // "First twelve bytes zero" alone is not enough: every address in
+        // ::/96 satisfies it, and ::1 - IPv6 loopback - was decoded as 0.0.0.1.
+        // An IPv4-mapped address has 0xFFFF in bytes 10-11, which is what
+        // actually distinguishes the two; a bare IPv4 written into this field
+        // leaves them zero, so accept either, and require the rest to be empty.
+        boolean lowBytesZero = true;
+        for (int i = 0; i < 10; i++) {
             if (standard[i] != 0) {
-                isIPv4 = false;
+                lowBytesZero = false;
                 break;
             }
         }
+        boolean mapped = (standard[10] & 0xFF) == 0xFF && (standard[11] & 0xFF) == 0xFF;
+        boolean bare = standard[10] == 0 && standard[11] == 0;
+        // The field carries no family marker, so ::N and 0.0.0.N are literally
+        // the same sixteen bytes and one of them has to lose. ::N wins, except
+        // for all-zero: 0.0.0.0 is what libsrt puts here when it does not know
+        // the peer's address, so it is a value that genuinely occurs, whereas
+        // 0.0.0.1 is not a host address anyone routes to. The ambiguity is in
+        // the wire format, not in this decision.
+        boolean looksLikeLowIpv6 = bare && standard[12] == 0 && standard[13] == 0
+                && standard[14] == 0 && standard[15] != 0;
+        boolean isIPv4 = lowBytesZero && (mapped || bare) && !looksLikeLowIpv6;
 
         try {
             return isIPv4

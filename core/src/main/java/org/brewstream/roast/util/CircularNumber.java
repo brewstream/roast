@@ -119,13 +119,23 @@ public final class CircularNumber {
     }
 
     public CircularNumber add(long n) {
-        long remaining = max - value;
-        long newValue = n <= remaining ? value + n : n - remaining - 1;
+        // Reduced modulo the domain size before adding, so a delta larger than
+        // one full turn of the circle lands in range. The previous form
+        // subtracted one wrap at most, which left values above max for any
+        // n > max - value: of(10).add(2 * MAX + 5) produced max + 14. No caller
+        // adds more than a handful today, which is why it went unnoticed, but
+        // the domain is this class's whole contract.
+        long span = max + 1;
+        long newValue = (value + Math.floorMod(n, span)) % span;
         return new CircularNumber(newValue, max);
     }
 
     public CircularNumber subtract(long n) {
-        long newValue = n <= value ? value - n : max - (n - value) + 1;
+        // As add: the old form borrowed one wrap at most, so subtracting more
+        // than max + value produced a negative value - of(10).subtract(3 * MAX)
+        // returned -4294967283, outside the domain entirely.
+        long span = max + 1;
+        long newValue = Math.floorMod(value - Math.floorMod(n, span), span);
         return new CircularNumber(newValue, max);
     }
 

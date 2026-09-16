@@ -216,7 +216,13 @@ public final class SendBuffer {
             return;
         }
 
-        Iterator<Entry> it = lossList.descendingIterator();
+        // Ascending, oldest first. gosrt walks its loss list backwards
+        // (lossList.Back() then Prev()) and this used to match, but the ordering
+        // has a reason to differ: the oldest packet is nearest its TSBPD
+        // deadline at the receiver, so sending it last is the one order that
+        // maximises the chance of it arriving too late to use. A deliberate
+        // divergence from the reference, not an oversight.
+        Iterator<Entry> it = lossList.iterator();
         while (it.hasNext()) {
             Entry entry = it.next();
             for (LossRange range : ranges) {
