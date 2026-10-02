@@ -22,11 +22,13 @@ import io.netty.channel.AddressedEnvelope;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.DefaultAddressedEnvelope;
+import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.channel.socket.DatagramChannel;
 import io.netty.channel.socket.nio.NioDatagramChannel;
+import io.netty.util.concurrent.Promise;
 import org.brewstream.roast.codec.SrtFrameDecoder;
 import org.brewstream.roast.codec.SrtFrameEncoder;
 import org.brewstream.roast.handshake.ConclusionOutcome;
@@ -44,6 +46,7 @@ import org.brewstream.roast.packet.cif.RejectionReason;
 
 import java.net.InetSocketAddress;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -199,16 +202,44 @@ public final class SrtListener {
     /**
      * Closes every connection this listener accepted, then the port itself.
      * Each connection is closed gracefully, so data already buffered in either
-     * direction is still delivered rather than discarded.
+     * direction is still delivered rather than discarded. When this returns, the
+     * port can be bound again, so a listener can be replaced on the same port
+     * straight away.
      */
     public void close() throws InterruptedException {
         connections.values().forEach(SrtConnection::close);
         channel.close().sync();
+        awaitPortReleased();
         // A group the application lent us is still theirs, and may well be
         // carrying their other traffic - shutting it down would take that with it.
         if (transport.shutdownWithOwner()) {
             transport.eventLoopGroup().shutdownGracefully().sync();
         }
+    }
+
+    /**
+     * Netty's close future completes before an NIO channel actually gives up its
+     * port. A channel still registered with a selector cannot be closed straight
+     * away, so the JDK closes the socket during the selector's next selection.
+     * Rebinding the port as soon as {@code close().sync()} returned failed
+     * about one time in ten on macOS.
+     *
+     * <p>The event loop always selects before it starts a batch of tasks, and it
+     * only takes up scheduled tasks at the start of a batch. A task scheduled
+     * now therefore runs only after that selection, so waiting for it means the
+     * port is free. The task is scheduled from inside the loop because a
+     * zero-delay task scheduled from another thread is already due, and Netty
+     * runs that in the current batch. Native transports close at once, and for
+     * them this just costs one trip through the event loop.
+     */
+    private void awaitPortReleased() throws InterruptedException {
+        EventLoop eventLoop = channel.eventLoop();
+        if (eventLoop.isShuttingDown()) {
+            return; // nothing left to select; the group's own shutdown releases the port
+        }
+        Promise<Void> released = eventLoop.newPromise();
+        eventLoop.execute(() -> eventLoop.schedule(() -> released.setSuccess(null), 0, TimeUnit.NANOSECONDS));
+        released.sync();
     }
 
     private void onHandshakePacket(AddressedEnvelope<SrtPacket, InetSocketAddress> msg) {
