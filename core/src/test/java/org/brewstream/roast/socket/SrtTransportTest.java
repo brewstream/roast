@@ -24,6 +24,7 @@ import io.netty.channel.socket.nio.NioDatagramChannel;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.net.DatagramSocket;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -106,6 +107,31 @@ class SrtTransportTest {
                 new InetSocketAddress("127.0.0.1", 0), SrtConfig.defaults(), transport);
         second.close();
         assertThat(group.isShutdown()).isFalse();
+    }
+
+    /**
+     * When {@code close()} returns, anything else must be able to bind the port:
+     * another process, another library, or a plain socket as here. NIO used to
+     * release the port just after {@code close()} returned, so binding it at once
+     * failed about one time in ten on macOS. Fifty rounds make that failure near
+     * certain to show up. A second Roast listener on the same group is no test
+     * of this, because its bind runs through the event loop and so waits for the
+     * release anyway.
+     */
+    @Test
+    void aClosedListenersPortCanBeBoundAgainAtOnce() throws Exception {
+        SrtTransport transport = sharedTransport();
+
+        for (int round = 0; round < 50; round++) {
+            listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0), SrtConfig.defaults(), transport);
+            InetSocketAddress address = listener.localAddress();
+            listener.close();
+            listener = null;
+
+            try (DatagramSocket rebound = new DatagramSocket(address)) {
+                assertThat(rebound.getLocalPort()).isEqualTo(address.getPort());
+            }
+        }
     }
 
     /** Same contract on the caller side, where the default is one group per connection. */

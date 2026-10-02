@@ -395,8 +395,9 @@ tuning anything.
 
 `SrtListener.close()` closes every connection it owns, gracefully: queued writes
 are drained and a SHUTDOWN is sent, so peers learn the stream ended rather than
-timing out. `SrtConnection.close()` does the same for one connection and is safe
-from any thread.
+timing out. When it returns the port is free, so a listener can be replaced on
+the same port at once. `SrtConnection.close()` does the same for one connection
+and is safe from any thread.
 
 In a Spring Boot application, the natural shape is a bean whose lifecycle matches
 the listener's:
