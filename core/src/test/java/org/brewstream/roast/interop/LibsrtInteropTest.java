@@ -208,6 +208,59 @@ class LibsrtInteropTest {
         }
     }
 
+    /**
+     * libsrt discards any control packet whose CIF is empty or not a multiple of
+     * 4 bytes, logging {@code INVALID SIZE} for each. The data tests above never
+     * noticed, because losing those packets costs no data: losing ACKACK leaves
+     * libsrt with no RTT samples, losing KEEPALIVE costs nothing, and losing
+     * SHUTDOWN means libsrt finds out about a close only when its idle timeout
+     * fires.
+     *
+     * <p>This test streams long enough for libsrt's Full ACKs to be answered with
+     * ACKACKs, then closes. libsrt is run without auto-reconnect, so it exits
+     * when it sees the SHUTDOWN. Its idle timeout is 5s, so an exit well inside
+     * that proves the SHUTDOWN was processed and did not time out. KEEPALIVE is
+     * not exercised here: our 10ms ACKs keep the connection from ever being idle
+     * long enough to send one. {@code SrtPacketCodecTest} covers it instead.
+     */
+    @Test
+    void realLibsrtAcceptsEveryControlPacketWeSend() throws Exception {
+        listener = SrtListener.bind(new InetSocketAddress("127.0.0.1", 0));
+        listener.setAcceptHandler(request -> AcceptDecision.accept());
+        CompletableFuture<SrtConnection> connected = new CompletableFuture<>();
+        listener.onConnection(connected::complete);
+
+        Path peerLog = Files.createTempFile("roast-interop-ctrl-", ".log");
+        peerLog.toFile().deleteOnExit();
+        srtLiveTransmit = new ProcessBuilder(
+                srtLiveTransmitPath().toString(),
+                "-t", "20", "-a:no",
+                "srt://127.0.0.1:" + listener.localAddress().getPort() + "?streamid=" + STREAM_ID,
+                "file://con")
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.to(peerLog.toFile()))
+                .start();
+
+        SrtConnection connection = connected.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        byte[] chunk = new byte[1316];
+        long streamUntil = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(1500);
+        while (System.nanoTime() < streamUntil) {
+            connection.write(Unpooled.wrappedBuffer(chunk));
+            Thread.sleep(5);
+        }
+
+        long closedAt = System.nanoTime();
+        connection.close();
+        boolean exited = srtLiveTransmit.waitFor(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        long exitMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - closedAt);
+
+        String log = Files.readString(peerLog);
+        assertThat(log).as("libsrt's log").doesNotContain("INVALID SIZE");
+        assertThat(exited).as("srt-live-transmit should exit once the connection is closed").isTrue();
+        assertThat(exitMillis).as("ms from our close to libsrt exiting - 5000+ means SHUTDOWN was lost")
+                .isLessThan(2000);
+    }
+
     private static SrtConnection connectWithRetries(int listenerPort) throws Exception {
         InetSocketAddress remote = new InetSocketAddress("127.0.0.1", listenerPort);
         Exception last = null;

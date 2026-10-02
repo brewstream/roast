@@ -84,6 +84,33 @@ class SrtPacketCodecTest {
         buf.release();
     }
 
+    /**
+     * libsrt discards a control packet whose CIF is empty, which used to cost us
+     * every ACKACK, KEEPALIVE and SHUTDOWN sent to it — so an empty CIF goes out
+     * as the 4 zero bytes libsrt itself sends, and the header is untouched.
+     */
+    @ParameterizedTest
+    @EnumSource(ControlType.class)
+    void emptyCifIsPaddedToFourZeroBytes(ControlType type) {
+        ControlPacket original = new ControlPacket(
+                type, 0x1111_2222, 0x3333_4444, SrtSocketId.of(7), Unpooled.buffer(0));
+
+        var buf = ByteBufAllocator.DEFAULT.buffer();
+        original.encodeTo(buf);
+
+        assertThat(buf.readableBytes()).isEqualTo(16 + 4);
+        assertThat(buf.getInt(16)).isZero();
+        assertThat(original.cif().refCnt()).isZero();
+
+        ControlPacket control = (ControlPacket) SrtPacket.decode(buf);
+        assertThat(control.type()).isEqualTo(type);
+        assertThat(control.typeSpecificInfo()).isEqualTo(0x1111_2222);
+        assertThat(control.body().readableBytes()).isEqualTo(4);
+
+        control.body().release();
+        buf.release();
+    }
+
     @Test
     void decodeReturnsNullForShortBuffer() {
         var buf = Unpooled.wrappedBuffer(new byte[]{1, 2, 3});

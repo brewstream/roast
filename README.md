@@ -609,7 +609,10 @@ MIT) for structure and golden vectors, and
 interoperability target. Where they disagree, or where Roast follows neither,
 the javadoc on the class in question says which one it follows and why —
 `SrtConnection`'s keepalive handling and `ReceiveBuffer`'s ACK boundary are the
-two worth reading first.
+two worth reading first. Where libsrt departs from the spec on the wire, Roast
+follows libsrt. For example, the spec gives KEEPALIVE, SHUTDOWN and ACKACK no
+control information field, but libsrt sends 4 zero bytes and drops any control
+packet without them, so Roast pads them too (see `ControlPacket`).
 
 Test grounding is stated per piece, because the difference matters when you
 change something: some tests are ported from a reference's own suite, others are
